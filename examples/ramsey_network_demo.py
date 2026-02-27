@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Ensure project root is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -109,6 +110,46 @@ def build_stack() -> dict:
     }
 
 
+# ── Ingestion shim ───────────────────────────────────────────────────
+
+class _DemoOrchestrator:
+    """Minimal shim so ingest_file() works with the demo's existing stack.
+
+    ingest_file() only accesses orchestrator.db and orchestrator.handle_store_memory().
+    This class provides exactly those two interfaces using the demo's mock stack.
+    """
+
+    def __init__(self, stack: dict):
+        self.db = stack["db"]
+        self._stack = stack
+
+    def handle_store_memory(
+        self,
+        content: str,
+        tags: list[str],
+        importance: float | None = None,
+        summary: str | None = None,
+    ) -> dict:
+        salience = importance if importance is not None else 0.5
+        mem = self._stack["mem_store"].store(
+            content=content,
+            tags=tags,
+            salience_model=salience,
+            summary=summary,
+        )
+        # Mirror Orchestrator._on_memory_stored side effects
+        self._stack["sync_engine"].invalidate_pca_cache()
+        for tag_name in mem.tags:
+            tag = self._stack["tags"].get_by_name(tag_name)
+            if tag:
+                self._stack["trend"].record_event(
+                    tag_id=tag.id,
+                    event_type="assignment",
+                    memory_id=mem.id,
+                )
+        return {"status": "stored", "memory_id": mem.id, "tags": mem.tags}
+
+
 # ── Demo scenarios ───────────────────────────────────────────────────
 
 MEMORIES = [
@@ -167,6 +208,55 @@ def demo_blank_slate(s: dict) -> None:
           f"semio={s['config'].tensor_semiotic_weight}")
     print(f"\n  The network is pure configuration. No data, no seed, no model.")
     print(f"  Everything self-assembles through usage.")
+
+
+def demo_ingest_document(s: dict, doc_path: Path) -> int:
+    """Ingest a real document into memory through the full pipeline."""
+    banner("PHASE 0.5: Document Ingestion")
+
+    from chicory.ingest.ingestor import ingest_file
+
+    print(f"\n  File: {doc_path.name}")
+    print(f"  Size: {doc_path.stat().st_size:,} bytes")
+    print(f"  Type: {doc_path.suffix or 'unknown'}")
+    print()
+    print("  Running: parse -> chunk -> tag -> store -> embed")
+    print("  (same pipeline as 'chicory ingest', using mock embeddings)\n")
+
+    shim = _DemoOrchestrator(s)
+    count = ingest_file(shim, doc_path, chunk_size=1500, overlap=300)
+
+    section(f"Result: {count} memory chunks created")
+
+    # Show derived tags
+    tag_rows = s["db"].execute(
+        """SELECT DISTINCT t.name FROM tags t
+           JOIN memory_tags mt ON mt.tag_id = t.id
+           WHERE length(t.name) > 1
+           ORDER BY t.name"""
+    ).fetchall()
+    tag_names = [r["name"] for r in tag_rows]
+    print(f"  Derived tags: {', '.join(tag_names)}")
+
+    # Show sample chunks
+    section("Sample chunks")
+    rows = s["db"].execute(
+        "SELECT id, content, summary FROM memories ORDER BY created_at LIMIT 3"
+    ).fetchall()
+    for r in rows:
+        summary = r["summary"] or ""
+        content_preview = r["content"][:80].replace("\n", " ")
+        print(f"  [{r['id'][:8]}] {summary}")
+        print(f"           {content_preview}...")
+
+    section("Database state after ingestion")
+    for table in ("memories", "tags", "embeddings", "memory_tags"):
+        c = s["db"].execute(
+            f"SELECT COUNT(*) as cnt FROM {table}"
+        ).fetchone()["cnt"]
+        kv(table, f"{c} rows")
+
+    return count
 
 
 def demo_store_memories(s: dict) -> list:
@@ -661,11 +751,28 @@ def main() -> None:
     print("\n" + " " * 8 + "CHICORY RAMSEY NETWORK DEMO")
     print(" " * 8 + "From blank slate to self-organizing memory")
 
+    # Optional: pass a file path to ingest a real document
+    doc_path: Optional[Path] = None
+    if len(sys.argv) > 1:
+        candidate = Path(sys.argv[1])
+        if candidate.exists() and candidate.is_file():
+            doc_path = candidate
+        else:
+            print(f"\n  Warning: '{sys.argv[1]}' not found, running without ingestion")
+
     s = build_stack()
 
     try:
         # Phase 0: Show empty state
         demo_blank_slate(s)
+
+        # Phase 0.5: Ingest a document (if provided)
+        if doc_path:
+            demo_ingest_document(s, doc_path)
+        else:
+            print("\n  Tip: pass a file path to demo document ingestion:")
+            print("    python -m examples.ramsey_network_demo path/to/document.txt")
+            print("  Supports: .txt .md .py .json .csv .pdf .docx and 30+ other formats\n")
 
         # Phase 1: Store memories (Layer 1)
         stored = demo_store_memories(s)

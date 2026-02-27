@@ -11,6 +11,14 @@ pip install -e ".[dev]"
 python -m examples.ramsey_network_demo
 ```
 
+To demo document ingestion — pass any file and watch the system learn:
+
+```bash
+python -m examples.ramsey_network_demo path/to/any/document.txt
+```
+
+Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other formats. The file is parsed, chunked, tagged, embedded, and fed through the full pipeline — tensor, lattice, and recall all operate on the ingested content alongside the built-in sample memories.
+
 The demo walks through 9 phases from blank slate to self-organizing memory in ~0.2 seconds, entirely in-memory with mock embeddings.
 
 For interactive use with Claude:
