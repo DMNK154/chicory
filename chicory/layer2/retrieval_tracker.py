@@ -39,13 +39,13 @@ class RetrievalTracker:
 
         retrieval_id = self._db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        for memory_id, rank, score in results:
-            self._db.execute(
+        if results:
+            self._db.executemany(
                 """
                 INSERT INTO retrieval_results (retrieval_id, memory_id, rank, relevance_score)
                 VALUES (?, ?, ?, ?)
                 """,
-                (retrieval_id, memory_id, rank, score),
+                [(retrieval_id, memory_id, rank, score) for memory_id, rank, score in results],
             )
         self._db.connection.commit()
 
@@ -57,14 +57,15 @@ class RetrievalTracker:
         tag_hits: list[tuple[int, str]],  # (tag_id, hit_type)
     ) -> None:
         """Record which tags were involved in a retrieval event."""
-        for tag_id, hit_type in tag_hits:
-            self._db.execute(
-                """
-                INSERT OR IGNORE INTO retrieval_tag_hits (retrieval_id, tag_id, hit_type)
-                VALUES (?, ?, ?)
-                """,
-                (retrieval_id, tag_id, hit_type),
-            )
+        if not tag_hits:
+            return
+        self._db.executemany(
+            """
+            INSERT OR IGNORE INTO retrieval_tag_hits (retrieval_id, tag_id, hit_type)
+            VALUES (?, ?, ?)
+            """,
+            [(retrieval_id, tag_id, hit_type) for tag_id, hit_type in tag_hits],
+        )
         self._db.connection.commit()
 
     def get_tag_retrieval_frequency(
@@ -126,6 +127,52 @@ class RetrievalTracker:
             return 0.0
         return sigmoid(math.log(ratio))
 
+    def get_all_normalized_frequencies(
+        self, tag_ids: list[int], window_hours: float | None = None
+    ) -> dict[int, float]:
+        """Batch-compute normalized retrieval frequency for many tags.
+
+        One query for per-tag counts + one for base rate, instead of
+        O(2t) separate queries via get_normalized_frequency.
+        """
+        if not tag_ids:
+            return {}
+
+        W = window_hours or self._config.trend_window_hours
+        cutoff = (datetime.utcnow() - timedelta(hours=W)).isoformat()
+
+        # Single query: per-tag hit counts
+        placeholders = ",".join("?" * len(tag_ids))
+        freq_rows = self._db.execute(
+            f"""
+            SELECT rth.tag_id, COUNT(*) as cnt
+            FROM retrieval_tag_hits rth
+            JOIN retrieval_events re ON rth.retrieval_id = re.id
+            WHERE rth.tag_id IN ({placeholders}) AND re.occurred_at > ?
+            GROUP BY rth.tag_id
+            """,
+            (*tag_ids, cutoff),
+        ).fetchall()
+
+        tag_counts = {r["tag_id"]: r["cnt"] for r in freq_rows}
+
+        # Single base rate computation (reuse existing method)
+        base = self.get_base_rate(W)
+
+        result: dict[int, float] = {}
+        for tid in tag_ids:
+            count = tag_counts.get(tid, 0)
+            raw = (count / W) if W > 0 else 0.0
+
+            if base <= 0:
+                result[tid] = 0.0 if raw == 0 else 0.9
+            elif raw <= 0:
+                result[tid] = 0.0
+            else:
+                result[tid] = sigmoid(math.log(raw / base))
+
+        return result
+
     def get_recent_retrievals(
         self, limit: int = 20, since_hours: float | None = None
     ) -> list[RetrievalEvent]:
@@ -154,6 +201,23 @@ class RetrievalTracker:
             (retrieval_id,),
         ).fetchall()
         return [r["memory_id"] for r in rows]
+
+    def get_retrieval_result_memory_ids_batch(
+        self, retrieval_ids: list[int],
+    ) -> dict[int, list[str]]:
+        """Get memory IDs for multiple retrieval events in a single query."""
+        if not retrieval_ids:
+            return {}
+        placeholders = ",".join("?" * len(retrieval_ids))
+        rows = self._db.execute(
+            f"""SELECT retrieval_id, memory_id FROM retrieval_results
+                WHERE retrieval_id IN ({placeholders}) ORDER BY retrieval_id, rank""",
+            tuple(retrieval_ids),
+        ).fetchall()
+        result: dict[int, list[str]] = {rid: [] for rid in retrieval_ids}
+        for r in rows:
+            result[r["retrieval_id"]].append(r["memory_id"])
+        return result
 
     def get_retrieval_tag_ids(self, retrieval_id: int) -> list[int]:
         """Get tag IDs that were hit in a retrieval event."""

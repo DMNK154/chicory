@@ -158,10 +158,15 @@ class EmbeddingEngine:
         rows = self._db.execute(
             "SELECT memory_id, embedding, dimension FROM embeddings WHERE chunk_index = 0"
         ).fetchall()
-        self._cache_all = {
-            r["memory_id"]: _blob_to_array(r["embedding"], r["dimension"])
-            for r in rows
-        }
+        if not rows:
+            self._cache_all = {}
+            return self._cache_all
+
+        dim = rows[0]["dimension"]
+        # Single deserialization: concat all blobs, one frombuffer + reshape
+        all_bytes = b"".join(r["embedding"] for r in rows)
+        matrix = np.frombuffer(all_bytes, dtype=np.float32).reshape(-1, dim).copy()
+        self._cache_all = {r["memory_id"]: matrix[i] for i, r in enumerate(rows)}
         return self._cache_all
 
     def get_all_chunk_embeddings(self) -> list[tuple[str, np.ndarray]]:
@@ -177,10 +182,16 @@ class EmbeddingEngine:
         rows = self._db.execute(
             "SELECT memory_id, embedding, dimension FROM embeddings ORDER BY memory_id, chunk_index"
         ).fetchall()
-        self._cache_chunks = [
-            (r["memory_id"], _blob_to_array(r["embedding"], r["dimension"]))
-            for r in rows
-        ]
+        if not rows:
+            self._cache_chunks = []
+            return self._cache_chunks
+
+        dim = rows[0]["dimension"]
+        # Single deserialization: concat all blobs, one frombuffer + reshape
+        # Matrix rows are views into the contiguous array — no per-row copy
+        all_bytes = b"".join(r["embedding"] for r in rows)
+        matrix = np.frombuffer(all_bytes, dtype=np.float32).reshape(-1, dim).copy()
+        self._cache_chunks = [(r["memory_id"], matrix[i]) for i, r in enumerate(rows)]
         return self._cache_chunks
 
     def reembed_all(self, new_model: str | None = None) -> int:

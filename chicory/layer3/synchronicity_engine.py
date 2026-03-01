@@ -51,7 +51,8 @@ class SynchronicityEngine:
         at each prime scale, and persists the position.  Idempotent — placing
         the same event twice returns the existing position.
 
-        Returns None if the event has no persisted ID or no computable angle.
+        Does NOT detect resonances — use place_events_batch for that.
+        For reseed(), rebuild_tensor() handles resonances after all placements.
         """
         if event.id is None:
             return None
@@ -79,27 +80,62 @@ class SynchronicityEngine:
         )
         self._db.connection.commit()
 
-        pos = LatticePosition(
+        return LatticePosition(
             sync_event_id=event.id,
             angle=angle,
             prime_slots=prime_slots_json,
         )
 
-        self._update_synchronicity_tensor(pos, event)
-
-        return pos
-
     def place_events_batch(
-        self, events: list[SynchronicityEvent]
+        self, events: list[SynchronicityEvent],
     ) -> list[LatticePosition]:
-        """Place multiple events on the lattice.  Returns successfully placed positions."""
+        """Place multiple events and detect resonances in a single vectorized pass.
+
+        Phase 1: Place each event (angle, prime slots, INSERT).
+        Phase 2: Vectorized resonance detection for all newly placed events
+                 using numpy broadcast, capped per event, batch SQL writes.
+        """
         self._pca_basis = None  # Invalidate to pick up any new embeddings
-        placed = []
+
+        placed: list[tuple[LatticePosition, SynchronicityEvent]] = []
         for event in events:
-            pos = self.place_event(event)
-            if pos is not None:
-                placed.append(pos)
-        return placed
+            if event.id is None:
+                continue
+
+            existing = self._db.execute(
+                "SELECT id FROM lattice_positions WHERE sync_event_id = ?",
+                (event.id,),
+            ).fetchone()
+            if existing:
+                continue
+
+            angle = self._compute_angle(event)
+            if angle is None:
+                continue
+
+            prime_slots = self._compute_prime_slots(angle)
+            prime_slots_json = json.dumps(prime_slots)
+
+            self._db.execute(
+                """
+                INSERT INTO lattice_positions (sync_event_id, angle, prime_slots)
+                VALUES (?, ?, ?)
+                """,
+                (event.id, angle, prime_slots_json),
+            )
+
+            pos = LatticePosition(
+                sync_event_id=event.id,
+                angle=angle,
+                prime_slots=prime_slots_json,
+            )
+            placed.append((pos, event))
+
+        if placed:
+            self._db.connection.commit()
+            self._find_and_persist_resonances(placed)
+
+        return [pos for pos, _ in placed]
 
     def invalidate_pca_cache(self) -> None:
         """Force recomputation of the PCA basis on next placement."""
@@ -350,56 +386,127 @@ class SynchronicityEngine:
 
     # ── Tag relational tensor ──────────────────────────────────────
 
-    def _update_synchronicity_tensor(
-        self, new_pos: LatticePosition, event: SynchronicityEvent,
+    def _find_and_persist_resonances(
+        self,
+        new_positions: list[tuple[LatticePosition, SynchronicityEvent]],
     ) -> None:
-        """Update the synchronicity network of the tag relational tensor
-        and persist discovered resonances.
+        """Vectorized resonance detection for newly placed events.
 
-        For the newly placed position, compare against all existing positions
-        (O(n) at write time).  For each resonance found:
-        1. INSERT into the resonances table
-        2. UPSERT tensor entries for every (tag_a, tag_b) cross-product
+        1. Load all lattice positions into a numpy slot matrix (one-time)
+        2. For each new event, broadcast-compare against all positions
+        3. Cap resonances per event (top-K strongest) to prevent table explosion
+        4. Aggregate tensor updates per tag pair, then batch write via executemany
         """
         min_shared = self._config.lattice_min_resonance_primes
         primes = self._config.lattice_primes
-        new_slots = {int(k): v for k, v in json.loads(new_pos.prime_slots).items()}
-        new_tag_ids = set(json.loads(event.involved_tags))
-        new_memory_ids = set(json.loads(event.involved_memories or "[]"))
+        n_primes = len(primes)
+        max_per_event = n_primes // 2  # Half the lattice size
 
+        # Load all positions (includes the newly placed ones)
         rows = self._db.execute(
             """
-            SELECT lp.sync_event_id, lp.prime_slots,
-                   se.involved_tags, se.involved_memories
+            SELECT lp.sync_event_id, lp.prime_slots, se.involved_tags
             FROM lattice_positions lp
             JOIN synchronicity_events se ON se.id = lp.sync_event_id
-            WHERE lp.sync_event_id != ?
-            """,
-            (event.id,),
+            """
         ).fetchall()
 
-        for row in rows:
-            other_slots = {int(k): v for k, v in json.loads(row["prime_slots"]).items()}
-            shared = [p for p in primes if new_slots.get(p) == other_slots.get(p)]
-            if len(shared) < min_shared:
+        if len(rows) < 2:
+            return
+
+        # Build slot matrix: (n_positions, n_primes)
+        all_ids: list[int] = []
+        all_tags: dict[int, set[int]] = {}
+        id_to_idx: dict[int, int] = {}
+        slot_matrix = np.zeros((len(rows), n_primes), dtype=np.int32)
+
+        for i, r in enumerate(rows):
+            eid = r["sync_event_id"]
+            all_ids.append(eid)
+            id_to_idx[eid] = i
+            all_tags[eid] = set(json.loads(r["involved_tags"]))
+            slots = json.loads(r["prime_slots"])
+            for j, p in enumerate(primes):
+                slot_matrix[i, j] = slots.get(str(p), slots.get(p, -1))
+
+        log_primes = np.array([math.log(p) for p in primes], dtype=np.float64)
+        new_event_ids = {event.id for _, event in new_positions}
+
+        resonance_rows: list[tuple] = []
+        tensor_agg: dict[tuple[int, int], float] = {}
+
+        for _pos, event in new_positions:
+            idx = id_to_idx.get(event.id)
+            if idx is None:
                 continue
 
-            strength = sum(math.log(p) for p in shared)
-            other_tag_ids = set(json.loads(row["involved_tags"]))
-            other_memory_ids = set(json.loads(row["involved_memories"] or "[]"))
-            combined_memories = sorted(new_memory_ids | other_memory_ids)
+            new_vec = slot_matrix[idx]  # (n_primes,)
 
-            # Persist resonance
-            id_a = min(event.id, row["sync_event_id"])
-            id_b = max(event.id, row["sync_event_id"])
-            chance = math.exp(-strength)
-            description = (
-                f"Events {id_a} and {id_b} resonate across {len(shared)} "
-                f"prime scales ({', '.join(str(p) for p in shared)}). "
-                f"Surprise: {strength:.1f} nats. "
-                f"Chance probability: {chance:.2e}"
-            )
-            self._db.execute(
+            # Broadcast compare: (n_all, n_primes) bool
+            match_matrix = slot_matrix == new_vec
+            shared_counts = match_matrix.sum(axis=1)  # (n_all,)
+            shared_counts[idx] = 0  # exclude self
+
+            # Filter by threshold
+            candidate_indices = np.where(shared_counts >= min_shared)[0]
+            if len(candidate_indices) == 0:
+                continue
+
+            # Compute strengths: sum of log(p) for shared primes
+            strengths = (
+                match_matrix[candidate_indices].astype(np.float64) * log_primes
+            ).sum(axis=1)
+
+            # Cap: keep only top-K strongest
+            if len(candidate_indices) > max_per_event:
+                top_k = np.argsort(strengths)[-max_per_event:]
+                candidate_indices = candidate_indices[top_k]
+                strengths = strengths[top_k]
+
+            new_tag_ids = all_tags.get(event.id, set())
+
+            for ci_pos, ci in enumerate(candidate_indices):
+                other_id = all_ids[ci]
+
+                # Avoid double-counting for new-to-new pairs
+                if other_id in new_event_ids and event.id > other_id:
+                    continue
+
+                strength = float(strengths[ci_pos])
+                shared = [
+                    primes[j] for j in range(n_primes)
+                    if match_matrix[ci, j]
+                ]
+
+                id_a = min(event.id, other_id)
+                id_b = max(event.id, other_id)
+                chance = math.exp(-strength)
+                description = (
+                    f"Events {id_a} and {id_b} resonate across {len(shared)} "
+                    f"prime scales ({', '.join(str(p) for p in shared)}). "
+                    f"Surprise: {strength:.1f} nats. "
+                    f"Chance probability: {chance:.2e}"
+                )
+
+                resonance_rows.append((
+                    id_a, id_b, json.dumps([id_a, id_b]),
+                    json.dumps(shared), strength, description,
+                ))
+
+                # Aggregate tensor: max strength per tag pair
+                other_tag_ids = all_tags.get(other_id, set())
+                for ta in new_tag_ids:
+                    for tb in other_tag_ids:
+                        key = (min(ta, tb), max(ta, tb))
+                        if key[0] == key[1]:
+                            continue
+                        tensor_agg[key] = max(
+                            tensor_agg.get(key, 0.0), strength,
+                        )
+
+        # Batch persist resonances
+        if resonance_rows:
+            self._db.executemany(
                 """
                 INSERT INTO resonances
                     (event_a_id, event_b_id, event_ids,
@@ -411,32 +518,32 @@ class SynchronicityEngine:
                     description = excluded.description,
                     detected_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
                 """,
-                (id_a, id_b, json.dumps([id_a, id_b]),
-                 json.dumps(shared), strength, description),
+                resonance_rows,
             )
 
-            for ta in new_tag_ids:
-                for tb in other_tag_ids:
-                    key_a, key_b = min(ta, tb), max(ta, tb)
-                    if key_a == key_b:
-                        continue
-                    self._db.execute(
-                        """
-                        INSERT INTO tag_relational_tensor
-                            (tag_a_id, tag_b_id, synchronicity_strength, memory_ids)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(tag_a_id, tag_b_id) DO UPDATE SET
-                            synchronicity_strength = MAX(
-                                tag_relational_tensor.synchronicity_strength,
-                                excluded.synchronicity_strength
-                            ),
-                            memory_ids = excluded.memory_ids,
-                            updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
-                        """,
-                        (key_a, key_b, strength, json.dumps(combined_memories)),
-                    )
+        # Batch persist tensor updates (aggregated — one row per tag pair)
+        if tensor_agg:
+            tensor_rows = [
+                (key_a, key_b, strength, "[]")
+                for (key_a, key_b), strength in tensor_agg.items()
+            ]
+            self._db.executemany(
+                """
+                INSERT INTO tag_relational_tensor
+                    (tag_a_id, tag_b_id, synchronicity_strength, memory_ids)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(tag_a_id, tag_b_id) DO UPDATE SET
+                    synchronicity_strength = MAX(
+                        tag_relational_tensor.synchronicity_strength,
+                        excluded.synchronicity_strength
+                    ),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
+                """,
+                tensor_rows,
+            )
 
-        self._db.connection.commit()
+        if resonance_rows or tensor_agg:
+            self._db.connection.commit()
 
     def update_cooccurrence_tensor(self) -> int:
         """Populate the co-occurrence network from memory_tags PMI.
@@ -666,10 +773,11 @@ class SynchronicityEngine:
     def rebuild_tensor(self) -> int:
         """Rebuild the entire tag relational tensor and resonances table from scratch.
 
-        Clears all entries and repopulates all three networks:
+        Clears all entries and repopulates all four networks:
         1. R_cooccurrence from memory_tags PMI
         2. R_semantic from embedding cosine similarities
-        3. R_synchronicity from lattice resonances (inline pairwise, O(1) memory)
+        3. R_semiotic from conditional probability asymmetry
+        4. R_synchronicity from lattice resonances (vectorized numpy, capped)
 
         Also clears and repopulates the resonances table.
 
@@ -684,86 +792,139 @@ class SynchronicityEngine:
         self.update_semantic_tensor()
         self.update_semiotic_tensor()
 
-        # Populate synchronicity network — inline pairwise without list accumulation
+        # Populate synchronicity network — vectorized row-by-row
         min_shared = self._config.lattice_min_resonance_primes
         primes = self._config.lattice_primes
+        n_primes = len(primes)
+        max_per_event = n_primes // 2  # Half the lattice size
 
         rows = self._db.execute(
             """
-            SELECT lp.sync_event_id, lp.prime_slots,
-                   se.involved_tags, se.involved_memories
+            SELECT lp.sync_event_id, lp.prime_slots, se.involved_tags
             FROM lattice_positions lp
             JOIN synchronicity_events se ON se.id = lp.sync_event_id
             """
         ).fetchall()
 
-        # Pre-parse all positions
-        positions: list[tuple[int, dict[int, int], set[int], set[str]]] = []
-        for r in rows:
-            slots = {int(k): v for k, v in json.loads(r["prime_slots"]).items()}
-            tag_ids = set(json.loads(r["involved_tags"]))
-            memory_ids = set(json.loads(r["involved_memories"] or "[]"))
-            positions.append((r["sync_event_id"], slots, tag_ids, memory_ids))
+        n = len(rows)
+        if n >= 2:
+            # Build slot matrix: (n, n_primes) and parse tags
+            all_ids: list[int] = []
+            all_tags: list[set[int]] = []
+            slot_matrix = np.zeros((n, n_primes), dtype=np.int32)
 
-        for i in range(len(positions)):
-            id_i, slots_i, tags_i, mems_i = positions[i]
-            for j in range(i + 1, len(positions)):
-                id_j, slots_j, tags_j, mems_j = positions[j]
+            for i, r in enumerate(rows):
+                all_ids.append(r["sync_event_id"])
+                all_tags.append(set(json.loads(r["involved_tags"])))
+                slots = json.loads(r["prime_slots"])
+                for j, p in enumerate(primes):
+                    slot_matrix[i, j] = slots.get(str(p), slots.get(p, -1))
 
-                shared = [p for p in primes if slots_i.get(p) == slots_j.get(p)]
-                if len(shared) < min_shared:
+            log_primes = np.array(
+                [math.log(p) for p in primes], dtype=np.float64,
+            )
+
+            resonance_rows: list[tuple] = []
+            tensor_agg: dict[tuple[int, int], float] = {}
+
+            # Row-by-row vectorized: compare position i against all j > i
+            for i in range(n - 1):
+                remaining = slot_matrix[i + 1:]  # (n-i-1, n_primes)
+
+                # Broadcast compare against row i
+                match_matrix = remaining == slot_matrix[i]  # bool
+                shared_counts = match_matrix.sum(axis=1)
+
+                candidate_offsets = np.where(shared_counts >= min_shared)[0]
+                if len(candidate_offsets) == 0:
                     continue
 
-                strength = sum(math.log(p) for p in shared)
+                # Strengths: sum of log(p) for shared primes
+                strengths = (
+                    match_matrix[candidate_offsets].astype(np.float64)
+                    * log_primes
+                ).sum(axis=1)
 
-                # Persist resonance
-                id_a, id_b = min(id_i, id_j), max(id_i, id_j)
-                chance = math.exp(-strength)
-                description = (
-                    f"Events {id_a} and {id_b} resonate across {len(shared)} "
-                    f"prime scales ({', '.join(str(p) for p in shared)}). "
-                    f"Surprise: {strength:.1f} nats. "
-                    f"Chance probability: {chance:.2e}"
-                )
-                self._db.execute(
+                # Cap: top-K strongest per event
+                if len(candidate_offsets) > max_per_event:
+                    top_k = np.argsort(strengths)[-max_per_event:]
+                    candidate_offsets = candidate_offsets[top_k]
+                    strengths = strengths[top_k]
+
+                id_i = all_ids[i]
+                tags_i = all_tags[i]
+
+                for ci_pos, offset in enumerate(candidate_offsets):
+                    j = i + 1 + int(offset)
+                    id_j = all_ids[j]
+                    strength = float(strengths[ci_pos])
+
+                    shared = [
+                        primes[k] for k in range(n_primes)
+                        if match_matrix[offset, k]
+                    ]
+
+                    id_a, id_b = min(id_i, id_j), max(id_i, id_j)
+                    chance = math.exp(-strength)
+                    description = (
+                        f"Events {id_a} and {id_b} resonate across "
+                        f"{len(shared)} prime scales "
+                        f"({', '.join(str(p) for p in shared)}). "
+                        f"Surprise: {strength:.1f} nats. "
+                        f"Chance probability: {chance:.2e}"
+                    )
+
+                    resonance_rows.append((
+                        id_a, id_b, json.dumps([id_a, id_b]),
+                        json.dumps(shared), strength, description,
+                    ))
+
+                    # Aggregate tensor: max strength per tag pair
+                    tags_j = all_tags[j]
+                    for ta in tags_i:
+                        for tb in tags_j:
+                            key = (min(ta, tb), max(ta, tb))
+                            if key[0] == key[1]:
+                                continue
+                            tensor_agg[key] = max(
+                                tensor_agg.get(key, 0.0), strength,
+                            )
+
+            # Batch persist resonances
+            if resonance_rows:
+                self._db.executemany(
                     """
                     INSERT OR IGNORE INTO resonances
                         (event_a_id, event_b_id, event_ids,
                          shared_primes, resonance_strength, description)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (id_a, id_b, json.dumps([id_a, id_b]),
-                     json.dumps(shared), strength, description),
+                    resonance_rows,
                 )
 
-                # UPSERT tensor
-                combined_memories = json.dumps(sorted(mems_i | mems_j))
-                for ta in tags_i:
-                    for tb in tags_j:
-                        key_a, key_b = min(ta, tb), max(ta, tb)
-                        if key_a == key_b:
-                            continue
-                        self._db.execute(
-                            """
-                            INSERT INTO tag_relational_tensor
-                                (tag_a_id, tag_b_id, synchronicity_strength, memory_ids)
-                            VALUES (?, ?, ?, ?)
-                            ON CONFLICT(tag_a_id, tag_b_id) DO UPDATE SET
-                                synchronicity_strength = MAX(
-                                    tag_relational_tensor.synchronicity_strength,
-                                    excluded.synchronicity_strength
-                                ),
-                                memory_ids = CASE
-                                    WHEN length(tag_relational_tensor.memory_ids) > length(excluded.memory_ids)
-                                    THEN tag_relational_tensor.memory_ids
-                                    ELSE excluded.memory_ids
-                                END,
-                                updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
-                            """,
-                            (key_a, key_b, strength, combined_memories),
-                        )
+            # Batch persist tensor updates
+            if tensor_agg:
+                tensor_rows = [
+                    (key_a, key_b, strength, "[]")
+                    for (key_a, key_b), strength in tensor_agg.items()
+                ]
+                self._db.executemany(
+                    """
+                    INSERT INTO tag_relational_tensor
+                        (tag_a_id, tag_b_id, synchronicity_strength,
+                         memory_ids)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(tag_a_id, tag_b_id) DO UPDATE SET
+                        synchronicity_strength = MAX(
+                            tag_relational_tensor.synchronicity_strength,
+                            excluded.synchronicity_strength
+                        ),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
+                    """,
+                    tensor_rows,
+                )
 
-        self._db.connection.commit()
+            self._db.connection.commit()
 
         row = self._db.execute(
             "SELECT COUNT(*) as cnt FROM tag_relational_tensor"
@@ -774,13 +935,20 @@ class SynchronicityEngine:
         self,
         tag_ids: list[int],
     ) -> list[tuple[str, float]]:
-        """O(k) tensor-based lookup for resonant memories.
+        """Tensor-based lookup for resonant memories.
 
         Given query-context tag_ids, look up the tag relational tensor and
         combine the four network strengths using configurable weights.
         The semiotic layer is direction-aware: when a query tag is tag_a_id,
         we use semiotic_forward (P(B|A)); when it's tag_b_id, we use
         semiotic_reverse (P(A|B)).
+
+        Phase 1: compute a combined strength per *partner tag* (tags not in
+        the query set that are connected via the tensor).  This avoids
+        parsing the memory_ids JSON column entirely.
+
+        Phase 2: resolve partner tags to memories via the indexed
+        memory_tags table.
         """
         if not tag_ids:
             return []
@@ -791,8 +959,7 @@ class SynchronicityEngine:
             f"""
             SELECT tag_a_id, tag_b_id,
                    cooccurrence_strength, synchronicity_strength,
-                   semantic_strength, semiotic_forward, semiotic_reverse,
-                   memory_ids
+                   semantic_strength, semiotic_forward, semiotic_reverse
             FROM tag_relational_tensor
             WHERE (tag_a_id IN ({placeholders}) OR tag_b_id IN ({placeholders}))
               AND (cooccurrence_strength > 0
@@ -812,20 +979,22 @@ class SynchronicityEngine:
         w_sem = self._config.tensor_semantic_weight
         w_semio = self._config.tensor_semiotic_weight
 
-        memory_scores: dict[str, float] = {}
-        max_combined = 0.0
-
-        combined_values: list[tuple[float, list[str]]] = []
+        # Phase 1: aggregate combined strength per partner tag
+        partner_scores: dict[int, float] = {}
         for row in rows:
-            # Direction-aware semiotic contribution
             a_in_query = row["tag_a_id"] in query_tag_set
             b_in_query = row["tag_b_id"] in query_tag_set
+
+            # Direction-aware semiotic contribution
             if a_in_query and b_in_query:
-                semiotic = max(row["semiotic_forward"], row["semiotic_reverse"])
+                # Both tags already in query — no new partner to surface
+                continue
             elif a_in_query:
-                semiotic = row["semiotic_forward"]   # query is A, pulling B
+                semiotic = row["semiotic_forward"]
+                partner = row["tag_b_id"]
             else:
-                semiotic = row["semiotic_reverse"]   # query is B, pulling A
+                semiotic = row["semiotic_reverse"]
+                partner = row["tag_a_id"]
 
             combined = (
                 w_co * row["cooccurrence_strength"]
@@ -833,17 +1002,31 @@ class SynchronicityEngine:
                 + w_sem * row["semantic_strength"]
                 + w_semio * semiotic
             )
-            if combined > max_combined:
-                max_combined = combined
-            combined_values.append((combined, json.loads(row["memory_ids"])))
+            if combined > 0:
+                partner_scores[partner] = max(
+                    partner_scores.get(partner, 0.0), combined,
+                )
 
+        if not partner_scores:
+            return []
+
+        max_combined = max(partner_scores.values())
         if max_combined <= 0:
             return []
 
-        for combined, mids in combined_values:
-            normalized = combined / max_combined
-            for mid in mids:
-                memory_scores[mid] = max(memory_scores.get(mid, 0.0), normalized)
+        # Phase 2: resolve partner tags → memories via memory_tags index
+        partner_ids = list(partner_scores.keys())
+        p2 = ",".join("?" * len(partner_ids))
+        mem_rows = self._db.execute(
+            f"SELECT memory_id, tag_id FROM memory_tags WHERE tag_id IN ({p2})",
+            tuple(partner_ids),
+        ).fetchall()
+
+        memory_scores: dict[str, float] = {}
+        for r in mem_rows:
+            normalized = partner_scores[r["tag_id"]] / max_combined
+            mid = r["memory_id"]
+            memory_scores[mid] = max(memory_scores.get(mid, 0.0), normalized)
 
         return sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)
 

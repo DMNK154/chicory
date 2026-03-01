@@ -66,6 +66,36 @@ class SalienceScorer:
         # Sigmoid to [0, 1]
         return 1.0 / (1.0 + math.exp(-6 * (raw - 0.5)))
 
+    def _compute_usage_from_row(
+        self,
+        access_count: int,
+        last_accessed: str | None,
+        success_count: int,
+        total_count: int,
+        now: datetime,
+    ) -> float:
+        """Compute usage salience from pre-fetched values (no DB query)."""
+        w_access = 0.4
+        access_score = min(math.log(1 + access_count) / math.log(1 + 100), 1.0)
+
+        w_recency = 0.4
+        if last_accessed:
+            hours_ago = (now - datetime.fromisoformat(last_accessed)).total_seconds() / 3600
+            recency_score = multi_tier_decay(hours_ago, [
+                (self._config.salience_recency_active_weight,
+                 self._config.salience_recency_active_halflife_hours),
+                (self._config.salience_recency_longterm_weight,
+                 self._config.salience_recency_longterm_halflife_hours),
+            ])
+        else:
+            recency_score = 0.0
+
+        w_success = 0.2
+        success_score = success_count / total_count if total_count > 0 else 0.5
+
+        raw = w_access * access_score + w_recency * recency_score + w_success * success_score
+        return 1.0 / (1.0 + math.exp(-6 * (raw - 0.5)))
+
     def compute_composite(self, salience_model: float, salience_usage: float) -> float:
         """Weighted combination of model-judged and usage-based salience."""
         w_m = self._config.salience_model_weight
@@ -103,10 +133,15 @@ class SalienceScorer:
             self._db.connection.commit()
 
     def update_on_access_batch(self, memory_ids: list[str]) -> None:
-        """Update salience scores for multiple memories in a single transaction."""
+        """Update salience scores for multiple memories in a single transaction.
+
+        Fetches all needed columns in one query, computes salience in-memory,
+        then writes back in a single executemany — no per-row SELECTs.
+        """
         if not memory_ids:
             return
-        now = datetime.utcnow().isoformat()
+        now_str = datetime.utcnow().isoformat()
+        now_dt = datetime.fromisoformat(now_str)
         with self._db.transaction():
             # Bulk update access counts
             placeholders = ",".join("?" * len(memory_ids))
@@ -119,22 +154,32 @@ class SalienceScorer:
                     updated_at = ?
                 WHERE id IN ({placeholders})
                 """,
-                (now, now, *memory_ids),
+                (now_str, now_str, *memory_ids),
             )
 
-            # Recompute usage salience for each memory
+            # Fetch all columns needed for salience computation in one query
             rows = self._db.execute(
-                f"SELECT id, salience_model FROM memories WHERE id IN ({placeholders})",
+                f"""SELECT id, salience_model, access_count, last_accessed,
+                           retrieval_success_count, retrieval_total_count
+                    FROM memories WHERE id IN ({placeholders})""",
                 tuple(memory_ids),
             ).fetchall()
 
+            # Compute salience in-memory and collect updates
+            updates: list[tuple[float, float, str]] = []
             for row in rows:
-                usage = self.compute_usage_salience(row["id"])
-                composite = self.compute_composite(row["salience_model"], usage)
-                self._db.execute(
-                    "UPDATE memories SET salience_usage = ?, salience_composite = ? WHERE id = ?",
-                    (usage, composite, row["id"]),
+                usage = self._compute_usage_from_row(
+                    row["access_count"], row["last_accessed"],
+                    row["retrieval_success_count"], row["retrieval_total_count"],
+                    now_dt,
                 )
+                composite = self.compute_composite(row["salience_model"], usage)
+                updates.append((usage, composite, row["id"]))
+
+            self._db.executemany(
+                "UPDATE memories SET salience_usage = ?, salience_composite = ? WHERE id = ?",
+                updates,
+            )
 
     def record_success(self, memory_id: str) -> None:
         """Record that a retrieved memory was useful."""

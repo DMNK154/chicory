@@ -221,28 +221,34 @@ class MetaAnalyzer:
 
     def _get_tag_clusters(self, tag_ids: set[int]) -> list[set[int]]:
         """Group tags into clusters based on co-occurrence.
-        Tags that frequently co-occur are in the same cluster."""
+
+        Single GROUP BY query replaces O(k²) per-pair queries.
+        """
         if not tag_ids:
             return []
 
         tag_list = list(tag_ids)
-        # Build adjacency based on co-occurrence
         adjacency: dict[int, set[int]] = {t: set() for t in tag_list}
 
-        for i in range(len(tag_list)):
-            for j in range(i + 1, len(tag_list)):
-                # Check co-occurrence
-                row = self._db.execute(
-                    """
-                    SELECT COUNT(*) as cnt FROM memory_tags a
-                    JOIN memory_tags b ON a.memory_id = b.memory_id
-                    WHERE a.tag_id = ? AND b.tag_id = ?
-                    """,
-                    (tag_list[i], tag_list[j]),
-                ).fetchone()
-                if row and row["cnt"] > 2:  # Threshold: co-occurred in >2 memories
-                    adjacency[tag_list[i]].add(tag_list[j])
-                    adjacency[tag_list[j]].add(tag_list[i])
+        # Single query: all co-occurring pairs among the given tags with count > 2
+        placeholders = ",".join("?" * len(tag_list))
+        rows = self._db.execute(
+            f"""
+            SELECT a.tag_id AS tag_a, b.tag_id AS tag_b, COUNT(*) AS cnt
+            FROM memory_tags a
+            JOIN memory_tags b ON a.memory_id = b.memory_id
+            WHERE a.tag_id IN ({placeholders})
+              AND b.tag_id IN ({placeholders})
+              AND a.tag_id < b.tag_id
+            GROUP BY a.tag_id, b.tag_id
+            HAVING cnt > 2
+            """,
+            (*tag_list, *tag_list),
+        ).fetchall()
+
+        for r in rows:
+            adjacency[r["tag_a"]].add(r["tag_b"])
+            adjacency[r["tag_b"]].add(r["tag_a"])
 
         # Connected components
         visited: set[int] = set()

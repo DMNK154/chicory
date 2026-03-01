@@ -31,6 +31,9 @@ class DatabaseEngine:
         db_path = str(self._config.db_path)
         is_memory = db_path == ":memory:"
 
+        if not is_memory:
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -78,9 +77,10 @@ class Orchestrator:
         )
         self._feedback = FeedbackEngine(self._db, self._tag_manager, self._salience)
 
-        # Rate limiting for detection
-        self._last_sync_check: datetime | None = None
-        self._last_meta_check: datetime | None = None
+        # Rate limiting for detection — initialise to "now" so the first
+        # retrieval isn't blocked by expensive sync/meta detection.
+        self._last_sync_check: datetime | None = datetime.utcnow()
+        self._last_meta_check: datetime | None = datetime.utcnow()
 
     @property
     def db(self) -> DatabaseEngine:
@@ -147,6 +147,7 @@ class Orchestrator:
         tags: list[str],
         importance: float | None = None,
         summary: str | None = None,
+        skip_embedding: bool = False,
     ) -> dict[str, Any]:
         """Store a memory and fire side effects."""
         salience = importance if importance is not None else 0.5
@@ -156,6 +157,7 @@ class Orchestrator:
             tags=tags,
             salience_model=salience,
             summary=summary,
+            skip_embedding=skip_embedding,
         )
 
         # Side effects: record tag assignment events
@@ -197,7 +199,7 @@ class Orchestrator:
         )
 
         # Side effects (background thread)
-        self._on_retrieval_completed_async(retrieval_id, results)
+        self._on_retrieval_completed(retrieval_id, results)
 
         return {
             "results": [
@@ -333,7 +335,7 @@ class Orchestrator:
                 results=combined_tuples,
                 model_version=self._config.llm_model,
             )
-            self._on_retrieval_completed_async(combined_id, all_retrieval_results)
+            self._on_retrieval_completed(combined_id, all_retrieval_results)
 
         return {
             "results": all_results,
@@ -485,6 +487,329 @@ class Orchestrator:
         """Get lattice state including positions, resonances, and void profile."""
         return self._sync_engine.get_lattice_state()
 
+    def handle_ingest_codebase(
+        self,
+        path: str,
+        file_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Ingest a codebase directory, storing structural summaries as memories.
+
+        Walks the directory, extracts code structure (classes, functions,
+        signatures, imports) via AST/regex parsing, and stores compact
+        summaries. These summaries can later be retrieved via
+        retrieve_memories instead of re-reading the full codebase.
+        """
+        import hashlib
+        import fnmatch
+        from pathlib import Path
+
+        from chicory.ingest.code_summarizer import CODE_EXTENSIONS, summarize_file
+
+        directory = Path(path).resolve()
+        if not directory.is_dir():
+            return {"error": f"Not a directory: {path}"}
+
+        # Determine which extensions to scan
+        if file_patterns:
+            allowed_suffixes = None  # Use glob matching instead
+        else:
+            allowed_suffixes = CODE_EXTENSIONS
+
+        # Directories to always skip
+        skip_dirs = {
+            ".git", ".venv", "venv", "node_modules", "__pycache__",
+            ".env", ".tox", ".mypy_cache", ".pytest_cache", "dist",
+            "build", ".eggs", "*.egg-info",
+        }
+        if exclude_patterns:
+            skip_dirs.update(exclude_patterns)
+
+        # Collect files
+        all_files: list[Path] = []
+        for f in directory.rglob("*"):
+            if not f.is_file():
+                continue
+            # Skip hidden and excluded directories
+            parts = f.relative_to(directory).parts
+            if any(
+                part.startswith(".") or part in skip_dirs
+                for part in parts[:-1]
+            ):
+                continue
+            # Check extension / pattern match
+            if file_patterns:
+                rel_str = str(f.relative_to(directory))
+                if not any(fnmatch.fnmatch(rel_str, pat) for pat in file_patterns):
+                    continue
+            elif allowed_suffixes and f.suffix.lower() not in allowed_suffixes:
+                continue
+            all_files.append(f)
+
+        all_files.sort()
+
+        stats = {
+            "files_scanned": len(all_files),
+            "files_summarized": 0,
+            "memories_created": 0,
+            "files_skipped": 0,
+            "files_already_ingested": 0,
+            "summaries": [],
+        }
+
+        # ── Phase 1: Store summaries (no embeddings) ──────────────
+        new_memory_ids: list[str] = []
+
+        for filepath in all_files:
+            summary_text = summarize_file(filepath, base_dir=directory)
+            if not summary_text:
+                stats["files_skipped"] += 1
+                continue
+
+            # Dedup by content hash
+            content_hash = hashlib.sha256(
+                summary_text.encode("utf-8")
+            ).hexdigest()[:16]
+
+            existing = self._db.execute(
+                "SELECT id FROM memories WHERE content LIKE ?",
+                (f"%chicory:code_hash={content_hash}%",),
+            ).fetchone()
+            if existing:
+                stats["files_already_ingested"] += 1
+                continue
+
+            # Derive tags from file path
+            rel_path = str(filepath.relative_to(directory)).replace("\\", "/")
+            tags = self._derive_code_tags(filepath, directory)
+
+            # Store with hash for dedup — skip embedding in this phase
+            content = summary_text + f"\n\n<!-- chicory:code_hash={content_hash} -->"
+            short_summary = rel_path
+
+            result = self.handle_store_memory(
+                content=content,
+                tags=tags,
+                importance=0.6,
+                summary=short_summary,
+                skip_embedding=True,
+            )
+
+            new_memory_ids.append(result["memory_id"])
+            stats["files_summarized"] += 1
+            stats["memories_created"] += 1
+            stats["summaries"].append(rel_path)
+
+        # ── Phase 1b: Generate project overview ─────────────────────
+        # Build a high-level summary so broad queries like "what does
+        # this project do?" have something to match against.
+        overview_id = self._generate_project_overview(
+            directory, all_files, stats,
+        )
+        if overview_id:
+            new_memory_ids.append(overview_id)
+            stats["memories_created"] += 1
+
+        # ── Phase 2: Batch embed all new memories ─────────────────
+        if new_memory_ids:
+            self._batch_embed_memories(new_memory_ids)
+
+        stats["embeddings_created"] = len(new_memory_ids)
+        return stats
+
+    def _batch_embed_memories(self, memory_ids: list[str]) -> None:
+        """Batch-compute and store embeddings for memories that have none."""
+        from chicory.ingest.chunker import chunk_text_for_embedding
+
+        # Load content for all memories
+        placeholders = ",".join("?" * len(memory_ids))
+        rows = self._db.execute(
+            f"SELECT id, content FROM memories WHERE id IN ({placeholders})",
+            tuple(memory_ids),
+        ).fetchall()
+
+        if not rows:
+            return
+
+        # Collect all texts to embed (one per memory for short content,
+        # multiple chunks for long content)
+        embed_tasks: list[tuple[str, list[str]]] = []  # (memory_id, chunks)
+        all_texts: list[str] = []
+
+        for row in rows:
+            chunks = chunk_text_for_embedding(row["content"])
+            if not chunks:
+                continue
+            embed_tasks.append((row["id"], chunks))
+            all_texts.extend(chunks)
+
+        if not all_texts:
+            return
+
+        # Single batch embed call — one model load, one forward pass
+        all_vecs = self._embedding_engine.embed_batch(all_texts)
+
+        # Distribute vectors back to their memories
+        vec_idx = 0
+        for memory_id, chunks in embed_tasks:
+            n_chunks = len(chunks)
+            vecs = [all_vecs[vec_idx + i] for i in range(n_chunks)]
+            vec_idx += n_chunks
+
+            if n_chunks == 1:
+                self._embedding_engine.store_cached(memory_id, vecs[0])
+            else:
+                self._embedding_engine.store_chunks(memory_id, vecs)
+
+    def _generate_project_overview(
+        self,
+        directory: "Path",
+        all_files: list["Path"],
+        stats: dict[str, Any],
+    ) -> str | None:
+        """Build a project-level overview memory from the ingested files.
+
+        Aggregates directory structure, languages, purpose lines from
+        module docstrings, and key classes/functions so that broad queries
+        like 'what does this project do?' have something to match against.
+        """
+        import hashlib
+        import ast
+        from collections import Counter
+
+        project_name = directory.name
+
+        # Dedup: skip if overview already exists
+        overview_hash = hashlib.sha256(
+            f"project_overview:{project_name}:{stats['files_scanned']}".encode()
+        ).hexdigest()[:16]
+        existing = self._db.execute(
+            "SELECT id FROM memories WHERE content LIKE ?",
+            (f"%chicory:code_hash={overview_hash}%",),
+        ).fetchone()
+        if existing:
+            return None
+
+        # Gather structure
+        lang_counts: Counter[str] = Counter()
+        top_dirs: set[str] = set()
+        purposes: list[str] = []
+        classes: list[str] = []
+        ext_to_lang = {
+            ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+            ".jsx": "JavaScript", ".tsx": "TypeScript",
+            ".java": "Java", ".go": "Go", ".rs": "Rust", ".rb": "Ruby",
+            ".c": "C", ".cpp": "C++", ".h": "C/C++ header",
+            ".sh": "Shell", ".md": "Markdown", ".sql": "SQL",
+            ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML",
+            ".json": "JSON", ".css": "CSS", ".html": "HTML",
+        }
+
+        for f in all_files:
+            lang = ext_to_lang.get(f.suffix.lower(), f.suffix)
+            lang_counts[lang] += 1
+            rel = f.relative_to(directory)
+            if len(rel.parts) > 1:
+                top_dirs.add(rel.parts[0])
+
+            # Extract module docstrings and classes from Python files
+            if f.suffix.lower() == ".py":
+                try:
+                    source = f.read_text(encoding="utf-8", errors="replace")
+                    tree = ast.parse(source)
+                    docstring = ast.get_docstring(tree)
+                    if docstring:
+                        first_line = docstring.strip().split("\n")[0]
+                        if len(first_line) > 10:
+                            rel_path = str(rel).replace("\\", "/")
+                            purposes.append(f"- {rel_path}: {first_line}")
+                    for node in ast.iter_child_nodes(tree):
+                        if isinstance(node, ast.ClassDef):
+                            cls_doc = ast.get_docstring(node)
+                            desc = f" — {cls_doc.split(chr(10))[0]}" if cls_doc else ""
+                            rel_path = str(rel).replace("\\", "/")
+                            classes.append(f"- {node.name}{desc} ({rel_path})")
+                except Exception:
+                    pass
+
+        # Check for README
+        readme_summary = ""
+        for name in ("README.md", "readme.md", "README.rst", "README.txt"):
+            readme = directory / name
+            if readme.exists():
+                try:
+                    text = readme.read_text(encoding="utf-8", errors="replace")
+                    # Grab first meaningful paragraph
+                    for para in text.split("\n\n"):
+                        stripped = para.strip()
+                        if stripped and not stripped.startswith("#") and len(stripped) > 20:
+                            readme_summary = stripped[:500]
+                            break
+                except Exception:
+                    pass
+                break
+
+        # Compose overview
+        lines = [f"# Project Overview: {project_name}"]
+        if readme_summary:
+            lines.append(f"\n## Description\n{readme_summary}")
+        lines.append(f"\n## Structure")
+        lines.append(f"Files: {stats['files_scanned']}")
+        if top_dirs:
+            lines.append(f"Top-level directories: {', '.join(sorted(top_dirs))}")
+        lines.append(f"Languages: {', '.join(f'{lang} ({n})' for lang, n in lang_counts.most_common())}")
+        if purposes:
+            lines.append(f"\n## Module Purposes")
+            lines.extend(purposes[:20])
+        if classes:
+            lines.append(f"\n## Key Classes")
+            lines.extend(classes[:20])
+
+        content = "\n".join(lines)
+        content += f"\n\n<!-- chicory:code_hash={overview_hash} -->"
+
+        result = self.handle_store_memory(
+            content=content,
+            tags=["code-summary", "project-overview", project_name.lower()],
+            importance=0.8,
+            summary=f"Project overview: {project_name}",
+            skip_embedding=True,
+        )
+        return result["memory_id"]
+
+    @staticmethod
+    def _derive_code_tags(filepath: "Path", base_dir: "Path") -> list[str]:
+        """Derive tags for a code file from its path and extension."""
+        from pathlib import Path
+
+        tags = ["code-summary"]
+
+        ext_tags = {
+            ".py": "python", ".js": "javascript", ".ts": "typescript",
+            ".jsx": "javascript", ".tsx": "typescript",
+            ".java": "java", ".go": "go", ".rs": "rust", ".rb": "ruby",
+            ".c": "c", ".cpp": "cpp", ".h": "c",
+            ".sh": "shell", ".md": "markdown", ".sql": "sql",
+            ".yaml": "config", ".yml": "config", ".toml": "config",
+            ".json": "json", ".css": "css", ".html": "html",
+        }
+        ext_tag = ext_tags.get(filepath.suffix.lower())
+        if ext_tag:
+            tags.append(ext_tag)
+
+        # Directory-based tags (skip generic ones)
+        try:
+            rel = filepath.relative_to(base_dir)
+            skip = {"src", "lib", "dist", ".", "app"}
+            for part in rel.parent.parts:
+                tag = part.lower().replace(" ", "-").replace("_", "-")
+                if tag and len(tag) > 1 and tag not in skip:
+                    tags.append(tag)
+        except ValueError:
+            pass
+
+        return tags
+
     # ── Velocity computation ────────────────────────────────────────
 
     def _compute_sync_velocity(self) -> dict[str, Any]:
@@ -558,6 +883,20 @@ class Orchestrator:
                     memory_id=memory.id,
                 )
 
+        # Record trend events for temporal tags
+        now_dt = datetime.utcnow()
+        for temporal_name in [
+            f"month-{now_dt.strftime('%Y-%m')}",
+            f"day-{now_dt.strftime('%Y-%m-%d')}",
+        ]:
+            tag = self._tag_manager.get_by_name(temporal_name)
+            if tag:
+                self._trend_engine.record_event(
+                    tag_id=tag.id,
+                    event_type="assignment",
+                    memory_id=memory.id,
+                )
+
         # Record tag assignment events for derived letter tags
         letter_counts = self._tag_manager.decompose_to_letters(memory.tags)
         for letter in letter_counts:
@@ -569,38 +908,33 @@ class Orchestrator:
                     memory_id=memory.id,
                 )
 
-    def _on_retrieval_completed_async(
-        self,
-        retrieval_id: int,
-        results: list[tuple[Memory, float]],
-    ) -> None:
-        """Fire retrieval side effects in a background thread."""
-        t = threading.Thread(
-            target=self._on_retrieval_completed,
-            args=(retrieval_id, results),
-            daemon=True,
-        )
-        t.start()
-
     def _on_retrieval_completed(
         self,
         retrieval_id: int,
         results: list[tuple[Memory, float]],
     ) -> None:
-        """Fire after a retrieval is completed."""
+        """Fire after a retrieval is completed.
+
+        Split into two phases:
+          1. Cheap bookkeeping (every retrieval): salience, trends,
+             tag hits, reinforcement — all batch SQL, O(results).
+          2. Expensive detection (rate-limited): sync detection and
+             meta-analysis — touches all tags/events, O(tags + events).
+        """
         try:
-            self._on_retrieval_completed_inner(retrieval_id, results)
+            self._retrieval_bookkeeping(retrieval_id, results)
+            self._maybe_run_sync_detection()
         except Exception:
             logging.getLogger(__name__).exception(
                 "Error in retrieval side effects"
             )
 
-    def _on_retrieval_completed_inner(
+    def _retrieval_bookkeeping(
         self,
         retrieval_id: int,
         results: list[tuple[Memory, float]],
     ) -> None:
-        """Batched retrieval side effects."""
+        """Phase 1: cheap per-retrieval bookkeeping (batch SQL writes)."""
         if not results:
             return
 
@@ -625,17 +959,13 @@ class Orchestrator:
         if tag_hits:
             self._retrieval_tracker.log_tag_hits(retrieval_id, tag_hits)
 
-        # Reinforce synchronicity events — single table scan for all memories
+        # Reinforce synchronicity events — collect IDs then single batch UPDATE
         events_map = self._sync_detector.get_events_for_memories(memory_ids)
         reinforced_event_ids: set[int] = set()
         for mid in memory_ids:
-            for eid in events_map.get(mid, []):
-                if eid not in reinforced_event_ids:
-                    self._sync_detector.reinforce_event(eid)
-                    reinforced_event_ids.add(eid)
-
-        # Maybe run synchronicity detection (rate-limited)
-        self._maybe_run_sync_detection()
+            reinforced_event_ids.update(events_map.get(mid, []))
+        if reinforced_event_ids:
+            self._sync_detector.reinforce_events_batch(list(reinforced_event_ids))
 
     def _maybe_run_sync_detection(self) -> None:
         """Run synchronicity detection if enough time has passed."""

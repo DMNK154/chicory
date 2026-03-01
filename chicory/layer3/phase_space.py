@@ -52,11 +52,49 @@ class PhaseSpace:
         )
 
     def compute_all_coordinates(self) -> dict[int, PhaseCoordinate]:
-        """Compute phase coordinates for all active tags."""
-        rows = self._db.execute(
-            "SELECT id FROM tags WHERE is_active = 1"
+        """Compute phase coordinates for all active tags.
+
+        Batches trend computation (single query) and retrieval frequencies
+        (single base rate + single grouped frequency query) instead of
+        O(3t) per-tag queries.
+        """
+        # Batch trends: single query via compute_all_trends
+        all_trends = self._trends.compute_all_trends()
+        if not all_trends:
+            return {}
+
+        # Batch retrieval frequencies: one base rate + one grouped query
+        all_freqs = self._retrieval.get_all_normalized_frequencies(
+            list(all_trends.keys()),
+        )
+
+        # Batch tag names
+        tag_ids = list(all_trends.keys())
+        placeholders = ",".join("?" * len(tag_ids))
+        name_rows = self._db.execute(
+            f"SELECT id, name FROM tags WHERE id IN ({placeholders})",
+            tuple(tag_ids),
         ).fetchall()
-        return {r["id"]: self.compute_coordinate(r["id"]) for r in rows}
+        tag_names = {r["id"]: r["name"] for r in name_rows}
+
+        result: dict[int, PhaseCoordinate] = {}
+        for tag_id, trend in all_trends.items():
+            temperature = trend.temperature
+            retrieval_freq = all_freqs.get(tag_id, 0.0)
+            quadrant = self._classify(temperature, retrieval_freq)
+            off_diag = (retrieval_freq - temperature) / math.sqrt(2)
+            tag_name = tag_names.get(tag_id, f"tag-{tag_id}")
+
+            result[tag_id] = PhaseCoordinate(
+                tag_id=tag_id,
+                tag_name=tag_name,
+                temperature=temperature,
+                retrieval_freq=retrieval_freq,
+                quadrant=quadrant,
+                off_diagonal_distance=off_diag,
+            )
+
+        return result
 
     def get_quadrant_populations(self) -> dict[Quadrant, list[PhaseCoordinate]]:
         """Group all tags by their quadrant."""

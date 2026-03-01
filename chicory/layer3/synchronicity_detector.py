@@ -45,11 +45,31 @@ class SynchronicityDetector:
         self._embeddings = embedding_engine
 
     def check_for_synchronicities(self) -> list[SynchronicityEvent]:
-        """Run all detection methods and return any events found."""
+        """Run all detection methods and return any events found.
+
+        Prefetches shared data (recent retrievals, retrieval→memory maps)
+        once instead of letting each detector query independently.
+        """
+        # Shared prefetch: recent retrievals + their memory IDs (1 + 1 query)
+        lookback = max(
+            self._config.sync_cross_domain_lookback_hours,
+            self._config.sync_semantic_convergence_lookback_hours,
+        )
+        recent_retrievals = self._retrieval.get_recent_retrievals(
+            limit=20, since_hours=lookback,
+        )
+        retrieval_memory_map = self._retrieval.get_retrieval_result_memory_ids_batch(
+            [r.id for r in recent_retrievals],
+        ) if recent_retrievals else {}
+
         events: list[SynchronicityEvent] = []
         events.extend(self.detect_dormant_reactivation())
-        events.extend(self.detect_cross_domain_bridges())
-        events.extend(self.detect_semantic_convergence())
+        events.extend(self._detect_cross_domain_bridges(
+            recent_retrievals[:10], retrieval_memory_map,
+        ))
+        events.extend(self._detect_semantic_convergence(
+            recent_retrievals, retrieval_memory_map,
+        ))
 
         for event in events:
             event_id = self.record_event(event)
@@ -108,50 +128,83 @@ class SynchronicityDetector:
         return events
 
     def detect_cross_domain_bridges(self) -> list[SynchronicityEvent]:
-        """Detect retrievals that bridge previously unrelated tag clusters."""
+        """Public convenience wrapper — fetches its own data."""
         recent = self._retrieval.get_recent_retrievals(
             limit=10, since_hours=self._config.sync_cross_domain_lookback_hours,
         )
-        events = []
+        if not recent:
+            return []
+        mem_map = self._retrieval.get_retrieval_result_memory_ids_batch(
+            [r.id for r in recent],
+        )
+        return self._detect_cross_domain_bridges(recent, mem_map)
 
+    def _detect_cross_domain_bridges(
+        self,
+        recent: list,
+        retrieval_memory_map: dict[int, list[str]],
+    ) -> list[SynchronicityEvent]:
+        """Detect retrievals that bridge previously unrelated tag clusters.
+
+        Uses batch queries: one for co-occurrences (→ set), one for tag
+        frequencies (→ vector).  Pair checks are set lookups, not SQL.
+        """
+        if not recent:
+            return []
+
+        all_memory_ids: list[str] = []
+        for mids in retrieval_memory_map.values():
+            all_memory_ids.extend(mids)
+
+        if not all_memory_ids:
+            return []
+
+        # Single batch: tag IDs for every retrieved memory
+        tag_ids_map = self._tags.get_tag_ids_for_memories(all_memory_ids)
+
+        # Single query: total memory count
+        total_memories = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM memories WHERE is_archived = 0"
+        ).fetchone()["cnt"]
+        if total_memories == 0:
+            return []
+
+        # Single query: tag frequency vector  {tag_id → freq}
+        freq_rows = self._db.execute(
+            "SELECT tag_id, COUNT(*) as cnt FROM memory_tags GROUP BY tag_id"
+        ).fetchall()
+        tag_freq: dict[int, float] = {
+            r["tag_id"]: r["cnt"] / total_memories for r in freq_rows
+        }
+
+        # Single query: co-occurrence set  {(lo, hi)}
+        co_pairs = self._tags.get_all_co_occurrences(min_count=1)
+        co_set: set[tuple[int, int]] = {
+            (min(a, b), max(a, b)) for a, b, _ in co_pairs
+        }
+
+        events: list[SynchronicityEvent] = []
         for retrieval in recent:
-            # Get all tag IDs from the memories returned
-            memory_ids = self._retrieval.get_retrieval_result_memory_ids(retrieval.id)
+            mids = retrieval_memory_map.get(retrieval.id, [])
             all_tags: set[int] = set()
-            for mid in memory_ids:
-                tag_ids = self._tags.get_tag_ids_for_memory(mid)
-                all_tags.update(tag_ids)
+            for mid in mids:
+                all_tags.update(tag_ids_map.get(mid, []))
 
             if len(all_tags) < 2:
                 continue
 
-            # Check all tag pairs for co-occurrence
             for tag_a, tag_b in itertools.combinations(sorted(all_tags), 2):
-                co_count = self._tags.get_co_occurrence_count(tag_a, tag_b)
-                if co_count > 0:
-                    continue  # Already known to co-occur
-
-                # Compute surprise under independence
-                total_memories = self._db.execute(
-                    "SELECT COUNT(*) as cnt FROM memories WHERE is_archived = 0"
-                ).fetchone()["cnt"]
-
-                if total_memories == 0:
+                if (tag_a, tag_b) in co_set:
                     continue
 
-                freq_a = self._db.execute(
-                    "SELECT COUNT(*) as cnt FROM memory_tags WHERE tag_id = ?",
-                    (tag_a,),
-                ).fetchone()["cnt"] / total_memories
-
-                freq_b = self._db.execute(
-                    "SELECT COUNT(*) as cnt FROM memory_tags WHERE tag_id = ?",
-                    (tag_b,),
-                ).fetchone()["cnt"] / total_memories
+                freq_a = tag_freq.get(tag_a, 0.0)
+                freq_b = tag_freq.get(tag_b, 0.0)
+                if freq_a == 0 or freq_b == 0:
+                    continue
 
                 expected = freq_a * freq_b * total_memories
                 if expected >= 1.0:
-                    continue  # Not actually surprising
+                    continue
 
                 surprise = -math.log(max(expected / total_memories, 1e-10))
                 if surprise < self._config.cross_domain_surprise_threshold:
@@ -170,25 +223,46 @@ class SynchronicityDetector:
                     strength=surprise,
                     quadrant="cross_domain",
                     involved_tags=json.dumps([tag_a, tag_b]),
-                    involved_memories=json.dumps(memory_ids),
+                    involved_memories=json.dumps(mids),
                     trigger_retrieval_id=retrieval.id,
                 ))
 
         return events
 
     def detect_semantic_convergence(self) -> list[SynchronicityEvent]:
-        """Detect memories with no shared tags but high embedding similarity
-        that were retrieved in separate events."""
+        """Public convenience wrapper — fetches its own data."""
         recent = self._retrieval.get_recent_retrievals(
             limit=20, since_hours=self._config.sync_semantic_convergence_lookback_hours,
         )
         if len(recent) < 2:
             return []
+        mem_map = self._retrieval.get_retrieval_result_memory_ids_batch(
+            [r.id for r in recent],
+        )
+        return self._detect_semantic_convergence(recent, mem_map)
 
-        # Collect (memory_id, retrieval_id) pairs
+    def _detect_semantic_convergence(
+        self,
+        recent: list,
+        all_result_map: dict[int, list[str]],
+    ) -> list[SynchronicityEvent]:
+        """Detect memories with no shared tags but high embedding similarity
+        that were retrieved in separate events.
+
+        All filtering is done via matrix operations:
+          similarity  = V @ V.T
+          tag_overlap = M @ M.T > 0
+          same_group  = R[:,None] == R[None,:]
+          valid       = upper_tri & (sim >= θ) & ~overlap & ~same_group
+        Only the (usually few) surviving pairs are iterated to build events.
+        """
+        if len(recent) < 2:
+            return []
+
+        # Collect (memory_id → first retrieval_id)
         memory_retrieval_map: dict[str, int] = {}
         for r in recent:
-            for mid in self._retrieval.get_retrieval_result_memory_ids(r.id):
+            for mid in all_result_map.get(r.id, []):
                 if mid not in memory_retrieval_map:
                     memory_retrieval_map[mid] = r.id
 
@@ -196,47 +270,62 @@ class SynchronicityDetector:
         if len(memory_ids) < 2:
             return []
 
-        # Load embeddings
+        # Load only the embeddings we need
         all_cached = self._embeddings.get_all_cached()
-        available = [(mid, all_cached[mid]) for mid in memory_ids if mid in all_cached]
-        if len(available) < 2:
+        available_ids = [mid for mid in memory_ids if mid in all_cached]
+        if len(available_ids) < 2:
             return []
 
-        events = []
+        n = len(available_ids)
+
+        # ── Embedding matrix → similarity via matmul ──────────────
+        V = np.stack([all_cached[mid] for mid in available_ids])
+        S = V @ V.T  # (n, n) cosine similarity (vectors are unit-normed)
+
+        # ── Tag membership matrix → overlap via matmul ────────────
+        tags_map = self._tags.get_tag_ids_for_memories(available_ids)
+        all_tag_ids: set[int] = set()
+        for tids in tags_map.values():
+            all_tag_ids.update(tids)
+        tag_list = sorted(all_tag_ids)
+        tag_to_col = {t: i for i, t in enumerate(tag_list)}
+
+        M = np.zeros((n, len(tag_list)), dtype=np.float32)
+        for i, mid in enumerate(available_ids):
+            for tid in tags_map.get(mid, []):
+                M[i, tag_to_col[tid]] = 1.0
+
+        overlap = (M @ M.T) > 0  # (n, n) bool — True if shared tags
+
+        # ── Same-retrieval mask ───────────────────────────────────
+        R = np.array([memory_retrieval_map[mid] for mid in available_ids])
+        same_group = R[:, None] == R[None, :]
+
+        # ── Combined mask — all filtering in one shot ─────────────
         threshold = self._config.semantic_convergence_threshold
+        upper_tri = np.triu(np.ones((n, n), dtype=bool), k=1)
+        valid = upper_tri & (S >= threshold) & ~overlap & ~same_group
 
-        for i in range(len(available)):
-            for j in range(i + 1, len(available)):
-                mid_a, vec_a = available[i]
-                mid_b, vec_b = available[j]
-
-                # Must be from different retrieval events
-                if memory_retrieval_map[mid_a] == memory_retrieval_map[mid_b]:
-                    continue
-
-                # Must have no shared tags
-                tags_a = set(self._tags.get_tag_ids_for_memory(mid_a))
-                tags_b = set(self._tags.get_tag_ids_for_memory(mid_b))
-                if tags_a & tags_b:
-                    continue
-
-                similarity = float(np.dot(vec_a, vec_b))
-                if similarity < threshold:
-                    continue
-
-                all_tag_ids = list(tags_a | tags_b)
-                events.append(SynchronicityEvent(
-                    event_type="unexpected_semantic_cluster",
-                    description=(
-                        f"Memories with no shared tags have embedding similarity "
-                        f"of {similarity:.2f}, retrieved in separate events. "
-                        f"This suggests an unconscious thematic thread."
-                    ),
-                    strength=similarity,
-                    quadrant="semantic_convergence",
-                    involved_tags=json.dumps(all_tag_ids),
-                    involved_memories=json.dumps([mid_a, mid_b]),
-                ))
+        # ── Build events only for surviving pairs ─────────────────
+        pairs = np.argwhere(valid)
+        events: list[SynchronicityEvent] = []
+        for i, j in pairs:
+            mid_a, mid_b = available_ids[i], available_ids[j]
+            all_involved = list(
+                set(tags_map.get(mid_a, [])) | set(tags_map.get(mid_b, []))
+            )
+            events.append(SynchronicityEvent(
+                event_type="unexpected_semantic_cluster",
+                description=(
+                    f"Memories with no shared tags have embedding similarity "
+                    f"of {S[i, j]:.2f}, retrieved in separate events. "
+                    f"This suggests an unconscious thematic thread."
+                ),
+                strength=float(S[i, j]),
+                quadrant="semantic_convergence",
+                involved_tags=json.dumps(all_involved),
+                involved_memories=json.dumps([mid_a, mid_b]),
+            ))
 
         return events
 
@@ -328,15 +417,22 @@ class SynchronicityDetector:
         return event.strength * boost * decay
 
     def reinforce_event(self, event_id: int) -> None:
-        """Reinforce a synchronicity event: reset decay clock and increment count."""
+        """Reinforce a single synchronicity event."""
+        self.reinforce_events_batch([event_id])
+
+    def reinforce_events_batch(self, event_ids: list[int]) -> None:
+        """Reinforce multiple synchronicity events in a single UPDATE."""
+        if not event_ids:
+            return
         now = datetime.utcnow().isoformat()
+        placeholders = ",".join("?" * len(event_ids))
         self._db.execute(
-            """
+            f"""
             UPDATE synchronicity_events
             SET last_reinforced = ?, reinforcement_count = reinforcement_count + 1
-            WHERE id = ?
+            WHERE id IN ({placeholders})
             """,
-            (now, event_id),
+            (now, *event_ids),
         )
         self._db.connection.commit()
 
@@ -345,14 +441,26 @@ class SynchronicityDetector:
         return self.get_events_for_memories([memory_id]).get(memory_id, [])
 
     def get_events_for_memories(self, memory_ids: list[str]) -> dict[str, list[int]]:
-        """Return event IDs for multiple memories in a single table scan."""
+        """Return event IDs for multiple memories using indexed LIKE filters.
+
+        Instead of scanning every row and JSON-parsing each, build a WHERE
+        clause that lets SQLite skip rows whose involved_memories blob
+        cannot contain any of the requested IDs.
+        """
         if not memory_ids:
             return {}
         result: dict[str, list[int]] = {mid: [] for mid in memory_ids}
         memory_id_set = set(memory_ids)
 
+        # Build OR-ed LIKE filters so SQLite can skip non-matching rows
+        like_clauses = " OR ".join(
+            "involved_memories LIKE ?" for _ in memory_ids
+        )
+        like_params = tuple(f"%{mid}%" for mid in memory_ids)
+
         rows = self._db.execute(
-            "SELECT id, involved_memories FROM synchronicity_events WHERE involved_memories IS NOT NULL"
+            f"SELECT id, involved_memories FROM synchronicity_events WHERE {like_clauses}",
+            like_params,
         ).fetchall()
 
         for r in rows:

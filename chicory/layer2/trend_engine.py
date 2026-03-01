@@ -115,11 +115,70 @@ class TrendEngine:
         )
 
     def compute_all_trends(self) -> dict[int, TrendVector]:
-        """Compute trends for all active tags."""
+        """Compute trends for all active tags in a single query.
+
+        Fetches all tag events in one pass and groups by tag_id in Python,
+        avoiding O(t) separate queries.
+        """
+        W = self._config.trend_window_hours
+        halflife = W / 2
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=W)
+
+        # Single query: all events for all active tags within the window
         rows = self._db.execute(
+            """
+            SELECT te.tag_id, te.occurred_at, te.weight
+            FROM tag_events te
+            JOIN tags t ON te.tag_id = t.id
+            WHERE t.is_active = 1 AND te.occurred_at > ?
+            ORDER BY te.tag_id
+            """,
+            (cutoff.isoformat(),),
+        ).fetchall()
+
+        # Group events by tag_id
+        from collections import defaultdict
+        events_by_tag: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        for r in rows:
+            t = datetime.fromisoformat(r["occurred_at"])
+            age = (now - t).total_seconds() / 3600
+            events_by_tag[r["tag_id"]].append((age, r["weight"]))
+
+        # Also include active tags with zero events
+        tag_rows = self._db.execute(
             "SELECT id FROM tags WHERE is_active = 1"
         ).fetchall()
-        return {r["id"]: self.compute_trend(r["id"]) for r in rows}
+
+        norm = self._get_normalization_factor()
+        w_l = self._config.trend_level_weight
+        w_v = self._config.trend_velocity_weight
+        w_j = self._config.trend_jerk_weight
+
+        result: dict[int, TrendVector] = {}
+        for tr in tag_rows:
+            tag_id = tr["id"]
+            events = events_by_tag.get(tag_id)
+            if not events:
+                result[tag_id] = TrendVector(
+                    tag_id=tag_id, level=0.0, velocity=0.0,
+                    jerk=0.0, temperature=0.0, event_count=0,
+                )
+                continue
+
+            level = weighted_sum_with_decay(events, halflife)
+            velocity = split_window_derivative(events, W, halflife)
+            jerk = three_part_jerk(events, W, halflife)
+
+            raw = w_l * level + w_v * max(0, velocity) + w_j * max(0, jerk)
+            temperature = sigmoid(raw / norm) if norm > 0 else 0.5
+
+            result[tag_id] = TrendVector(
+                tag_id=tag_id, level=level, velocity=velocity,
+                jerk=jerk, temperature=temperature, event_count=len(events),
+            )
+
+        return result
 
     def snapshot_trends(self) -> None:
         """Persist current trends for all active tags."""
@@ -174,9 +233,14 @@ class TrendEngine:
         return row["temperature"] if row else None
 
     def _get_normalization_factor(self) -> float:
-        """Compute 90th-percentile raw score across all tags for normalization."""
+        """Compute 90th-percentile raw score across all tags for normalization.
+
+        Uses a single query to fetch all tag events, groups by tag in Python.
+        """
         if self._norm_factor is not None:
             return self._norm_factor
+
+        from collections import defaultdict
 
         W = self._config.trend_window_hours
         halflife = W / 2
@@ -191,26 +255,33 @@ class TrendEngine:
             self._norm_factor = 1.0
             return 1.0
 
-        raw_scores = []
+        # Single query: all events for all active tags
+        event_rows = self._db.execute(
+            """
+            SELECT te.tag_id, te.occurred_at, te.weight
+            FROM tag_events te
+            JOIN tags t ON te.tag_id = t.id
+            WHERE t.is_active = 1 AND te.occurred_at > ?
+            """,
+            (cutoff.isoformat(),),
+        ).fetchall()
+
+        events_by_tag: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        for r in event_rows:
+            t = datetime.fromisoformat(r["occurred_at"])
+            age = (now - t).total_seconds() / 3600
+            events_by_tag[r["tag_id"]].append((age, r["weight"]))
+
         w_l = self._config.trend_level_weight
         w_v = self._config.trend_velocity_weight
         w_j = self._config.trend_jerk_weight
 
+        raw_scores = []
         for tr in tag_rows:
-            rows = self._db.execute(
-                "SELECT occurred_at, weight FROM tag_events WHERE tag_id = ? AND occurred_at > ?",
-                (tr["id"], cutoff.isoformat()),
-            ).fetchall()
-
-            if not rows:
+            events = events_by_tag.get(tr["id"])
+            if not events:
                 raw_scores.append(0.0)
                 continue
-
-            events = []
-            for r in rows:
-                t = datetime.fromisoformat(r["occurred_at"])
-                age = (now - t).total_seconds() / 3600
-                events.append((age, r["weight"]))
 
             level = weighted_sum_with_decay(events, halflife)
             velocity = split_window_derivative(events, W, halflife)

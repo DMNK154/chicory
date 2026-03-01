@@ -11,7 +11,7 @@ class ChicoryConfig(BaseModel):
     """All configuration for the Chicory memory system."""
 
     # Paths
-    db_path: Path = Field(default=Path("chicory.db"))
+    db_path: Path = Field(default_factory=lambda: Path.home() / ".chicory" / "chicory.db")
 
     # LLM
     anthropic_api_key: str = Field(default="")
@@ -111,7 +111,11 @@ def load_config(**overrides) -> ChicoryConfig:
     """Load config from .env file and environment variables, with overrides."""
     from dotenv import dotenv_values
 
-    env = dotenv_values(".env")
+    # Look for .env in cwd first, then next to the chicory package root
+    env_path = Path(".env")
+    if not env_path.exists():
+        env_path = Path(__file__).resolve().parent.parent / ".env"
+    env = dotenv_values(str(env_path))
 
     kwargs: dict = {}
     mapping = {

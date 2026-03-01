@@ -47,8 +47,9 @@ class MemoryStore:
         salience_model: float = 0.5,
         source_model: str | None = None,
         summary: str | None = None,
+        skip_embedding: bool = False,
     ) -> Memory:
-        """Store a new memory with tags and embedding."""
+        """Store a new memory with tags and (optionally) embedding."""
         memory_id = str(uuid.uuid4())
         now = datetime.utcnow().isoformat()
         model = source_model or self._config.llm_model
@@ -78,20 +79,35 @@ class MemoryStore:
                     (memory_id, tag.id),
                 )
 
-            # Derive and assign single-letter tags from word tags
+            # Assign temporal date-period tags
+            now_dt = datetime.utcnow()
+            temporal_names = [
+                f"month-{now_dt.strftime('%Y-%m')}",
+                f"day-{now_dt.strftime('%Y-%m-%d')}",
+                f"minute-{now_dt.strftime('%Y-%m-%dt%H-%M')}",
+            ]
+            temporal_tags = self._tags.validate_tags(temporal_names)
+            for tag in temporal_tags:
+                self._db.execute(
+                    "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) VALUES (?, ?, 'system')",
+                    (memory_id, tag.id),
+                )
+
+            # Derive and assign single-letter tags from word tags (excludes temporal)
             letter_counts = self._tags.decompose_to_letters(tags)
             if letter_counts:
                 self._tags.assign_letter_tags(memory_id, letter_counts)
 
         # Generate and cache embeddings (outside transaction — not critical).
         # Chunk long content so each chunk fits the embedding model's token limit.
-        chunks = chunk_text_for_embedding(content)
-        if len(chunks) <= 1:
-            embedding = self._embedding.embed(content)
-            self._embedding.store_cached(memory_id, embedding)
-        else:
-            vecs = list(self._embedding.embed_batch(chunks))
-            self._embedding.store_chunks(memory_id, vecs)
+        if not skip_embedding:
+            chunks = chunk_text_for_embedding(content)
+            if len(chunks) <= 1:
+                embedding = self._embedding.embed(content)
+                self._embedding.store_cached(memory_id, embedding)
+            else:
+                vecs = list(self._embedding.embed_batch(chunks))
+                self._embedding.store_chunks(memory_id, vecs)
 
         tag_names = [t.name for t in tag_objects]
         return Memory(
@@ -215,18 +231,20 @@ class MemoryStore:
         for mem, sim in semantic_results:
             scores[mem.id] = w_sem * sim
 
-        # Tag scores (if tags provided)
+        # Tag scores (if tags provided): semantic search filtered to tagged
+        # memories so tag matches are re-ranked by relevance, not flat 1.0.
         if tags:
-            tag_results = self.retrieve_by_tags(tags)
-            for mem in tag_results:
-                tag_score = 1.0  # Binary tag match
-                scores[mem.id] = scores.get(mem.id, 0.0) + w_tag * tag_score
+            tag_semantic = self.retrieve_semantic(query, top_k=k, tag_filter=tags)
+            for mem, sim in tag_semantic:
+                scores[mem.id] = scores.get(mem.id, 0.0) + w_tag * sim
 
         # Lattice resonance boost for structurally connected dormant memories
         if self._sync_engine and self._config.lattice_retrieval_boost_enabled:
+            top5_ids = [mem.id for mem, _ in semantic_results[:5]]
+            tag_ids_map = self._tags.get_tag_ids_for_memories(top5_ids)
             context_tag_ids: set[int] = set()
-            for mem, _ in semantic_results[:5]:
-                context_tag_ids.update(self._tags.get_tag_ids_for_memory(mem.id))
+            for tids in tag_ids_map.values():
+                context_tag_ids.update(tids)
 
             if context_tag_ids:
                 resonant = self._sync_engine.get_resonant_memory_ids_fast(

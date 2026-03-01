@@ -23,6 +23,7 @@ def dispatch_tool_call(
         "get_meta_patterns": _handle_get_meta_patterns,
         "get_lattice_resonances": _handle_get_lattice_resonances,
         "deep_retrieve": _handle_deep_retrieve,
+        "ingest_codebase": _handle_ingest_codebase,
     }
 
     handler = handlers.get(tool_name)
@@ -79,4 +80,12 @@ def _handle_deep_retrieve(o: "Orchestrator", inp: dict) -> dict:
         tags=inp.get("tags"),
         max_depth=inp.get("max_depth"),
         per_level_k=inp.get("per_level_k"),
+    )
+
+
+def _handle_ingest_codebase(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_ingest_codebase(
+        path=inp["path"],
+        file_patterns=inp.get("file_patterns"),
+        exclude_patterns=inp.get("exclude_patterns"),
     )

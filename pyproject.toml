@@ -32,9 +32,13 @@ dashboard = [
     "plotly>=5.18",
     "networkx>=3.0",
 ]
+mcp = [
+    "mcp>=1.0",
+]
 
 [project.scripts]
 chicory = "chicory.cli.app:app"
+chicory-mcp = "chicory.mcp.server:main"
 
 [tool.setuptools.packages.find]
 include = ["chicory*"]
