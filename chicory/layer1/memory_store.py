@@ -79,6 +79,16 @@ class MemoryStore:
                     (memory_id, tag.id),
                 )
 
+            # Split compound tags into constituent words
+            split_words = self._tags.split_compound_tags(tags)
+            if split_words:
+                split_tag_objects = self._tags.validate_tags(split_words)
+                for tag in split_tag_objects:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) VALUES (?, ?, 'system')",
+                        (memory_id, tag.id),
+                    )
+
             # Assign temporal date-period tags
             now_dt = datetime.utcnow()
             temporal_names = [
@@ -93,8 +103,8 @@ class MemoryStore:
                     (memory_id, tag.id),
                 )
 
-            # Derive and assign single-letter tags from word tags (excludes temporal)
-            letter_counts = self._tags.decompose_to_letters(tags)
+            # Derive and assign single-letter tags from word tags + split words
+            letter_counts = self._tags.decompose_to_letters(tags + split_words)
             if letter_counts:
                 self._tags.assign_letter_tags(memory_id, letter_counts)
 

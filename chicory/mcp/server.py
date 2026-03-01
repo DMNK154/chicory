@@ -53,6 +53,21 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     config = load_config()
     orchestrator = Orchestrator(config)
     logger.info("Chicory orchestrator initialized (db=%s)", config.db_path)
+
+    # Eagerly load embedding model + FAISS index in the main thread.
+    # Loading lazily in FastMCP's thread pool deadlocks (torch/asyncio conflict).
+    try:
+        t0 = time.time()
+        embedding = orchestrator._memory_store._embedding
+        embedding._load_model()
+        logger.info("Embedding model loaded in %.1fs", time.time() - t0)
+
+        t1 = time.time()
+        embedding.search_similar(embedding.embed("warmup"), top_k=1)
+        logger.info("FAISS index built in %.1fs", time.time() - t1)
+    except Exception:
+        logger.exception("Eager model/index load failed (will retry lazily)")
+
     try:
         yield AppContext(orchestrator=orchestrator)
     finally:
@@ -73,7 +88,12 @@ mcp_server = FastMCP(
 
 def _call(ctx: Context, tool_name: str, tool_input: dict) -> str:
     """Dispatch a tool call and return JSON string result."""
-    logger.info("TOOL CALL: %s  input_keys=%s", tool_name, list(tool_input.keys()))
+    import threading
+
+    logger.info(
+        "TOOL CALL: %s  input_keys=%s  thread=%s",
+        tool_name, list(tool_input.keys()), threading.current_thread().name,
+    )
     t0 = time.time()
     orchestrator: Orchestrator = ctx.request_context.lifespan_context.orchestrator
     try:

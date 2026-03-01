@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -916,17 +917,33 @@ class Orchestrator:
         """Fire after a retrieval is completed.
 
         Split into two phases:
-          1. Cheap bookkeeping (every retrieval): salience, trends,
+          1. Cheap bookkeeping (synchronous): salience, trends,
              tag hits, reinforcement — all batch SQL, O(results).
-          2. Expensive detection (rate-limited): sync detection and
-             meta-analysis — touches all tags/events, O(tags + events).
+          2. Expensive detection (background thread, rate-limited):
+             sync detection and meta-analysis — runs without blocking
+             the retrieval response.
         """
         try:
             self._retrieval_bookkeeping(retrieval_id, results)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Error in retrieval bookkeeping"
+            )
+
+        # Fire-and-forget: don't block the response on sync detection
+        thread = threading.Thread(
+            target=self._sync_detection_background,
+            daemon=True,
+        )
+        thread.start()
+
+    def _sync_detection_background(self) -> None:
+        """Run sync detection in a background thread."""
+        try:
             self._maybe_run_sync_detection()
         except Exception:
             logging.getLogger(__name__).exception(
-                "Error in retrieval side effects"
+                "Error in background sync detection"
             )
 
     def _retrieval_bookkeeping(

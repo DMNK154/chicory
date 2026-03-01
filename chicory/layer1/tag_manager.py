@@ -212,6 +212,28 @@ class TagManager:
         return result
 
     @staticmethod
+    def split_compound_tags(tag_names: list[str]) -> list[str]:
+        """Split hyphen/underscore-joined tags into constituent words.
+
+        E.g. ["code-summary", "python"] → ["code", "summary"]
+        Single-character and purely numeric parts are excluded.
+        Parts that are already in the original tag list are excluded.
+        """
+        originals = {_normalize_tag(n) for n in tag_names}
+        parts: set[str] = set()
+
+        for name in tag_names:
+            words = re.split(r"[-_]", name.strip().lower())
+            if len(words) <= 1:
+                continue
+            for word in words:
+                cleaned = re.sub(r"[^a-z0-9]", "", word)
+                if len(cleaned) > 1 and not cleaned.isdigit() and cleaned not in originals:
+                    parts.add(cleaned)
+
+        return sorted(parts)
+
+    @staticmethod
     def decompose_to_letters(tag_names: list[str]) -> dict[str, int]:
         """Decompose tag names into letter frequency counts.
 
