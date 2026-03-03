@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 TABLES = [
     # -- Schema version tracking --
@@ -259,6 +259,23 @@ TABLES = [
         notes           TEXT
     )
     """,
+
+    # -- Commons Layer: Pending Signals --
+    """
+    CREATE TABLE IF NOT EXISTS pending_signals (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id      TEXT NOT NULL,
+        op_type         TEXT NOT NULL,
+        tags            TEXT NOT NULL,
+        strength        REAL,
+        event_type      TEXT,
+        created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        processed       INTEGER NOT NULL DEFAULT 0,
+        tag_set_hash    TEXT NOT NULL,
+        UNIQUE(project_id, op_type, tag_set_hash, created_at)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pending_signals_unprocessed ON pending_signals(processed) WHERE processed = 0",
 ]
 
 
@@ -289,6 +306,8 @@ def apply_schema(db: DatabaseEngine) -> None:
             _migrate_v7_to_v8(db)
         if current_version <= 8:
             _migrate_v8_to_v9(db)
+        if current_version <= 9:
+            _migrate_v9_to_v10(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -302,7 +321,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Semiotic layer: directional associative strength in tensor"),
+                (SCHEMA_VERSION, "Commons layer: cross-project signal federation"),
             )
 
 
@@ -440,3 +459,11 @@ def _migrate_v8_to_v9(db: DatabaseEngine) -> None:
     db.execute(
         "ALTER TABLE tag_relational_tensor ADD COLUMN semiotic_reverse REAL NOT NULL DEFAULT 0.0"
     )
+
+
+def _migrate_v9_to_v10(db: DatabaseEngine) -> None:
+    """Add pending_signals table for cross-project commons federation.
+
+    Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass

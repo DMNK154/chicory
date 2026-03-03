@@ -15,7 +15,7 @@ def _normalize_tag(name: str) -> str:
     """Normalize a tag name: lowercase, strip, replace spaces with hyphens."""
     name = name.strip().lower()
     name = re.sub(r"\s+", "-", name)
-    name = re.sub(r"[^a-z0-9\-]", "", name)
+    name = re.sub(r"[^a-z0-9\-:]", "", name)
     return name
 
 
@@ -196,6 +196,17 @@ class TagManager:
             (memory_id,),
         ).fetchall()
         return [r["tag_id"] for r in rows]
+
+    def get_names_by_ids(self, tag_ids: list[int]) -> dict[int, str]:
+        """Get tag names for multiple tag IDs in a single query."""
+        if not tag_ids:
+            return {}
+        placeholders = ",".join("?" * len(tag_ids))
+        rows = self._db.execute(
+            f"SELECT id, name FROM tags WHERE id IN ({placeholders})",
+            tuple(tag_ids),
+        ).fetchall()
+        return {r["id"]: r["name"] for r in rows}
 
     def get_tag_ids_for_memories(self, memory_ids: list[str]) -> dict[str, list[int]]:
         """Get tag IDs for multiple memories in a single query."""
