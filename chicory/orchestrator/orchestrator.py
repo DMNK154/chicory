@@ -83,6 +83,17 @@ class Orchestrator:
         self._last_sync_check: datetime | None = datetime.utcnow()
         self._last_meta_check: datetime | None = datetime.utcnow()
 
+        # Commons signal emitter (optional)
+        self._signal_emitter = None
+        if config.commons_enabled and config.commons_project_id:
+            try:
+                from chicory_commons import SignalEmitter
+            except ImportError:
+                SignalEmitter = None
+            if SignalEmitter is not None:
+                self._signal_emitter = SignalEmitter(config)
+            self._signal_emitter.start()
+
     @property
     def db(self) -> DatabaseEngine:
         return self._db
@@ -137,7 +148,9 @@ class Orchestrator:
             self._sync_engine.rebuild_tensor()
 
     def close(self) -> None:
-        """Close database connection."""
+        """Close database connection and signal emitter."""
+        if self._signal_emitter:
+            self._signal_emitter.stop()
         self._db.close()
 
     # ── Tool call handlers ──────────────────────────────────────────
@@ -909,6 +922,10 @@ class Orchestrator:
                     memory_id=memory.id,
                 )
 
+        # Emit commons signal
+        if self._signal_emitter:
+            self._signal_emitter.emit_store(memory.tags)
+
     def _on_retrieval_completed(
         self,
         retrieval_id: int,
@@ -984,6 +1001,15 @@ class Orchestrator:
         if reinforced_event_ids:
             self._sync_detector.reinforce_events_batch(list(reinforced_event_ids))
 
+        # Emit commons retrieve signal with all result tag names
+        if self._signal_emitter:
+            all_tag_ids: set[int] = set()
+            for tids in tag_ids_map.values():
+                all_tag_ids.update(tids)
+            if all_tag_ids:
+                id_to_name = self._tag_manager.get_names_by_ids(list(all_tag_ids))
+                self._signal_emitter.emit_retrieve(list(id_to_name.values()))
+
     def _maybe_run_sync_detection(self) -> None:
         """Run synchronicity detection if enough time has passed."""
         now = datetime.utcnow()
@@ -996,6 +1022,19 @@ class Orchestrator:
         # Place new events on the prime Ramsey lattice
         if new_events:
             self._sync_engine.place_events_batch(new_events)
+
+            # Emit synchronicity signals to commons (immediate flush)
+            if self._signal_emitter:
+                for event in new_events:
+                    involved_tag_ids = json.loads(event.involved_tags)
+                    id_to_name = self._tag_manager.get_names_by_ids(involved_tag_ids)
+                    tag_names = list(id_to_name.values())
+                    if tag_names:
+                        self._signal_emitter.emit_synchronicity(
+                            tags=tag_names,
+                            strength=event.strength,
+                            event_type=event.event_type,
+                        )
 
         # Also maybe run meta-analysis
         self._maybe_run_meta_analysis()

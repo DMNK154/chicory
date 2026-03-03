@@ -53,6 +53,9 @@ dashboard = [
 mcp = [
     "mcp>=1.0",
 ]
+commons = [
+    "chicory-commons-man>=0.1.0",
+]
 
 [project.scripts]
 chicory = "chicory.cli.app:app"

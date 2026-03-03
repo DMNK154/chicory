@@ -37,6 +37,7 @@ class AppContext:
     """Typed lifespan context holding the Orchestrator instance."""
 
     orchestrator: Orchestrator
+    signal_processor: object | None = None  # SignalProcessor, if commons DB
 
 
 @asynccontextmanager
@@ -68,8 +69,25 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     except Exception:
         logger.exception("Eager model/index load failed (will retry lazily)")
 
+    # Initialize signal processor if pending_signals table exists (commons mode)
+    signal_processor = None
     try:
-        yield AppContext(orchestrator=orchestrator)
+        table_check = orchestrator.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_signals'"
+        ).fetchone()
+        if table_check:
+            from chicory_commons import SignalProcessor
+
+            signal_processor = SignalProcessor(orchestrator)
+            logger.info("Signal processor initialized (commons mode)")
+    except Exception:
+        logger.exception("Signal processor init failed")
+
+    try:
+        yield AppContext(
+            orchestrator=orchestrator,
+            signal_processor=signal_processor,
+        )
     finally:
         orchestrator.close()
         logger.info("Chicory orchestrator closed")
@@ -95,7 +113,16 @@ def _call(ctx: Context, tool_name: str, tool_input: dict) -> str:
         tool_name, list(tool_input.keys()), threading.current_thread().name,
     )
     t0 = time.time()
-    orchestrator: Orchestrator = ctx.request_context.lifespan_context.orchestrator
+    app_ctx = ctx.request_context.lifespan_context
+    orchestrator: Orchestrator = app_ctx.orchestrator
+
+    # Auto-process pending signals if this is a commons instance
+    if app_ctx.signal_processor:
+        try:
+            app_ctx.signal_processor.maybe_auto_process()
+        except Exception:
+            logger.exception("Signal auto-processing failed")
+
     try:
         result = dispatch_tool_call(orchestrator, tool_name, tool_input)
     except Exception:
@@ -269,6 +296,23 @@ def ingest_codebase(
     if exclude_patterns is not None:
         inp["exclude_patterns"] = exclude_patterns
     return _call(ctx, "ingest_codebase", inp)
+
+
+@mcp_server.tool()
+def process_signals(ctx: Context) -> str:
+    """Process pending cross-project signals into commons memories.
+
+    Reads signals from project Chicory instances, converts them to
+    commons memories with project-namespaced and shared tags, and
+    triggers embedding generation.
+    """
+    app_ctx = ctx.request_context.lifespan_context
+    if not app_ctx.signal_processor:
+        from chicory_commons import SignalProcessor
+
+        app_ctx.signal_processor = SignalProcessor(app_ctx.orchestrator)
+    result = app_ctx.signal_processor.process_pending()
+    return json.dumps(result, default=str)
 
 
 # ── Entry point ─────────────────────────────────────────────────────
