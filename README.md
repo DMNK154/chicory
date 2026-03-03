@@ -2,31 +2,74 @@
 
 A self-organizing memory system for LLMs. Stores memories with semantic embeddings and tags, detects cross-domain synchronicities through a Prime Ramsey Lattice, and maintains a four-network tag relational tensor that bootstraps from zero with no seed data.
 
-## Quick Start
+## Install
+
+```bash
+pip install chicory-man[mcp]
+```
+
+Or without MCP server support:
+
+```bash
+pip install chicory-man
+```
+
+## MCP Server Setup (Claude Code / Claude Desktop)
+
+1. Set your API key and start the server:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+chicory-mcp
+```
+
+2. Add to your Claude Code config (`~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "chicory": {
+      "type": "stdio",
+      "command": "chicory-mcp",
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-..."
+      }
+    }
+  }
+}
+```
+
+The embedding model (`all-MiniLM-L6-v2`) downloads automatically on first use. The database is created at `~/.chicory/chicory.db` by default (override with `CHICORY_DB_PATH`).
+
+## Quick Start (CLI)
+
+```bash
+# Interactive chat with Claude + memory
+export ANTHROPIC_API_KEY=sk-ant-...
+chicory chat
+
+# System status
+chicory status
+
+# Ingest a file or directory
+chicory ingest path/to/docs/ --recursive
+```
+
+## Demo
 
 ```bash
 # Run the architecture demo (no API keys, no model downloads, just numpy)
-git clone <repo> && cd chicory
-pip install -e ".[dev]"
+pip install chicory[dev]
 python -m examples.ramsey_network_demo
 ```
 
-To demo document ingestion — pass any file and watch the system learn:
+The demo walks through 9 phases from blank slate to self-organizing memory in ~0.2 seconds, entirely in-memory with mock embeddings. Pass any file to demo document ingestion:
 
 ```bash
 python -m examples.ramsey_network_demo path/to/any/document.txt
 ```
 
-Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other formats. The file is parsed, chunked, tagged, embedded, and fed through the full pipeline — tensor, lattice, and recall all operate on the ingested content alongside the built-in sample memories.
-
-The demo walks through 9 phases from blank slate to self-organizing memory in ~0.2 seconds, entirely in-memory with mock embeddings.
-
-For interactive use with Claude:
-
-```bash
-echo "ANTHROPIC_API_KEY=sk-..." > .env
-chicory chat
-```
+Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other formats.
 
 ## Architecture
 

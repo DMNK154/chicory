@@ -3,10 +3,23 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chicory"
-version = "0.1.0"
-description = "Dual-tracking memory architecture for LLMs"
+name = "chicory-man"
+version = "0.2.0"
+description = "Self-organizing memory system for LLMs with synchronicity detection and prime Ramsey lattice"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.11"
+keywords = ["llm", "memory", "mcp", "rag", "synchronicity", "ramsey", "embeddings"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "anthropic>=0.40.0",
     "pydantic>=2.0",
@@ -21,6 +34,11 @@ dependencies = [
     "python-docx>=1.1",
     "watchdog>=4.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/DMNK154/chicory"
+Repository = "https://github.com/DMNK154/chicory"
+Issues = "https://github.com/DMNK154/chicory/issues"
 
 [project.optional-dependencies]
 dev = [
