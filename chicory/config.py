@@ -106,6 +106,15 @@ class ChicoryConfig(BaseModel):
     faiss_nprobe: int = Field(default=8)
     faiss_rebuild_threshold: int = Field(default=500)
 
+    # Commons Layer — cross-project signal federation
+    commons_enabled: bool = Field(default=False)
+    commons_db_path: Path = Field(
+        default_factory=lambda: Path.home() / ".chicory" / "commons.db"
+    )
+    commons_project_id: str = Field(default="")
+    commons_signal_buffer_size: int = Field(default=10)
+    commons_flush_interval_seconds: float = Field(default=5.0)
+
 
 def load_config(**overrides) -> ChicoryConfig:
     """Load config from .env file and environment variables, with overrides."""
@@ -123,6 +132,9 @@ def load_config(**overrides) -> ChicoryConfig:
         "CHICORY_DB_PATH": "db_path",
         "CHICORY_LLM_MODEL": "llm_model",
         "CHICORY_EMBEDDING_MODEL": "embedding_model",
+        "CHICORY_COMMONS_ENABLED": "commons_enabled",
+        "CHICORY_COMMONS_DB_PATH": "commons_db_path",
+        "CHICORY_COMMONS_PROJECT_ID": "commons_project_id",
     }
     for env_key, config_key in mapping.items():
         if env_key in env and env[env_key]:
@@ -135,5 +147,32 @@ def load_config(**overrides) -> ChicoryConfig:
         if val:
             kwargs[config_key] = val
 
+    # Coerce string booleans from env vars
+    if isinstance(kwargs.get("commons_enabled"), str):
+        kwargs["commons_enabled"] = kwargs["commons_enabled"].lower() in ("true", "1", "yes")
+
     kwargs.update(overrides)
+
+    # Auto-detect project ID from git repo or cwd if not explicitly set
+    if kwargs.get("commons_enabled") and not kwargs.get("commons_project_id"):
+        kwargs["commons_project_id"] = _detect_project_id()
+
     return ChicoryConfig(**kwargs)
+
+
+def _detect_project_id() -> str:
+    """Detect project name from git repo root, falling back to cwd basename."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            name = Path(result.stdout.strip()).name
+            return name.lower().replace(" ", "-")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return Path.cwd().name.lower().replace(" ", "-")
