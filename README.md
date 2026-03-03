@@ -1,6 +1,6 @@
 # Chicory
 
-A self-organizing memory system for LLMs. Stores memories with semantic embeddings and tags, detects cross-domain synchronicities through a Prime Ramsey Lattice, and maintains a four-network tag relational tensor that bootstraps from zero with no seed data.
+A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags in co-occurance, symmetric syntax, asymmetric semotic, and cross-domain synchronicities through a Prime Ramsey Lattice. Each chicory MAN maintains a four-network tag relational tensor that bootstraps from zero with no seed data.
 
 ## Install
 
