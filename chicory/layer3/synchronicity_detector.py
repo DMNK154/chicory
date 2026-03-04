@@ -16,7 +16,6 @@ from chicory.db.engine import DatabaseEngine
 from chicory.layer1.embedding_engine import EmbeddingEngine
 from chicory.layer1.tag_manager import TagManager
 from chicory.layer2.retrieval_tracker import RetrievalTracker
-from chicory.layer2.time_series import multi_tier_decay
 from chicory.layer2.trend_engine import TrendEngine
 from chicory.layer3.phase_space import PhaseSpace
 from chicory.models.phase import Quadrant
@@ -391,30 +390,16 @@ class SynchronicityDetector:
         ]
 
     def effective_strength(self, event: SynchronicityEvent) -> float:
-        """Compute effective strength with decay and reinforcement boost.
+        """Effective strength = raw strength * reinforcement boost.
 
-        Formula: strength * min(1 + count * boost_factor, max_boost)
-                          * multi_tier_decay(age, tiers)
-
-        Age is measured from last_reinforced (not detected_at).
+        Time-decay has been replaced by active centroid sub-graph inhibition
+        on resonance_strength and tensor synchronicity_strength.
         """
-        now = datetime.utcnow()
-        reference_time = event.last_reinforced or event.detected_at or now
-        age_hours = (now - reference_time).total_seconds() / 3600
-
         boost = min(
             1.0 + event.reinforcement_count * self._config.sync_reinforcement_boost_factor,
             self._config.sync_reinforcement_max_boost,
         )
-
-        decay = multi_tier_decay(age_hours, [
-            (self._config.sync_decay_active_weight,
-             self._config.sync_decay_active_halflife_hours),
-            (self._config.sync_decay_longterm_weight,
-             self._config.sync_decay_longterm_halflife_hours),
-        ])
-
-        return event.strength * boost * decay
+        return event.strength * boost
 
     def reinforce_event(self, event_id: int) -> None:
         """Reinforce a single synchronicity event."""
@@ -425,15 +410,19 @@ class SynchronicityDetector:
         if not event_ids:
             return
         now = datetime.utcnow().isoformat()
-        placeholders = ",".join("?" * len(event_ids))
-        self._db.execute(
-            f"""
-            UPDATE synchronicity_events
-            SET last_reinforced = ?, reinforcement_count = reinforcement_count + 1
-            WHERE id IN ({placeholders})
-            """,
-            (now, *event_ids),
-        )
+        # SQLite has a variable limit (~999); chunk to stay safe
+        chunk_size = 900
+        for i in range(0, len(event_ids), chunk_size):
+            chunk = event_ids[i : i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            self._db.execute(
+                f"""
+                UPDATE synchronicity_events
+                SET last_reinforced = ?, reinforcement_count = reinforcement_count + 1
+                WHERE id IN ({placeholders})
+                """,
+                (now, *chunk),
+            )
         self._db.connection.commit()
 
     def get_events_for_memory(self, memory_id: str) -> list[int]:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 TABLES = [
     # -- Schema version tracking --
@@ -220,6 +220,31 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_tensor_synchronicity ON tag_relational_tensor(synchronicity_strength DESC)",
     "CREATE INDEX IF NOT EXISTS idx_tensor_semantic ON tag_relational_tensor(semantic_strength DESC)",
 
+    # -- Layer 3.5: Centroid Sub-Graph --
+    """
+    CREATE TABLE IF NOT EXISTS tag_centroids (
+        tag_id       INTEGER PRIMARY KEY REFERENCES tags(id),
+        centroid     BLOB NOT NULL,
+        memory_count INTEGER NOT NULL DEFAULT 0,
+        updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+
+    """
+    CREATE TABLE IF NOT EXISTS centroid_edges (
+        tag_a_id           INTEGER NOT NULL REFERENCES tags(id),
+        tag_b_id           INTEGER NOT NULL REFERENCES tags(id),
+        edge_strength      REAL NOT NULL DEFAULT 0.0,
+        co_retrieval_count INTEGER NOT NULL DEFAULT 0,
+        updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (tag_a_id, tag_b_id),
+        CHECK (tag_a_id < tag_b_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_centroid_edges_a ON centroid_edges(tag_a_id)",
+    "CREATE INDEX IF NOT EXISTS idx_centroid_edges_b ON centroid_edges(tag_b_id)",
+    "CREATE INDEX IF NOT EXISTS idx_centroid_edges_strength ON centroid_edges(edge_strength DESC)",
+
     # -- Layer 4: Meta-Patterns --
     """
     CREATE TABLE IF NOT EXISTS meta_patterns (
@@ -308,6 +333,8 @@ def apply_schema(db: DatabaseEngine) -> None:
             _migrate_v8_to_v9(db)
         if current_version <= 9:
             _migrate_v9_to_v10(db)
+        if current_version <= 10:
+            _migrate_v10_to_v11(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -321,7 +348,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Commons layer: cross-project signal federation"),
+                (SCHEMA_VERSION, "Centroid sub-graph: retrieval-driven inhibition"),
             )
 
 
@@ -465,5 +492,14 @@ def _migrate_v9_to_v10(db: DatabaseEngine) -> None:
     """Add pending_signals table for cross-project commons federation.
 
     Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v10_to_v11(db: DatabaseEngine) -> None:
+    """Add tag_centroids and centroid_edges tables for retrieval-driven inhibition.
+
+    Tables use IF NOT EXISTS in TABLES, so no explicit migration needed.
+    Centroid backfill from existing embeddings is deferred to orchestrator boot.
     """
     pass

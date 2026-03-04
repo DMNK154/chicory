@@ -19,6 +19,7 @@ from chicory.layer2.retrieval_tracker import RetrievalTracker
 from chicory.layer2.trend_engine import TrendEngine
 from chicory.layer3.phase_space import PhaseSpace
 from chicory.layer3.synchronicity_detector import SynchronicityDetector
+from chicory.layer3.centroid_subgraph import CentroidSubgraph
 from chicory.layer3.synchronicity_engine import SynchronicityEngine
 from chicory.layer4.adaptive_thresholds import AdaptiveThresholds
 from chicory.layer4.feedback import FeedbackEngine
@@ -60,8 +61,16 @@ class Orchestrator:
             config, self._db, self._embedding_engine, self._tag_manager,
         )
 
+        # Centroid sub-graph for retrieval-driven inhibition
+        self._centroid_subgraph = CentroidSubgraph(
+            config, self._db, self._embedding_engine,
+        )
+
         # Seed the tag relational tensor if empty
         self._maybe_seed_tensor()
+
+        # Seed centroid sub-graph if empty
+        self._maybe_seed_centroid_subgraph()
 
         # Layer 1 (complete — now has access to Layer 3 for lattice-aware retrieval)
         self._memory_store = MemoryStore(
@@ -92,7 +101,7 @@ class Orchestrator:
                 SignalEmitter = None
             if SignalEmitter is not None:
                 self._signal_emitter = SignalEmitter(config)
-            self._signal_emitter.start()
+                self._signal_emitter.start()
 
     @property
     def db(self) -> DatabaseEngine:
@@ -146,6 +155,26 @@ class Orchestrator:
         ).fetchone()["cnt"]
         if lattice_count > 0:
             self._sync_engine.rebuild_tensor()
+
+    def _maybe_seed_centroid_subgraph(self) -> None:
+        """Seed centroids and co-retrieval edges on first boot after upgrade."""
+        centroid_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM tag_centroids"
+        ).fetchone()["cnt"]
+        if centroid_count > 0:
+            return
+
+        memory_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM memories WHERE is_archived = 0"
+        ).fetchone()["cnt"]
+        if memory_count > 0:
+            self._centroid_subgraph.rebuild_centroids()
+
+        retrieval_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM retrieval_tag_hits"
+        ).fetchone()["cnt"]
+        if retrieval_count > 0:
+            self._centroid_subgraph.rebuild_edges_from_history()
 
     def close(self) -> None:
         """Close database connection and signal emitter."""
@@ -922,6 +951,17 @@ class Orchestrator:
                     memory_id=memory.id,
                 )
 
+        # Update tag centroids incrementally
+        if self._config.centroid_inhibition_enabled:
+            embedding = self._embedding_engine.get_cached(memory.id)
+            if embedding is not None:
+                for tag_name in memory.tags:
+                    tag = self._tag_manager.get_by_name(tag_name)
+                    if tag:
+                        self._centroid_subgraph.update_centroid_on_store(
+                            tag.id, embedding,
+                        )
+
         # Emit commons signal
         if self._signal_emitter:
             self._signal_emitter.emit_store(memory.tags)
@@ -1000,6 +1040,21 @@ class Orchestrator:
             reinforced_event_ids.update(events_map.get(mid, []))
         if reinforced_event_ids:
             self._sync_detector.reinforce_events_batch(list(reinforced_event_ids))
+
+        # Record co-retrieval and apply centroid sub-graph reweighting
+        if self._config.centroid_inhibition_enabled:
+            all_tag_ids_flat: list[int] = []
+            for tids in tag_ids_map.values():
+                all_tag_ids_flat.extend(tids)
+            unique_tags = list(set(all_tag_ids_flat))
+            if len(unique_tags) >= 2:
+                mean_relevance = (
+                    sum(score for _, score in results) / len(results)
+                )
+                self._centroid_subgraph.record_co_retrieval(unique_tags)
+                self._centroid_subgraph.update_on_retrieval(
+                    unique_tags, mean_relevance,
+                )
 
         # Emit commons retrieve signal with all result tag names
         if self._signal_emitter:

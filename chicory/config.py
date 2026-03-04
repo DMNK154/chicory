@@ -14,7 +14,9 @@ class ChicoryConfig(BaseModel):
     db_path: Path = Field(default_factory=lambda: Path.home() / ".chicory" / "chicory.db")
 
     # LLM
+    llm_provider: str = Field(default="auto")  # auto, anthropic, openai, null
     anthropic_api_key: str = Field(default="")
+    openai_api_key: str = Field(default="")
     llm_model: str = Field(default="claude-sonnet-4-6")
     max_tokens: int = Field(default=4096)
 
@@ -88,6 +90,12 @@ class ChicoryConfig(BaseModel):
     tensor_semantic_weight: float = Field(default=0.2)
     tensor_semiotic_weight: float = Field(default=0.15)
 
+    # Centroid sub-graph — retrieval-driven reweighting
+    centroid_ema_alpha: float = Field(default=0.1)
+    centroid_edge_ema_alpha: float = Field(default=0.15)
+    centroid_inhibition_scale: float = Field(default=0.5)
+    centroid_inhibition_enabled: bool = Field(default=True)
+
     # Migration
     burn_in_hours: float = Field(default=48.0)
     burn_in_threshold_multiplier: float = Field(default=1.5)
@@ -129,6 +137,8 @@ def load_config(**overrides) -> ChicoryConfig:
     kwargs: dict = {}
     mapping = {
         "ANTHROPIC_API_KEY": "anthropic_api_key",
+        "OPENAI_API_KEY": "openai_api_key",
+        "CHICORY_LLM_PROVIDER": "llm_provider",
         "CHICORY_DB_PATH": "db_path",
         "CHICORY_LLM_MODEL": "llm_model",
         "CHICORY_EMBEDDING_MODEL": "embedding_model",

@@ -97,7 +97,7 @@ class TestDatabaseSchema:
 
     def test_schema_version(self, db):
         row = db.execute("SELECT MAX(version) as version FROM schema_version").fetchone()
-        assert row["version"] == 10
+        assert row["version"] == 11
 
 
 class TestTagManager:

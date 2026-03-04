@@ -1,6 +1,6 @@
 # Chicory
 
-A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags in co-occurance, symmetric syntax, asymmetric semotic, and cross-domain synchronicities through a Prime Ramsey Lattice. Each chicory MAN maintains a four-network tag relational tensor that bootstraps from zero with no seed data.
+A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags in co-occurrence, symmetric syntax, asymmetric semiotic, and cross-domain synchronicities through a Prime Ramsey Lattice. Each chicory MAN maintains a four-network tag relational tensor that bootstraps from zero with no seed data. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay.
 
 ## Install
 
@@ -128,6 +128,16 @@ Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other f
                   |    synchronicity  (lattice, symmetric)    |
                   +-------------------------------------------+
                                       |
+                           each retrieval triggers
+                                      v
+                  +-------------------------------------------+
+  Layer 3.5       |      Centroid Sub-Graph Reweighting       |
+                  |  tag centroids (EMA on store)             |
+                  |  co-retrieval edges (EMA on retrieve)     |
+                  |  add incoming + subtract inverted         |
+                  |  parallelness-gated (orthogonal preserved)|
+                  +-------------------------------------------+
+                                      |
                                       v
                   +-------------------------------------------+
   Layer 4         |  Meta-Analysis & Adaptive Thresholds      |
@@ -157,6 +167,34 @@ These are naturally asymmetric. If "topology" appears on 1 memory and "mathemati
 **Synchronicity** — Lattice resonance strength. Two events resonate when they share slot positions across multiple prime scales. Strength = `sum(log(p))` for shared primes, measuring information-theoretic surprise.
 
 All four networks are stored in a single `tag_relational_tensor` table with a `CHECK(tag_a_id < tag_b_id)` constraint. The semiotic layer encodes directionality as `semiotic_forward` (a->b) and `semiotic_reverse` (b->a) within this symmetric key.
+
+## Centroid Sub-Graph Reweighting
+
+Synchronicity and resonance strengths are not passively decayed by time. Instead, every retrieval actively reweights existing scores based on what the system is actually doing:
+
+**On store:** Tag centroids are updated via exponential moving average (EMA). Each tag's centroid is a unit-normalized running average of all memory embeddings assigned to it.
+
+**On retrieval:** The system computes incoming association strengths for every pair of activated tags:
+
+```
+incoming(A,B) = cosine_sim(centroid_A, centroid_B) × mean_relevance × scale
+```
+
+These incoming strengths are then ranked highest to lowest and the values are inverted (reversed). Each pair receives:
+- **Addition:** the raw incoming strength (boosting active associations)
+- **Subtraction:** the inverted value × parallelness factor (suppressing redundant patterns)
+
+The **parallelness factor** prevents collateral damage to independent associations. Each pair defines a direction vector in embedding space (`normalize(centroid_A - centroid_B)`). The subtraction is scaled by how geometrically aligned the pair is with any stronger pair:
+
+```
+parallelness(i) = max(|cos(direction_i, direction_j)|)  for all j ranking above i
+```
+
+- **Parallel weak pairs** (redundant with a stronger pattern): full subtraction — prevents rigidity
+- **Orthogonal weak pairs** (independent patterns): near-zero subtraction — preserved
+- **Dominant pair** (rank 0): no reference above it → zero subtraction → pure additive boost
+
+The net effect: strongest incoming associations grow, weakest parallel ones shrink, and orthogonal associations pass through unharmed. Old connections that stop being actively retrieved lose strength as new retrievals erode them.
 
 ## Cold Start
 
@@ -191,7 +229,7 @@ chicory/
     commands.py                 Slash commands (/memories, /trends, /phase, /sync)
   db/
     engine.py                   SQLite with WAL mode, thread-safe RLock
-    schema.py                   Schema v9, 14 tables, versioned migrations
+    schema.py                   Schema v11, 16 tables, versioned migrations
   ingest/
     parsers.py                  40+ file types (PDF, docx, code, markdown...)
     chunker.py                  Section/paragraph/sentence splitting
@@ -199,7 +237,7 @@ chicory/
     watcher.py                  Real-time directory monitoring
   layer1/                       Memory store, embeddings, salience, tags, FAISS
   layer2/                       Trend engine, retrieval tracker, time series
-  layer3/                       Phase space, synchronicity detection, lattice, tensor
+  layer3/                       Phase space, synchronicity detection, lattice, tensor, centroid sub-graph
   layer4/                       Adaptive thresholds, meta-analysis, feedback
   llm/                          Claude API client, tool definitions
   models/                       Pydantic models (Memory, Tag, SynchronicityEvent, ...)
@@ -225,6 +263,11 @@ User sends message
      -> retrieve_memories(query)
         -> FAISS similarity search + tensor-boosted recall
         -> log retrieval, record tag hits
+        -> centroid sub-graph reweighting:
+           -> record co-retrieval edges (EMA)
+           -> compute incoming association strengths (C @ C.T)
+           -> rank, invert, scale by parallelness
+           -> add/subtract to tensor + resonance strengths
         -> [background thread] _on_retrieval_completed_async:
            -> update salience on access
            -> record trend events
@@ -255,6 +298,9 @@ Key parameters in `ChicoryConfig`:
 | `tensor_semantic_weight` | `0.2` | Cosine weight in recall scoring |
 | `tensor_semiotic_weight` | `0.15` | Conditional probability weight |
 | `sync_detection_sigma` | `2.0` | Z-score threshold for anomaly detection |
+| `centroid_ema_alpha` | `0.1` | EMA weight for tag centroid updates |
+| `centroid_edge_ema_alpha` | `0.15` | EMA weight for co-retrieval edges |
+| `centroid_inhibition_scale` | `0.5` | Reweighting intensity per retrieval cycle |
 | `embedding_model` | `all-MiniLM-L6-v2` | Sentence-transformer model |
 | `embedding_dimension` | `384` | Embedding vector dimension |
 
@@ -263,8 +309,9 @@ All parameters are overridable via environment variables or `.env` file.
 ## Tests
 
 ```bash
-pytest tests/ -v                                    # Full suite (59 tests)
+pytest tests/ -v                                    # Full suite (99 tests)
 pytest tests/test_layer3/test_tag_relational_tensor.py -v   # Tensor tests (21 tests)
+pytest tests/test_layer3/test_centroid_subgraph.py -v       # Centroid sub-graph tests (20 tests)
 pytest tests/test_layer3/test_synchronicity_engine.py -v    # Lattice tests
 ```
 
@@ -278,7 +325,7 @@ pytest tests/test_layer3/test_synchronicity_engine.py -v    # Lattice tests
 
 ## Database
 
-SQLite with WAL mode. Schema v9, 14 tables, versioned migrations with idempotency checks. Thread-safe via `threading.RLock` on all execute/executemany calls.
+SQLite with WAL mode. Schema v11, 16 tables, versioned migrations with idempotency checks. Thread-safe via `threading.RLock` on all execute/executemany calls.
 
 ```bash
 chicory status          # Show memory count, tag count, tensor state
