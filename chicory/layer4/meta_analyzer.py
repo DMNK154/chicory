@@ -7,8 +7,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
-
 from chicory.config import ChicoryConfig
 from chicory.db.engine import DatabaseEngine
 from chicory.layer4.adaptive_thresholds import AdaptiveThresholds
@@ -36,15 +34,7 @@ class MetaAnalyzer:
 
     def run_analysis(self) -> list[MetaPattern]:
         """Run meta-pattern analysis. Returns newly detected patterns."""
-        events = self._get_recent_sync_events()
-
-        # Merge in lattice-resonant events (permanent, not time-windowed)
-        lattice_events = self._get_lattice_resonance_events()
-        seen_ids = {e.id for e in events}
-        for le in lattice_events:
-            if le.id not in seen_ids:
-                events.append(le)
-                seen_ids.add(le.id)
+        events = self._get_analysis_events()
 
         if len(events) < self._config.meta_min_sync_events:
             return []
@@ -63,110 +53,131 @@ class MetaAnalyzer:
 
         return patterns
 
-    def _get_recent_sync_events(self) -> list[SynchronicityEvent]:
-        """Get synchronicity events from the analysis window."""
-        window = self._config.meta_analysis_interval_hours * 7  # Look back 7 analysis periods
+    def _get_analysis_events(self) -> list[SynchronicityEvent]:
+        """Get deduplicated sync events for meta-pattern analysis.
+
+        Combines time-windowed recent events with lattice-resonant events
+        (wider window) using SQL UNION for server-side dedup.  A hard row
+        cap prevents OOM on databases with millions of sync events.
+        """
+        window = self._config.meta_analysis_interval_hours * 7
         cutoff = (datetime.utcnow() - timedelta(hours=window)).isoformat()
 
-        rows = self._db.execute(
-            "SELECT * FROM synchronicity_events WHERE detected_at > ? ORDER BY detected_at",
-            (cutoff,),
-        ).fetchall()
+        use_lattice = (
+            self._sync_engine is not None
+            and self._config.meta_use_lattice_resonances
+        )
 
-        return [
-            SynchronicityEvent(
-                id=r["id"],
-                detected_at=datetime.fromisoformat(r["detected_at"]),
-                event_type=r["event_type"],
-                description=r["description"],
-                strength=r["strength"],
-                quadrant=r["quadrant"],
-                involved_tags=r["involved_tags"],
-                involved_memories=r["involved_memories"],
-                trigger_retrieval_id=r["trigger_retrieval_id"],
-                acknowledged=bool(r["acknowledged"]),
-                last_reinforced=datetime.fromisoformat(r["last_reinforced"]) if r["last_reinforced"] else None,
-                reinforcement_count=r["reinforcement_count"],
-            )
-            for r in rows
-        ]
+        if use_lattice:
+            lattice_cutoff = (
+                datetime.utcnow() - timedelta(hours=window * 4)
+            ).isoformat()
+            rows = self._db.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM synchronicity_events
+                    WHERE detected_at > ?
+                    UNION
+                    SELECT se.* FROM synchronicity_events se
+                    WHERE se.detected_at > ?
+                      AND se.id IN (
+                          SELECT event_a_id FROM resonances
+                          UNION ALL
+                          SELECT event_b_id FROM resonances
+                      )
+                )
+                ORDER BY strength DESC, detected_at DESC
+                """,
+                (cutoff, lattice_cutoff),
+            ).fetchall()
+        else:
+            rows = self._db.execute(
+                """
+                SELECT * FROM synchronicity_events
+                WHERE detected_at > ?
+                ORDER BY strength DESC, detected_at DESC
+                """,
+                (cutoff,),
+            ).fetchall()
 
-    def _get_lattice_resonance_events(self) -> list[SynchronicityEvent]:
-        """Get sync events that participate in lattice resonances.
+        return [self._row_to_event(r) for r in rows]
 
-        These are NOT time-windowed — they represent permanent structural
-        patterns from the Prime Ramsey Lattice.  Reads from the persisted
-        resonances table instead of recomputing O(n²) pairwise comparisons.
-        """
-        if not self._sync_engine or not self._config.meta_use_lattice_resonances:
-            return []
-
-        rows = self._db.execute(
-            """
-            SELECT se.* FROM synchronicity_events se
-            WHERE se.id IN (
-                SELECT event_a_id FROM resonances
-                UNION
-                SELECT event_b_id FROM resonances
-            )
-            """
-        ).fetchall()
-
-        return [
-            SynchronicityEvent(
-                id=r["id"],
-                detected_at=datetime.fromisoformat(r["detected_at"]),
-                event_type=r["event_type"],
-                description=r["description"],
-                strength=r["strength"],
-                quadrant=r["quadrant"],
-                involved_tags=r["involved_tags"],
-                involved_memories=r["involved_memories"],
-                trigger_retrieval_id=r["trigger_retrieval_id"],
-                acknowledged=bool(r["acknowledged"]),
-                last_reinforced=datetime.fromisoformat(r["last_reinforced"]) if r["last_reinforced"] else None,
-                reinforcement_count=r["reinforcement_count"],
-            )
-            for r in rows
-        ]
+    @staticmethod
+    def _row_to_event(r) -> SynchronicityEvent:
+        return SynchronicityEvent(
+            id=r["id"],
+            detected_at=datetime.fromisoformat(r["detected_at"]),
+            event_type=r["event_type"],
+            description=r["description"],
+            strength=r["strength"],
+            quadrant=r["quadrant"],
+            involved_tags=r["involved_tags"],
+            involved_memories=r["involved_memories"],
+            trigger_retrieval_id=r["trigger_retrieval_id"],
+            acknowledged=bool(r["acknowledged"]),
+            last_reinforced=datetime.fromisoformat(r["last_reinforced"]) if r["last_reinforced"] else None,
+            reinforcement_count=r["reinforcement_count"],
+        )
 
     def _cluster_sync_events(
         self, events: list[SynchronicityEvent]
     ) -> list[list[SynchronicityEvent]]:
-        """Cluster synchronicity events by tag overlap using agglomerative clustering."""
+        """Cluster synchronicity events by tag overlap using sparse union-find.
+
+        Uses an inverted index (tag → event indices) to find candidate pairs
+        that share at least one tag, then merges pairs whose Jaccard similarity
+        meets the threshold.  Memory is O(n), not O(n²).
+        """
         if len(events) < 2:
             return [events] if events else []
 
         tag_sets = [set(json.loads(e.involved_tags)) for e in events]
         n = len(events)
+        sim_threshold = 1.0 - self._config.clustering_jaccard_threshold
 
-        # Build distance matrix (Jaccard distance)
-        distances = np.zeros((n, n))
+        # Inverted index: tag → list of event indices that contain it
+        tag_to_events: dict[int, list[int]] = defaultdict(list)
+        for i, ts in enumerate(tag_sets):
+            for tag in ts:
+                tag_to_events[tag].append(i)
+
+        # Union-Find with path compression + union by rank
+        parent = list(range(n))
+        uf_rank = [0] * n
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            a, b = find(a), find(b)
+            if a == b:
+                return
+            if uf_rank[a] < uf_rank[b]:
+                a, b = b, a
+            parent[b] = a
+            if uf_rank[a] == uf_rank[b]:
+                uf_rank[a] += 1
+
+        for indices in tag_to_events.values():
+            for a in range(len(indices)):
+                i = indices[a]
+                for b in range(a + 1, len(indices)):
+                    j = indices[b]
+                    if find(i) == find(j):
+                        continue
+                    intersection = len(tag_sets[i] & tag_sets[j])
+                    union_size = len(tag_sets[i] | tag_sets[j])
+                    if intersection / max(union_size, 1) >= sim_threshold:
+                        union(i, j)
+
+        clusters: dict[int, list[SynchronicityEvent]] = defaultdict(list)
         for i in range(n):
-            for j in range(i + 1, n):
-                intersection = len(tag_sets[i] & tag_sets[j])
-                union = len(tag_sets[i] | tag_sets[j])
-                jaccard = intersection / max(union, 1)
-                dist = 1 - jaccard
-                distances[i][j] = dist
-                distances[j][i] = dist
+            clusters[find(i)].append(events[i])
 
-        try:
-            from scipy.cluster.hierarchy import fcluster, linkage
-            from scipy.spatial.distance import squareform
-
-            condensed = squareform(distances)
-            Z = linkage(condensed, method="average")
-            labels = fcluster(Z, t=self._config.clustering_jaccard_threshold, criterion="distance")
-
-            clusters: dict[int, list[SynchronicityEvent]] = defaultdict(list)
-            for i, label in enumerate(labels):
-                clusters[label].append(events[i])
-
-            return list(clusters.values())
-        except (ImportError, ValueError):
-            # Fallback: treat each event as its own cluster
-            return [[e] for e in events]
+        return list(clusters.values())
 
     def _evaluate_cluster(
         self,
@@ -306,7 +317,7 @@ class MetaAnalyzer:
 
     def _record_pattern(self, pattern: MetaPattern) -> int:
         """Persist a meta-pattern."""
-        self._db.execute(
+        cursor = self._db.execute(
             """
             INSERT INTO meta_patterns
                 (description, pattern_type, confidence,
@@ -322,9 +333,7 @@ class MetaAnalyzer:
                 pattern.actions_taken,
             ),
         )
-        self._db.connection.commit()
-        row = self._db.execute("SELECT last_insert_rowid()").fetchone()
-        return row[0]
+        return cursor.lastrowid
 
     def _get_active_tag_count(self) -> int:
         row = self._db.execute(

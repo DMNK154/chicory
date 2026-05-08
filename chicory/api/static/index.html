@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chicory Demo</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #111; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Header */
+  header { display: flex; align-items: center; gap: 24px; padding: 12px 20px; background: #1a1a1a; border-bottom: 1px solid #333; flex-shrink: 0; }
+  .logo { font-size: 20px; font-weight: 700; color: #4fc3f7; letter-spacing: -0.5px; }
+  .stats { display: flex; gap: 16px; font-size: 13px; color: #888; }
+  .stats span { color: #e0e0e0; }
+  .spacer { flex: 1; }
+  .btn { padding: 6px 14px; border: 1px solid #444; border-radius: 6px; background: transparent; color: #e0e0e0; cursor: pointer; font-size: 13px; transition: all 0.15s; }
+  .btn:hover { border-color: #4fc3f7; color: #4fc3f7; }
+  .btn-danger:hover { border-color: #f44336; color: #f44336; }
+
+  /* Main layout */
+  main { display: grid; grid-template-columns: 340px 1fr; flex: 1; overflow: hidden; }
+
+  /* Left panel */
+  .left-panel { display: flex; flex-direction: column; gap: 12px; padding: 16px; border-right: 1px solid #333; overflow-y: auto; }
+
+  /* Drop zone */
+  .drop-zone { border: 2px dashed #444; border-radius: 10px; padding: 28px 16px; text-align: center; cursor: pointer; transition: all 0.2s; flex-shrink: 0; }
+  .drop-zone:hover, .drop-zone.dragover { border-color: #4fc3f7; background: rgba(79,195,247,0.06); }
+  .drop-zone h3 { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .drop-zone p { font-size: 12px; color: #888; }
+  .drop-zone input { display: none; }
+
+  /* File list */
+  .file-list { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+  .file-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1e1e1e; border-radius: 6px; font-size: 13px; }
+  .file-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-item .status { font-size: 11px; color: #888; }
+  .file-item .status.done { color: #4caf50; }
+  .file-item .status.error { color: #f44336; }
+
+  /* Network viz */
+  .network-container { flex: 1; min-height: 200px; background: #1a1a1a; border-radius: 10px; border: 1px solid #333; position: relative; overflow: hidden; }
+  .network-container h4 { position: absolute; top: 8px; left: 12px; font-size: 12px; color: #666; font-weight: 500; z-index: 1; }
+  .network-container svg { width: 100%; height: 100%; }
+  .network-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #555; font-size: 13px; }
+
+  /* Right panel */
+  .right-panel { display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Chat messages */
+  .messages { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: #1a3a4a; color: #e0e0e0; border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: #1e1e1e; border: 1px solid #333; border-bottom-left-radius: 4px; }
+  .msg.system { align-self: center; color: #888; font-size: 12px; background: transparent; padding: 4px; }
+  .msg.loading { align-self: flex-start; color: #888; font-size: 13px; background: transparent; padding: 4px; }
+  .tool-calls { display: flex; flex-wrap: wrap; gap: 4px; align-self: flex-start; }
+  .tool-badge { font-size: 11px; padding: 2px 8px; background: #1a2a1a; border: 1px solid #2a4a2a; border-radius: 10px; color: #4caf50; }
+
+  /* Chat input */
+  .chat-input { display: flex; gap: 8px; padding: 12px 20px; border-top: 1px solid #333; background: #1a1a1a; flex-shrink: 0; }
+  .chat-input input { flex: 1; padding: 10px 14px; background: #1e1e1e; border: 1px solid #333; border-radius: 8px; color: #e0e0e0; font-size: 14px; outline: none; }
+  .chat-input input:focus { border-color: #4fc3f7; }
+  .chat-input button { padding: 10px 20px; background: #4fc3f7; color: #111; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; }
+  .chat-input button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .chat-input button:hover:not(:disabled) { background: #81d4fa; }
+
+  /* Footer */
+  footer { padding: 8px 20px; text-align: center; font-size: 12px; color: #555; border-top: 1px solid #222; flex-shrink: 0; }
+  footer a { color: #4fc3f7; text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+
+  /* Welcome state */
+  .welcome { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #666; text-align: center; padding: 40px; gap: 12px; }
+  .welcome h2 { color: #e0e0e0; font-size: 20px; }
+  .welcome p { font-size: 14px; max-width: 400px; line-height: 1.5; }
+
+  /* Login bar */
+  .login-bar { display: flex; align-items: center; gap: 8px; padding: 6px 20px; background: #151515; border-bottom: 1px solid #282828; flex-shrink: 0; font-size: 13px; }
+  .login-bar label { color: #888; }
+  .login-bar input { padding: 4px 10px; background: #1e1e1e; border: 1px solid #333; border-radius: 6px; color: #e0e0e0; font-size: 13px; width: 200px; outline: none; }
+  .login-bar input:focus { border-color: #4fc3f7; }
+  .credit-display { display: flex; gap: 14px; color: #888; font-size: 12px; }
+  .credit-display span { color: #e0e0e0; }
+
+  /* Buy modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.active { display: flex; }
+  .modal { background: #1e1e1e; border: 1px solid #444; border-radius: 12px; padding: 28px; width: 380px; max-width: 90vw; }
+  .modal h3 { margin-bottom: 16px; font-size: 17px; }
+  .modal .field { margin-bottom: 14px; }
+  .modal .field label { display: block; font-size: 13px; color: #aaa; margin-bottom: 4px; }
+  .modal select { width: 100%; padding: 8px; background: #111; border: 1px solid #333; border-radius: 6px; color: #e0e0e0; font-size: 14px; }
+  .btn-buy { width: 100%; padding: 10px; background: #4fc3f7; color: #111; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 14px; margin-top: 8px; }
+  .btn-buy:hover { background: #81d4fa; }
+  .btn-buy:disabled { opacity: 0.5; cursor: wait; }
+
+  /* Upgrade banner */
+  .upgrade-banner { display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: #1a1a2e; border-top: 1px solid #4fc3f7; flex-shrink: 0; }
+  .upgrade-banner .msg-text { flex: 1; font-size: 13px; color: #ccc; }
+  .upgrade-banner .msg-text strong { color: #4fc3f7; }
+  .btn-upgrade { padding: 8px 18px; background: #4fc3f7; color: #111; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 13px; transition: background 0.15s; }
+  .btn-upgrade:hover { background: #81d4fa; }
+  .btn-upgrade:disabled { opacity: 0.5; cursor: wait; }
+
+  /* Subscriber badge */
+  .sub-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; background: #1a2a1a; border: 1px solid #2a5a2a; border-radius: 10px; color: #4caf50; font-size: 12px; font-weight: 600; }
+  .btn-subscribe { padding: 6px 14px; border: 1px solid #4caf50; border-radius: 6px; background: transparent; color: #4caf50; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.15s; }
+  .btn-subscribe:hover { background: #4caf50; color: #111; }
+  .btn-subscribe:disabled { opacity: 0.5; cursor: wait; }
+
+  /* Password gate */
+  .password-gate { position: fixed; inset: 0; background: #111; z-index: 200; display: flex; align-items: center; justify-content: center; }
+  .password-box { background: #1e1e1e; border: 1px solid #333; border-radius: 12px; padding: 36px 32px; width: 340px; text-align: center; }
+  .password-box h2 { margin-bottom: 6px; font-size: 22px; color: #4fc3f7; }
+  .password-box p { font-size: 13px; color: #888; margin-bottom: 20px; }
+  .password-box input { width: 100%; padding: 10px 14px; background: #111; border: 1px solid #444; border-radius: 8px; color: #e0e0e0; font-size: 14px; outline: none; margin-bottom: 12px; }
+  .password-box input:focus { border-color: #4fc3f7; }
+  .password-box button { width: 100%; padding: 10px; background: #4fc3f7; color: #111; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 14px; }
+  .password-box button:hover { background: #81d4fa; }
+  .password-box .error { color: #f44336; font-size: 12px; margin-top: 8px; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="password-gate" id="password-gate">
+  <div class="password-box">
+    <h2>Chicory</h2>
+    <p>Enter password to continue</p>
+    <input type="password" id="gate-password" placeholder="Password" autofocus>
+    <button onclick="submitPassword()">Enter</button>
+    <div class="error" id="gate-error"></div>
+  </div>
+</div>
+
+<header>
+  <div class="logo">Chicory</div>
+  <div class="stats">
+    memories: <span id="stat-memories">0</span>
+    &nbsp;&middot;&nbsp;
+    tags: <span id="stat-tags">0</span>
+  </div>
+  <div class="spacer"></div>
+  <button class="btn btn-danger" onclick="wipeSession()">Wipe Session</button>
+</header>
+
+<div class="login-bar">
+  <label>Email:</label>
+  <input type="email" id="login-email" placeholder="you@example.com">
+  <button class="btn" onclick="loginUser()">Log In</button>
+  <div class="spacer"></div>
+  <button class="btn-subscribe" onclick="startSubscription()" id="btn-subscribe" style="display:none;">Save My Network</button>
+  <span class="sub-badge" id="sub-badge" style="display:none;">Network saved</span>
+  <button class="btn" onclick="openBuyModal()" id="btn-buy-credits">Buy Credits</button>
+  <div class="credit-display" id="credit-display" style="display:none;">
+    File credits: <span id="credit-files">0</span>
+    &nbsp;&middot;&nbsp;
+    Message credits: <span id="credit-msgs">0</span>
+  </div>
+</div>
+
+<main>
+  <div class="left-panel">
+    <div class="drop-zone" id="drop-zone">
+      <h3>Drop files here</h3>
+      <p>PDF, DOCX, TXT, MD, JSON, CSV, code files</p>
+      <input type="file" id="file-input" multiple accept=".pdf,.docx,.txt,.md,.json,.csv,.py,.js,.ts,.html,.css,.yaml,.yml,.toml">
+    </div>
+    <div class="file-list" id="file-list"></div>
+    <div class="network-container" id="network-container">
+      <h4>Memory Network</h4>
+      <div class="network-empty" id="network-empty">Upload files to see the network</div>
+      <svg id="network-svg"></svg>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <div class="messages" id="messages">
+      <div class="welcome">
+        <h2>Welcome to Chicory</h2>
+        <p>Drop some files on the left to ingest them into memory, then ask questions about your data.</p>
+        <p style="font-size:12px; color:#555;">Your files stay in this ephemeral session and are wiped when you leave.</p>
+      </div>
+    </div>
+    <div id="upgrade-banner" style="display:none;"></div>
+    <div class="chat-input">
+      <input type="text" id="chat-input" placeholder="Ask about your uploaded files..." disabled>
+      <button id="send-btn" onclick="sendMessage()" disabled>Send</button>
+    </div>
+  </div>
+</main>
+
+<footer>
+  Want to deploy your own? <a href="https://github.com/DMNK154/chicory" target="_blank">github.com/DMNK154/chicory</a>
+  &nbsp;&middot;&nbsp; Self-organizing memory with synchronicity detection
+</footer>
+
+<div class="modal-overlay" id="buy-modal">
+  <div class="modal">
+    <h3>Buy Credits</h3>
+    <div class="field">
+      <label>File upload credits</label>
+      <select id="buy-file-qty">
+        <option value="0">None</option>
+        <option value="5">5 files</option>
+        <option value="10">10 files</option>
+        <option value="25">25 files</option>
+        <option value="50">50 files</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Chat message credits</label>
+      <select id="buy-msg-qty">
+        <option value="0">None</option>
+        <option value="25">25 messages</option>
+        <option value="50">50 messages</option>
+        <option value="100">100 messages</option>
+        <option value="250">250 messages</option>
+      </select>
+    </div>
+    <button class="btn-buy" onclick="startCreditCheckout()" id="btn-checkout">Proceed to Checkout</button>
+    <button class="btn" style="width:100%;margin-top:8px;" onclick="closeBuyModal()">Cancel</button>
+  </div>
+</div>
+
+<script>
+const API = '';
+let sessionId = null;
+let chatEnabled = false;
+let loggedInEmail = null;
+let isSubscriber = false;
+
+// ── Session lifecycle ──────────────────────────────────────────
+
+async function createSession() {
+  const res = await fetch(`${API}/api/sessions`, { method: 'POST' });
+  const data = await res.json();
+  sessionId = data.session_id;
+  enableChat();
+}
+
+async function wipeSession() {
+  if (!sessionId) return;
+  await fetch(`${API}/api/sessions/${sessionId}`, { method: 'DELETE' });
+  sessionId = null;
+  document.getElementById('file-list').innerHTML = '';
+  document.getElementById('messages').innerHTML = `
+    <div class="welcome">
+      <h2>Welcome to Chicory</h2>
+      <p>Drop some files on the left to ingest them into memory, then ask questions about your data.</p>
+      <p style="font-size:12px; color:#555;">Your files stay in this ephemeral session and are wiped when you leave.</p>
+    </div>`;
+  document.getElementById('stat-memories').textContent = '0';
+  document.getElementById('stat-tags').textContent = '0';
+  document.getElementById('credit-display').style.display = 'none';
+  document.getElementById('login-email').disabled = false;
+  document.getElementById('login-email').value = '';
+  loggedInEmail = null;
+  isSubscriber = false;
+  updateSubscriptionUI();
+  hideUpgradeBanner();
+  clearNetwork();
+  await createSession();
+}
+
+function enableChat() {
+  document.getElementById('chat-input').disabled = false;
+  document.getElementById('send-btn').disabled = false;
+  chatEnabled = true;
+}
+
+// Cleanup on page close
+window.addEventListener('beforeunload', () => {
+  if (sessionId) {
+    navigator.sendBeacon(`${API}/api/sessions/${sessionId}`, '');
+  }
+});
+
+// ── File upload ────────────────────────────────────────────────
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('click', () => fileInput.click());
+
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.classList.add('dragover');
+});
+
+dropZone.addEventListener('dragleave', () => {
+  dropZone.classList.remove('dragover');
+});
+
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+});
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) uploadFiles(fileInput.files);
+  fileInput.value = '';
+});
+
+async function uploadFiles(files) {
+  if (!sessionId) return;
+
+  const fileList = document.getElementById('file-list');
+
+  for (const file of files) {
+    const item = document.createElement('div');
+    item.className = 'file-item';
+    item.innerHTML = `<span class="name">${file.name}</span><span class="status">uploading...</span>`;
+    fileList.appendChild(item);
+
+    const formData = new FormData();
+    formData.append('files', file);
+
+    try {
+      const res = await fetch(`${API}/api/sessions/${sessionId}/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+      const status = item.querySelector('.status');
+      if (res.status === 429) {
+        status.textContent = 'limit reached';
+        status.className = 'status error';
+        showUpgradeBanner('You\'ve used all your free file uploads.');
+        break;
+      } else if (data.errors && data.errors.length) {
+        status.textContent = 'error';
+        status.className = 'status error';
+      } else {
+        status.textContent = `${data.memories_created} memories`;
+        status.className = 'status done';
+      }
+    } catch (err) {
+      const status = item.querySelector('.status');
+      status.textContent = 'failed';
+      status.className = 'status error';
+    }
+  }
+
+  // Clear welcome message if first upload
+  const welcome = document.querySelector('.welcome');
+  if (welcome) {
+    welcome.remove();
+    addSystemMessage('Files ingested. Ask me anything about them.');
+  }
+
+  refreshStats();
+  refreshNetwork();
+}
+
+// ── Chat ───────────────────────────────────────────────────────
+
+const chatInput = document.getElementById('chat-input');
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+async function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const message = input.value.trim();
+  if (!message || !sessionId) return;
+
+  input.value = '';
+  addUserMessage(message);
+
+  const sendBtn = document.getElementById('send-btn');
+  input.disabled = true;
+  sendBtn.disabled = true;
+
+  const loadingEl = addLoadingMessage();
+
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+
+    loadingEl.remove();
+
+    if (!res.ok) {
+      const err = await res.json();
+      addSystemMessage(`Error: ${err.detail || 'Unknown error'}`);
+      if (res.status === 429) {
+        input.placeholder = 'Chat limit reached';
+        showUpgradeBanner('You\'ve used all your free chat messages.');
+        return;
+      }
+    } else {
+      const data = await res.json();
+
+      // Show tool calls
+      if (data.tool_calls && data.tool_calls.length) {
+        addToolCalls(data.tool_calls);
+      }
+
+      addAssistantMessage(data.response);
+    }
+  } catch (err) {
+    loadingEl.remove();
+    addSystemMessage(`Network error: ${err.message}`);
+  }
+
+  input.disabled = false;
+  sendBtn.disabled = false;
+  input.focus();
+
+  refreshStats();
+  refreshNetwork();
+}
+
+function addUserMessage(text) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg user';
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function addAssistantMessage(text) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function addSystemMessage(text) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg system';
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function addLoadingMessage() {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg loading';
+  div.textContent = 'Thinking...';
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  return div;
+}
+
+function addToolCalls(tools) {
+  const msgs = document.getElementById('messages');
+  const container = document.createElement('div');
+  container.className = 'tool-calls';
+  for (const tc of tools) {
+    const badge = document.createElement('span');
+    badge.className = 'tool-badge';
+    badge.textContent = tc.name;
+    badge.title = JSON.stringify(tc.input, null, 2);
+    container.appendChild(badge);
+  }
+  msgs.appendChild(container);
+}
+
+// ── Stats ──────────────────────────────────────────────────────
+
+async function refreshStats() {
+  if (!sessionId) return;
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/status`);
+    const data = await res.json();
+    document.getElementById('stat-memories').textContent = data.memory_count;
+    document.getElementById('stat-tags').textContent = data.tag_list.length;
+    if (data.logged_in) {
+      document.getElementById('credit-display').style.display = 'flex';
+      document.getElementById('credit-files').textContent = data.file_credits;
+      document.getElementById('credit-msgs').textContent = data.message_credits;
+      isSubscriber = data.is_subscriber || false;
+      updateSubscriptionUI();
+    }
+  } catch {}
+}
+
+// ── Network visualization (D3) ─────────────────────────────────
+
+const QUADRANT_COLORS = {
+  active_deep_work: '#4caf50',
+  novel_exploration: '#ffeb3b',
+  dormant_reactivation: '#f44336',
+  inactive: '#666',
+};
+
+let simulation = null;
+
+function clearNetwork() {
+  const svg = d3.select('#network-svg');
+  svg.selectAll('*').remove();
+  document.getElementById('network-empty').style.display = 'flex';
+  if (simulation) { simulation.stop(); simulation = null; }
+}
+
+async function refreshNetwork() {
+  if (!sessionId) return;
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/network`);
+    const data = await res.json();
+    renderNetwork(data.network);
+  } catch {}
+}
+
+function renderNetwork(network) {
+  if (!network || !network.nodes || network.nodes.length === 0) return;
+
+  document.getElementById('network-empty').style.display = 'none';
+
+  const container = document.getElementById('network-container');
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+
+  const svg = d3.select('#network-svg');
+  svg.selectAll('*').remove();
+
+  if (simulation) simulation.stop();
+
+  const nodes = network.nodes.map(d => ({ ...d, id: d.tag }));
+  const edges = network.edges.map(d => ({ ...d }));
+
+  // Build lookup for link validation
+  const nodeIds = new Set(nodes.map(n => n.id));
+  const validEdges = edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+
+  const maxWeight = Math.max(1, ...validEdges.map(e => e.weight));
+
+  simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(validEdges).id(d => d.id).distance(60).strength(0.4))
+    .force('charge', d3.forceManyBody().strength(-80))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(20));
+
+  const g = svg.append('g');
+
+  // Zoom
+  svg.call(d3.zoom().scaleExtent([0.3, 4]).on('zoom', (e) => {
+    g.attr('transform', e.transform);
+  }));
+
+  // Edges
+  const link = g.append('g')
+    .selectAll('line')
+    .data(validEdges)
+    .join('line')
+    .attr('stroke', d => d.weight > maxWeight * 0.5 ? 'rgba(79,195,247,0.35)' : 'rgba(255,255,255,0.1)')
+    .attr('stroke-width', d => Math.max(0.5, (d.weight / maxWeight) * 3));
+
+  // Nodes
+  const node = g.append('g')
+    .selectAll('circle')
+    .data(nodes)
+    .join('circle')
+    .attr('r', d => Math.max(5, Math.min(18, (d.temperature || 0.3) * 20 + 4)))
+    .attr('fill', d => QUADRANT_COLORS[d.quadrant] || '#666')
+    .attr('fill-opacity', 0.85)
+    .attr('stroke', 'rgba(255,255,255,0.2)')
+    .attr('stroke-width', 1)
+    .call(drag(simulation));
+
+  // Labels
+  const label = g.append('g')
+    .selectAll('text')
+    .data(nodes)
+    .join('text')
+    .text(d => d.tag)
+    .attr('font-size', 10)
+    .attr('fill', '#aaa')
+    .attr('text-anchor', 'middle')
+    .attr('dy', d => -(Math.max(5, Math.min(18, (d.temperature || 0.3) * 20 + 4)) + 4))
+    .style('pointer-events', 'none');
+
+  // Hover
+  node.on('mouseover', function() {
+    d3.select(this).attr('fill-opacity', 1).attr('stroke', '#4fc3f7').attr('stroke-width', 2);
+  }).on('mouseout', function(_, d) {
+    d3.select(this).attr('fill-opacity', 0.85).attr('stroke', 'rgba(255,255,255,0.2)').attr('stroke-width', 1);
+  });
+
+  // Tick
+  simulation.on('tick', () => {
+    link
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y);
+    node
+      .attr('cx', d => d.x)
+      .attr('cy', d => d.y);
+    label
+      .attr('x', d => d.x)
+      .attr('y', d => d.y);
+  });
+}
+
+function drag(sim) {
+  return d3.drag()
+    .on('start', (event, d) => {
+      if (!event.active) sim.alphaTarget(0.3).restart();
+      d.fx = d.x; d.fy = d.y;
+    })
+    .on('drag', (event, d) => {
+      d.fx = event.x; d.fy = event.y;
+    })
+    .on('end', (event, d) => {
+      if (!event.active) sim.alphaTarget(0);
+      d.fx = null; d.fy = null;
+    });
+}
+
+// ── Login & Credits ─────────────────────────────────────────────
+
+async function loginUser() {
+  const emailInput = document.getElementById('login-email');
+  const email = emailInput.value.trim();
+  if (!email || !sessionId) return;
+
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/login`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email}),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      addSystemMessage('Login error: ' + (err.detail || 'Unknown'));
+      return;
+    }
+    const data = await res.json();
+    loggedInEmail = data.email;
+    emailInput.value = data.email;
+    emailInput.disabled = true;
+
+    // Handle session swap for returning subscribers
+    if (data.new_session_id) {
+      sessionId = data.new_session_id;
+      addSystemMessage('Your saved Ramsey network has been restored.');
+      refreshStats();
+      refreshNetwork();
+    }
+
+    isSubscriber = data.is_subscriber || false;
+    updateSubscriptionUI();
+
+    document.getElementById('credit-display').style.display = 'flex';
+    document.getElementById('credit-files').textContent = data.file_credits;
+    document.getElementById('credit-msgs').textContent = data.message_credits;
+
+    // Hide upgrade banner if showing (credits may now cover usage)
+    hideUpgradeBanner();
+
+    addSystemMessage(`Logged in as ${data.email}. Credits: ${data.file_credits} files, ${data.message_credits} messages.`);
+  } catch (err) {
+    addSystemMessage('Login failed: ' + err.message);
+  }
+}
+
+function showUpgradeBanner(reason) {
+  const banner = document.getElementById('upgrade-banner');
+  if (banner.querySelector('.upgrade-banner')) return;
+  banner.style.display = 'block';
+
+  const buttonText = loggedInEmail ? 'Buy More Credits' : 'Log In & Buy Credits';
+  const action = loggedInEmail ? 'openBuyModal()' : "document.getElementById('login-email').focus()";
+
+  banner.innerHTML = `
+    <div class="upgrade-banner">
+      <span class="msg-text"><strong>Limit reached.</strong> ${reason}</span>
+      <button class="btn-upgrade" onclick="${action}">${buttonText}</button>
+    </div>`;
+}
+
+function hideUpgradeBanner() {
+  const banner = document.getElementById('upgrade-banner');
+  banner.style.display = 'none';
+  banner.innerHTML = '';
+}
+
+function updateSubscriptionUI() {
+  const btnSub = document.getElementById('btn-subscribe');
+  const badge = document.getElementById('sub-badge');
+  if (isSubscriber) {
+    btnSub.style.display = 'none';
+    badge.style.display = 'inline-flex';
+  } else if (loggedInEmail) {
+    btnSub.style.display = 'inline-block';
+    badge.style.display = 'none';
+  } else {
+    btnSub.style.display = 'none';
+    badge.style.display = 'none';
+  }
+}
+
+async function startSubscription() {
+  if (!loggedInEmail || !sessionId) return;
+
+  const btn = document.getElementById('btn-subscribe');
+  btn.disabled = true;
+  btn.textContent = 'Redirecting...';
+
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/subscribe-checkout`, {
+      method: 'POST',
+    });
+    const data = await res.json();
+    if (data.checkout_url) {
+      localStorage.setItem('chicory_email', loggedInEmail);
+      window.location.href = data.checkout_url;
+    } else {
+      addSystemMessage('Subscription error: ' + (data.detail || 'Unknown'));
+      btn.disabled = false;
+      btn.textContent = 'Save My Network';
+    }
+  } catch (err) {
+    addSystemMessage('Subscription error: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Save My Network';
+  }
+}
+
+function openBuyModal() {
+  if (!loggedInEmail) {
+    addSystemMessage('Please log in with your email first to purchase credits.');
+    document.getElementById('login-email').focus();
+    return;
+  }
+  document.getElementById('buy-modal').classList.add('active');
+}
+
+function closeBuyModal() {
+  document.getElementById('buy-modal').classList.remove('active');
+}
+
+async function startCreditCheckout() {
+  const fileQty = parseInt(document.getElementById('buy-file-qty').value);
+  const msgQty = parseInt(document.getElementById('buy-msg-qty').value);
+  if (fileQty === 0 && msgQty === 0) {
+    addSystemMessage('Please select at least one credit type to purchase.');
+    return;
+  }
+
+  const btn = document.getElementById('btn-checkout');
+  btn.disabled = true;
+  btn.textContent = 'Redirecting to Stripe...';
+
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/credit-checkout`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ file_credits: fileQty, message_credits: msgQty }),
+    });
+    const data = await res.json();
+    if (data.checkout_url) {
+      localStorage.setItem('chicory_email', loggedInEmail);
+      window.location.href = data.checkout_url;
+    } else {
+      addSystemMessage('Checkout error: ' + (data.detail || 'Unknown'));
+      btn.disabled = false;
+      btn.textContent = 'Proceed to Checkout';
+    }
+  } catch (err) {
+    addSystemMessage('Checkout error: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Proceed to Checkout';
+  }
+}
+
+async function handleStripeReturn() {
+  const params = new URLSearchParams(window.location.search);
+
+  if (params.get('subscribed') === '1') {
+    const returnedSessionId = params.get('session_id');
+    if (returnedSessionId) {
+      sessionId = returnedSessionId;
+      enableChat();
+
+      const savedEmail = localStorage.getItem('chicory_email');
+      if (savedEmail) {
+        document.getElementById('login-email').value = savedEmail;
+        await loginUser();
+      }
+
+      addSystemMessage('Subscription activated! Your Ramsey network will be saved across sessions.');
+      refreshStats();
+      refreshNetwork();
+    }
+    window.history.replaceState({}, '', '/');
+    return true;
+  }
+
+  if (params.get('purchased') === '1') {
+    const returnedSessionId = params.get('session_id');
+    if (returnedSessionId) {
+      sessionId = returnedSessionId;
+      enableChat();
+
+      // Auto re-login to refresh credits
+      const savedEmail = localStorage.getItem('chicory_email');
+      if (savedEmail) {
+        document.getElementById('login-email').value = savedEmail;
+        await loginUser();
+      }
+
+      addSystemMessage('Purchase successful! Your credits have been added.');
+      hideUpgradeBanner();
+      refreshStats();
+      refreshNetwork();
+    }
+    window.history.replaceState({}, '', '/');
+    return true;
+  }
+
+  if (params.get('cancelled') === '1') {
+    const returnedSessionId = params.get('session_id');
+    if (returnedSessionId) {
+      sessionId = returnedSessionId;
+      enableChat();
+    }
+    addSystemMessage('Payment cancelled. You can try again anytime.');
+    window.history.replaceState({}, '', '/');
+
+    const savedEmail = localStorage.getItem('chicory_email');
+    if (savedEmail) {
+      document.getElementById('login-email').value = savedEmail;
+      await loginUser();
+    }
+  }
+
+  return false;
+}
+
+// ── Password gate ──────────────────────────────────────────────
+
+const gateEl = document.getElementById('password-gate');
+const gateInput = document.getElementById('gate-password');
+const gateError = document.getElementById('gate-error');
+
+gateInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitPassword();
+});
+
+async function submitPassword() {
+  const pw = gateInput.value;
+  if (!pw) return;
+  gateError.textContent = '';
+  try {
+    const res = await fetch(`${API}/api/auth`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'include',
+      body: JSON.stringify({password: pw}),
+    });
+    if (!res.ok) {
+      gateError.textContent = 'Wrong password';
+      return;
+    }
+    gateEl.style.display = 'none';
+    await startApp();
+  } catch (err) {
+    gateError.textContent = 'Connection error';
+  }
+}
+
+async function checkExistingAuth() {
+  try {
+    // Try creating a session — if the cookie is valid it will succeed
+    const res = await fetch(`${API}/api/sessions`, {method: 'POST', credentials: 'include'});
+    if (res.ok) {
+      const data = await res.json();
+      sessionId = data.session_id;
+      enableChat();
+      gateEl.style.display = 'none';
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+async function startApp() {
+  const wasReturn = await handleStripeReturn();
+  if (!wasReturn) {
+    await createSession();
+    const savedEmail = localStorage.getItem('chicory_email');
+    if (savedEmail) {
+      document.getElementById('login-email').value = savedEmail;
+      await loginUser();
+    }
+  }
+}
+
+// ── Init ───────────────────────────────────────────────────────
+
+(async () => {
+  const alreadyAuthed = await checkExistingAuth();
+  if (!alreadyAuthed) {
+    // Show password gate (it's visible by default)
+    gateInput.focus();
+  }
+})();
+</script>
+</body>
+</html>

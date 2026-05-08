@@ -28,16 +28,14 @@ class RetrievalTracker:
         context_summary: str | None = None,
     ) -> int:
         """Log a retrieval event and its results. Returns the retrieval_id."""
-        self._db.execute(
+        cursor = self._db.execute(
             """
             INSERT INTO retrieval_events (query_text, context_summary, method, result_count, model_version)
             VALUES (?, ?, ?, ?, ?)
             """,
             (query_text, context_summary, method, len(results), model_version),
         )
-        self._db.connection.commit()
-
-        retrieval_id = self._db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        retrieval_id = cursor.lastrowid
 
         if results:
             self._db.executemany(

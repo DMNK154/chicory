@@ -51,10 +51,13 @@ def watch_directory(
             if not _should_process(path):
                 return
             try:
-                count = ingest_file(
+                count, new_ids = ingest_file(
                     orchestrator, path, base_dir=directory,
                     chunk_size=chunk_size, overlap=overlap,
                 )
+                if new_ids:
+                    orchestrator._batch_embed_memories(new_ids)
+                    orchestrator._finalize_ingested_memories(new_ids)
                 if count > 0:
                     console.print(
                         f"  [green]Ingested {path.name} ({count} memories)[/green]"

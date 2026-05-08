@@ -1,4 +1,4 @@
-"""Interactive chat loop with Claude and transparent memory operations."""
+"""Interactive chat loop with an LLM and transparent memory operations."""
 
 from __future__ import annotations
 
@@ -9,21 +9,23 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from chicory.cli.commands import handle_slash_command
+from chicory.cli.conversation_log import ConversationLog
 from chicory.cli.display import console
 from chicory.config import ChicoryConfig
-from chicory.llm.client import ClaudeClient
+from chicory.llm.factory import create_llm_client
 from chicory.orchestrator.orchestrator import Orchestrator
 from chicory.orchestrator.tool_handlers import dispatch_tool_call
 
 
 class ChatSession:
-    """Interactive chat session with Claude, memory ops happening transparently."""
+    """Interactive chat session with memory ops happening transparently."""
 
     def __init__(self, config: ChicoryConfig) -> None:
         self._config = config
         self._orchestrator = Orchestrator(config)
-        self._client = ClaudeClient(config)
+        self._client = create_llm_client(config)
         self._messages: list[dict[str, Any]] = []
+        self._log = ConversationLog()
 
     def run(self) -> None:
         """Run the interactive chat loop."""
@@ -60,14 +62,16 @@ class ChatSession:
             console.print("[dim]Session ended.[/dim]")
 
     def _process_message(self, user_input: str) -> None:
-        """Process a user message through Claude with tool handling."""
-        # Update active tags in system prompt
-        active_tags = self._orchestrator.tag_manager.list_active_names()
+        """Process a user message through the configured LLM with tool handling."""
+        self._log.log_user(user_input)
+
+        # Update system prompt with tags relevant to this query
+        active_tags = self._orchestrator.get_relevant_tags(user_input)
         self._client.update_active_tags(active_tags)
 
         self._messages.append({"role": "user", "content": user_input})
 
-        # Send to Claude and handle tool use loop
+        # Send to the configured LLM and handle tool use loop
         empty_retries = 0
         while True:
             try:
@@ -130,6 +134,7 @@ class ChatSession:
                 })
                 for block in assistant_content:
                     if hasattr(block, "text") and block.text.strip():
+                        self._log.log_assistant(block.text)
                         console.print()
                         console.print(Markdown(block.text))
                         console.print()
@@ -144,6 +149,7 @@ class ChatSession:
             tool_results = []
             for block in assistant_content:
                 if block.type == "tool_use":
+                    self._log.log_tool_use(block.name)
                     console.print(
                         f"  [dim]Using {block.name}...[/dim]"
                     )
@@ -163,7 +169,7 @@ class ChatSession:
                 "role": "user",
                 "content": tool_results,
             })
-            # Loop continues — Claude will process tool results
+            # Loop continues — the configured LLM will process tool results
 
     def _cleanup_orphaned_tool_use(self) -> None:
         """Remove trailing messages that would leave orphaned tool_use blocks.

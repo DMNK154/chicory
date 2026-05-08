@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import json
 import math
 import statistics
@@ -48,6 +47,8 @@ class SynchronicityDetector:
 
         Prefetches shared data (recent retrievals, retrieval→memory maps)
         once instead of letting each detector query independently.
+        Cross-domain bridge detection is gated by glyph lattice resonance,
+        so generation volume is bounded by the lattice structure.
         """
         # Shared prefetch: recent retrievals + their memory IDs (1 + 1 query)
         lookback = max(
@@ -145,8 +146,9 @@ class SynchronicityDetector:
     ) -> list[SynchronicityEvent]:
         """Detect retrievals that bridge previously unrelated tag clusters.
 
-        Uses batch queries: one for co-occurrences (→ set), one for tag
-        frequencies (→ vector).  Pair checks are set lookups, not SQL.
+        Only considers tag pairs that share prime lattice resonance (glyph
+        lattice), so generation is bounded by the number of resonant pairs
+        rather than O(k²) over all tags.
         """
         if not recent:
             return []
@@ -158,17 +160,14 @@ class SynchronicityDetector:
         if not all_memory_ids:
             return []
 
-        # Single batch: tag IDs for every retrieved memory
         tag_ids_map = self._tags.get_tag_ids_for_memories(all_memory_ids)
 
-        # Single query: total memory count
         total_memories = self._db.execute(
             "SELECT COUNT(*) as cnt FROM memories WHERE is_archived = 0"
         ).fetchone()["cnt"]
         if total_memories == 0:
             return []
 
-        # Single query: tag frequency vector  {tag_id → freq}
         freq_rows = self._db.execute(
             "SELECT tag_id, COUNT(*) as cnt FROM memory_tags GROUP BY tag_id"
         ).fetchall()
@@ -176,11 +175,13 @@ class SynchronicityDetector:
             r["tag_id"]: r["cnt"] / total_memories for r in freq_rows
         }
 
-        # Single query: co-occurrence set  {(lo, hi)}
         co_pairs = self._tags.get_all_co_occurrences(min_count=1)
         co_set: set[tuple[int, int]] = {
             (min(a, b), max(a, b)) for a, b, _ in co_pairs
         }
+
+        # Glyph lattice gate: only tag pairs with prime resonance are candidates
+        resonant_pairs = self._load_resonant_tag_pairs()
 
         events: list[SynchronicityEvent] = []
         for retrieval in recent:
@@ -192,7 +193,9 @@ class SynchronicityDetector:
             if len(all_tags) < 2:
                 continue
 
-            for tag_a, tag_b in itertools.combinations(sorted(all_tags), 2):
+            for tag_a, tag_b in resonant_pairs:
+                if tag_a not in all_tags or tag_b not in all_tags:
+                    continue
                 if (tag_a, tag_b) in co_set:
                     continue
 
@@ -227,6 +230,13 @@ class SynchronicityDetector:
                 ))
 
         return events
+
+    def _load_resonant_tag_pairs(self) -> list[tuple[int, int]]:
+        """Load glyph-lattice resonant tag pairs as (lo, hi) tuples."""
+        rows = self._db.execute(
+            "SELECT tag_a_id, tag_b_id FROM glyph_resonances"
+        ).fetchall()
+        return [(r["tag_a_id"], r["tag_b_id"]) for r in rows]
 
     def detect_semantic_convergence(self) -> list[SynchronicityEvent]:
         """Public convenience wrapper — fetches its own data."""
@@ -331,28 +341,43 @@ class SynchronicityDetector:
     def record_event(self, event: SynchronicityEvent) -> int:
         """Persist a synchronicity event. Returns the event ID."""
         now = datetime.utcnow().isoformat()
-        self._db.execute(
-            """
-            INSERT INTO synchronicity_events
-                (event_type, description, strength, quadrant,
-                 involved_tags, involved_memories, trigger_retrieval_id,
-                 last_reinforced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.event_type,
-                event.description,
-                event.strength,
-                event.quadrant,
-                event.involved_tags,
-                event.involved_memories,
-                event.trigger_retrieval_id,
-                now,
-            ),
-        )
-        self._db.connection.commit()
-        row = self._db.execute("SELECT last_insert_rowid()").fetchone()
-        return row[0]
+
+        mids: list[str] = []
+        if event.involved_memories:
+            try:
+                mids = [str(m) for m in json.loads(event.involved_memories)]
+            except (json.JSONDecodeError, TypeError):
+                mids = []
+
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO synchronicity_events
+                    (event_type, description, strength, quadrant,
+                     involved_tags, involved_memories, trigger_retrieval_id,
+                     last_reinforced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_type,
+                    event.description,
+                    event.strength,
+                    event.quadrant,
+                    event.involved_tags,
+                    event.involved_memories,
+                    event.trigger_retrieval_id,
+                    now,
+                ),
+            )
+            event_id = cursor.lastrowid
+
+            if mids:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO sync_event_memories (event_id, memory_id) VALUES (?, ?)",
+                    [(event_id, str(mid)) for mid in mids],
+                )
+
+        return event_id
 
     def get_recent(self, limit: int = 20, unacknowledged_only: bool = False) -> list[SynchronicityEvent]:
         """Get recent synchronicity events."""
@@ -430,34 +455,20 @@ class SynchronicityDetector:
         return self.get_events_for_memories([memory_id]).get(memory_id, [])
 
     def get_events_for_memories(self, memory_ids: list[str]) -> dict[str, list[int]]:
-        """Return event IDs for multiple memories using indexed LIKE filters.
-
-        Instead of scanning every row and JSON-parsing each, build a WHERE
-        clause that lets SQLite skip rows whose involved_memories blob
-        cannot contain any of the requested IDs.
-        """
+        """Return event IDs for memories via indexed junction table lookup."""
         if not memory_ids:
             return {}
         result: dict[str, list[int]] = {mid: [] for mid in memory_ids}
-        memory_id_set = set(memory_ids)
 
-        # Build OR-ed LIKE filters so SQLite can skip non-matching rows
-        like_clauses = " OR ".join(
-            "involved_memories LIKE ?" for _ in memory_ids
-        )
-        like_params = tuple(f"%{mid}%" for mid in memory_ids)
-
-        rows = self._db.execute(
-            f"SELECT id, involved_memories FROM synchronicity_events WHERE {like_clauses}",
-            like_params,
-        ).fetchall()
-
-        for r in rows:
-            involved = json.loads(r["involved_memories"])
-            event_id = r["id"]
-            for mid in involved:
-                if mid in memory_id_set:
-                    result[mid].append(event_id)
+        for i in range(0, len(memory_ids), 500):
+            chunk = memory_ids[i : i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._db.execute(
+                f"SELECT event_id, memory_id FROM sync_event_memories WHERE memory_id IN ({placeholders})",
+                tuple(chunk),
+            ).fetchall()
+            for r in rows:
+                result[r["memory_id"]].append(r["event_id"])
         return result
 
     def acknowledge(self, event_id: int) -> None:

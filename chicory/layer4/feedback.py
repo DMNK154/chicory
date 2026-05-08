@@ -86,13 +86,14 @@ class FeedbackEngine:
     def _boost_involved_memories(self, sync_ids: list[int]) -> int:
         """Boost salience of memories involved in the synchronicity events."""
         memory_ids: set[str] = set()
-        for sid in sync_ids:
-            row = self._db.execute(
-                "SELECT involved_memories FROM synchronicity_events WHERE id = ?",
-                (sid,),
-            ).fetchone()
-            if row and row["involved_memories"]:
-                memory_ids.update(json.loads(row["involved_memories"]))
+        for i in range(0, len(sync_ids), 500):
+            chunk = sync_ids[i : i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._db.execute(
+                f"SELECT DISTINCT memory_id FROM sync_event_memories WHERE event_id IN ({placeholders})",
+                tuple(chunk),
+            ).fetchall()
+            memory_ids.update(r["memory_id"] for r in rows)
 
         for mid in memory_ids:
             self._salience.adjust_salience(mid, 0.05)  # Small boost

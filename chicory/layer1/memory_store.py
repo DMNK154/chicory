@@ -48,6 +48,9 @@ class MemoryStore:
         source_model: str | None = None,
         summary: str | None = None,
         skip_embedding: bool = False,
+        content_hash: str | None = None,
+        source_path: str | None = None,
+        ingestion_tier: str = "critical",
     ) -> Memory:
         """Store a new memory with tags and (optionally) embedding."""
         memory_id = str(uuid.uuid4())
@@ -61,11 +64,13 @@ class MemoryStore:
                 """
                 INSERT INTO memories
                     (id, content, summary, created_at, updated_at, source_model,
-                     salience_model, salience_usage, salience_composite)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?)
+                     salience_model, salience_usage, salience_composite, content_hash,
+                     source_path, ingestion_tier)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?, ?)
                 """,
                 (memory_id, content, summary, now, now, model,
-                 salience_model, salience_composite),
+                 salience_model, salience_composite, content_hash,
+                 source_path, ingestion_tier),
             )
 
             # Assign word tags
@@ -257,12 +262,22 @@ class MemoryStore:
                 context_tag_ids.update(tids)
 
             if context_tag_ids:
+                ctx_list = list(context_tag_ids)
                 resonant = self._sync_engine.get_resonant_memory_ids_fast(
-                    list(context_tag_ids),
+                    ctx_list,
                 )
                 w_lattice = self._config.lattice_retrieval_boost_weight
                 for mid, strength in resonant:
                     scores[mid] = scores.get(mid, 0.0) + w_lattice * strength
+
+                # Glyph association boost: traverse glyph tensor edges
+                w_glyph_ret = self._config.glyph_retrieval_boost_weight
+                if w_glyph_ret > 0:
+                    glyph_assoc = self._sync_engine.get_glyph_association_scores(
+                        ctx_list,
+                    )
+                    for mid, strength in glyph_assoc:
+                        scores[mid] = scores.get(mid, 0.0) + w_glyph_ret * strength
 
         # Sort and return top-k, batch-load memories
         sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]

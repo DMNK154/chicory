@@ -13,6 +13,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from chicory.config import ChicoryConfig
 from chicory.ingest.chunker import Chunk, chunk_document
 from chicory.ingest.parsers import SUPPORTED_EXTENSIONS, parse_file
+from chicory.llm.base import BaseLLMClient
 from chicory.orchestrator.orchestrator import Orchestrator
 
 console = Console()
@@ -64,17 +65,58 @@ def ingest_file(
     base_dir: Path | None = None,
     chunk_size: int = 2000,
     overlap: int = 400,
-) -> int:
-    """Ingest a single file. Returns number of memories created."""
+    llm_client: BaseLLMClient | None = None,
+) -> tuple[int, list[str]]:
+    """Ingest a single file.
+
+    Returns (count of memories created, list of new memory IDs for batch embedding).
+    """
     text = parse_file(path)
     if not text or not text.strip():
-        return 0
+        return 0, []
 
-    tags = _derive_tags(path, base_dir)
+    base_tags = _derive_tags(path, base_dir)
+    existing_tag_names = orchestrator.tag_manager.list_active_names()
     chunks = chunk_document(text, str(path), chunk_size, overlap)
 
+    if not chunks:
+        return 0, []
+
+    # Compute all content hashes up front
+    chunk_hashes = [_content_hash(c.text) for c in chunks]
+
+    # Batch dedup: single indexed query instead of per-chunk LIKE scan
+    placeholders = ",".join("?" for _ in chunk_hashes)
+    existing_hashes = set()
+    rows = orchestrator.db.execute(
+        f"SELECT content_hash FROM memories WHERE content_hash IN ({placeholders})",
+        tuple(chunk_hashes),
+    ).fetchall()
+    for row in rows:
+        existing_hashes.add(row["content_hash"])
+
+    # Propose tags once per file using a representative sample, not per chunk
+    tags = list(base_tags)
+    if llm_client is not None:
+        # Use first chunk as representative content for tag proposal
+        sample_text = chunks[0].text
+        try:
+            proposed = llm_client.propose_tags(sample_text, existing_tag_names)
+            for t in proposed:
+                if t not in tags:
+                    tags.append(t)
+            for t in proposed:
+                if t not in existing_tag_names:
+                    existing_tag_names.append(t)
+        except Exception:
+            pass
+
     count = 0
-    for chunk in chunks:
+    new_ids: list[str] = []
+    for chunk, content_hash in zip(chunks, chunk_hashes):
+        if content_hash in existing_hashes:
+            continue
+
         # Build a summary line
         if chunk.total > 1:
             summary = f"{path.name} [{chunk.index + 1}/{chunk.total}]"
@@ -83,27 +125,23 @@ def ingest_file(
         else:
             summary = path.name
 
-        # Check for duplicates by content hash
-        content_hash = _content_hash(chunk.text)
-        existing = orchestrator.db.execute(
-            "SELECT id FROM memories WHERE content LIKE ?",
-            (f"%{content_hash}%",),
-        ).fetchone()
-        if existing:
-            continue
-
-        # Store with hash appended as metadata for dedup
+        # Store with hash in both column and content metadata for dedup
         content = chunk.text + f"\n\n<!-- chicory:hash={content_hash} -->"
 
-        orchestrator.handle_store_memory(
+        result = orchestrator.handle_store_memory(
             content=content,
             tags=tags,
-            importance=0.4,  # Documents start at moderate importance
+            importance=0.4,
             summary=summary,
+            content_hash=content_hash,
+            skip_embedding=True,
+            defer_side_effects=True,
         )
+        new_ids.append(result["memory_id"])
+        existing_hashes.add(content_hash)
         count += 1
 
-    return count
+    return count, new_ids
 
 
 def ingest_directory(
@@ -112,6 +150,7 @@ def ingest_directory(
     recursive: bool = True,
     chunk_size: int = 2000,
     overlap: int = 400,
+    llm_client: BaseLLMClient | None = None,
 ) -> dict[str, int]:
     """Ingest all supported files in a directory.
 
@@ -143,6 +182,7 @@ def ingest_directory(
     files.sort()
 
     stats = {"files_found": len(files), "files_ingested": 0, "memories_created": 0}
+    all_new_ids: list[str] = []
 
     with Progress(
         SpinnerColumn(),
@@ -154,13 +194,24 @@ def ingest_directory(
         for f in files:
             progress.update(task, description=f"Ingesting {f.name}...")
             try:
-                count = ingest_file(orchestrator, f, base_dir=directory,
-                                    chunk_size=chunk_size, overlap=overlap)
+                count, new_ids = ingest_file(
+                    orchestrator, f, base_dir=directory,
+                    chunk_size=chunk_size, overlap=overlap,
+                    llm_client=llm_client,
+                )
                 if count > 0:
                     stats["files_ingested"] += 1
                     stats["memories_created"] += count
+                    all_new_ids.extend(new_ids)
             except Exception as e:
                 console.print(f"  [yellow]Skipped {f.name}: {e}[/yellow]")
             progress.advance(task)
+
+    if all_new_ids:
+        console.print(f"[dim]Batch embedding {len(all_new_ids)} memories...[/dim]")
+        orchestrator._batch_embed_memories(all_new_ids)
+
+        console.print("[dim]Updating tensor networks...[/dim]")
+        orchestrator._finalize_ingested_memories(all_new_ids)
 
     return stats

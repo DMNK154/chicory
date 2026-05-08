@@ -21,7 +21,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "anthropic>=0.40.0",
     "pydantic>=2.0",
     "sentence-transformers>=3.0",
     "numpy>=1.24",
@@ -41,6 +40,22 @@ Repository = "https://github.com/DMNK154/chicory"
 Issues = "https://github.com/DMNK154/chicory/issues"
 
 [project.optional-dependencies]
+anthropic = [
+    "anthropic>=0.40.0",
+]
+openai = [
+    "openai>=1.0",
+]
+all-llm = [
+    "anthropic>=0.40.0",
+    "openai>=1.0",
+]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.7",
+    "stripe>=7.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -56,10 +71,15 @@ mcp = [
 commons = [
     "chicory-commons-man>=0.1.0",
 ]
+glyph = [
+    "transformers>=4.40",
+    "torch>=2.0",
+]
 
 [project.scripts]
 chicory = "chicory.cli.app:app"
 chicory-mcp = "chicory.mcp.server:main"
+chicory-api = "chicory.api.app:main"
 
 [tool.setuptools.packages.find]
 include = ["chicory*"]

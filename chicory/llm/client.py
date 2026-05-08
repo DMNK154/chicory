@@ -9,27 +9,24 @@ import anthropic
 
 from chicory.config import ChicoryConfig
 from chicory.exceptions import LLMError
+from chicory.llm.base import BaseLLMClient
 from chicory.llm.prompts import build_system_prompt
+from chicory.llm.types import ContentBlock, LLMResponse, TextBlock, ToolUseBlock
 from chicory.orchestrator.tool_definitions import CHICORY_TOOLS
 
 
-class ClaudeClient:
+class ClaudeClient(BaseLLMClient):
     """Wrapper around the Anthropic API for Claude interactions with memory tools."""
 
     def __init__(self, config: ChicoryConfig, active_tags: list[str] | None = None) -> None:
-        self._config = config
+        super().__init__(config, active_tags)
         self._client = anthropic.Anthropic(api_key=config.anthropic_api_key)
-        self._active_tags = active_tags or []
-
-    def update_active_tags(self, tags: list[str]) -> None:
-        """Update the active tags shown in the system prompt."""
-        self._active_tags = tags
 
     def chat(
         self,
         messages: list[dict[str, Any]],
         system: str | None = None,
-    ) -> anthropic.types.Message:
+    ) -> LLMResponse:
         """Send a message to Claude with memory tools available."""
         sys_prompt = system or build_system_prompt(self._active_tags)
 
@@ -38,12 +35,71 @@ class ClaudeClient:
                 model=self._config.llm_model,
                 max_tokens=self._config.max_tokens,
                 system=sys_prompt,
-                messages=messages,
+                messages=self._convert_messages(messages),
                 tools=CHICORY_TOOLS,
             )
-            return response
+            return self._convert_response(response)
         except anthropic.APIError as e:
             raise LLMError(f"Claude API error: {e}") from e
+
+    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert internal messages (with our ContentBlock types) to Anthropic format.
+
+        When ChatSession appends response.content (list of our dataclasses) into
+        the message history and passes it back, we need to serialize those back
+        to dicts that the Anthropic SDK expects.
+        """
+        result = []
+        for msg in messages:
+            content = msg["content"]
+            if isinstance(content, list):
+                converted = []
+                for item in content:
+                    if isinstance(item, TextBlock):
+                        converted.append({"type": "text", "text": item.text})
+                    elif isinstance(item, ToolUseBlock):
+                        converted.append({
+                            "type": "tool_use",
+                            "id": item.id,
+                            "name": item.name,
+                            "input": item.input,
+                        })
+                    else:
+                        # Already a dict (e.g., tool_result from ChatSession)
+                        converted.append(item)
+                result.append({"role": msg["role"], "content": converted})
+            else:
+                result.append(msg)
+        return result
+
+    def _convert_response(self, response: anthropic.types.Message) -> LLMResponse:
+        """Convert Anthropic Message to our LLMResponse."""
+        content: list[ContentBlock] = []
+        for block in response.content:
+            if block.type == "text":
+                content.append(TextBlock(text=block.text))
+            elif block.type == "tool_use":
+                content.append(ToolUseBlock(
+                    id=block.id,
+                    name=block.name,
+                    input=block.input,
+                ))
+
+        usage = {}
+        if response.usage:
+            usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            }
+
+        return LLMResponse(
+            content=content,
+            stop_reason=response.stop_reason or "end_turn",
+            model=response.model or "",
+            usage=usage,
+        )
+
+    # --- Anthropic-specific methods (not part of the base interface) ---
 
     def judge_salience(self, content: str, context: str = "") -> float:
         """Ask Claude to rate the importance of a memory. Returns 0.0-1.0."""

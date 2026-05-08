@@ -224,7 +224,7 @@ def demo_ingest_document(s: dict, doc_path: Path) -> int:
     print("  (same pipeline as 'chicory ingest', using mock embeddings)\n")
 
     shim = _DemoOrchestrator(s)
-    count = ingest_file(shim, doc_path, chunk_size=1500, overlap=300)
+    count, _new_ids = ingest_file(shim, doc_path, chunk_size=1500, overlap=300)
 
     section(f"Result: {count} memory chunks created")
 

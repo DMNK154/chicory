@@ -24,6 +24,9 @@ def dispatch_tool_call(
         "get_lattice_resonances": _handle_get_lattice_resonances,
         "deep_retrieve": _handle_deep_retrieve,
         "ingest_codebase": _handle_ingest_codebase,
+        "ingest_documents": _handle_ingest_documents,
+        "get_canopy": _handle_get_canopy,
+        "sync_network": _handle_sync_network,
     }
 
     handler = handlers.get(tool_name)
@@ -89,3 +92,26 @@ def _handle_ingest_codebase(o: "Orchestrator", inp: dict) -> dict:
         file_patterns=inp.get("file_patterns"),
         exclude_patterns=inp.get("exclude_patterns"),
     )
+
+
+def _handle_ingest_documents(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_ingest_documents(
+        path=inp["path"],
+        file_patterns=inp.get("file_patterns"),
+        exclude_patterns=inp.get("exclude_patterns"),
+        critical=inp.get("critical"),
+    )
+
+
+def _handle_get_canopy(o: "Orchestrator", inp: dict) -> dict:
+    block_key = inp.get("block_key")
+    if block_key:
+        detail = o.canopy.get_block_detail(block_key)
+        if detail is None:
+            return {"error": f"Canopy block not found: {block_key}"}
+        return detail
+    return o.canopy.get_canopy_summary(top_k=inp.get("top_k", 20))
+
+
+def _handle_sync_network(o: "Orchestrator", inp: dict) -> dict:
+    return o.run_sync()

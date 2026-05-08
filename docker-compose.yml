@@ -1,0 +1,13 @@
+services:
+  chicory:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - chicory-data:/root/.chicory
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  chicory-data:

@@ -413,7 +413,7 @@ class CentroidSubgraph:
                 f"JOIN synchronicity_events seb ON seb.id = r.event_b_id "
                 f"WHERE ({like_clauses}) "
                 f"   OR ({like_clauses.replace('sea.', 'seb.')}) "
-                f"ORDER BY r.resonance_strength DESC LIMIT 1000"
+                f"ORDER BY r.resonance_strength DESC"
             )
             params = tuple(str(t) for t in chunk) * 2
             for row in self._db.execute(sql, params).fetchall():

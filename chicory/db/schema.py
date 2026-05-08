@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 22
 
 TABLES = [
     # -- Schema version tracking --
@@ -32,10 +32,14 @@ TABLES = [
         salience_composite      REAL NOT NULL DEFAULT 0.5,
         retrieval_success_count INTEGER NOT NULL DEFAULT 0,
         retrieval_total_count   INTEGER NOT NULL DEFAULT 0,
-        is_archived             INTEGER NOT NULL DEFAULT 0
+        is_archived             INTEGER NOT NULL DEFAULT 0,
+        content_hash            TEXT,
+        source_path             TEXT,
+        ingestion_tier          TEXT NOT NULL DEFAULT 'critical'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_memories_salience ON memories(salience_composite DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash) WHERE content_hash IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed)",
 
@@ -166,6 +170,16 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_sync_events_type ON synchronicity_events(event_type)",
     "CREATE INDEX IF NOT EXISTS idx_sync_events_strength ON synchronicity_events(strength DESC)",
 
+    # -- Layer 3: Synchronicity event ↔ memory junction --
+    """
+    CREATE TABLE IF NOT EXISTS sync_event_memories (
+        event_id   INTEGER NOT NULL REFERENCES synchronicity_events(id) ON DELETE CASCADE,
+        memory_id  TEXT NOT NULL,
+        PRIMARY KEY (event_id, memory_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_sync_event_memories_mid ON sync_event_memories(memory_id)",
+
     # -- Layer 3.5: Prime Ramsey Lattice --
     """
     CREATE TABLE IF NOT EXISTS lattice_positions (
@@ -173,12 +187,15 @@ TABLES = [
         sync_event_id   INTEGER NOT NULL REFERENCES synchronicity_events(id) ON DELETE CASCADE,
         angle           REAL NOT NULL,
         prime_slots     TEXT NOT NULL,
+        poincare_x      REAL,
+        poincare_y      REAL,
         placed_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
         UNIQUE(sync_event_id)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_lattice_pos_event ON lattice_positions(sync_event_id)",
     "CREATE INDEX IF NOT EXISTS idx_lattice_pos_angle ON lattice_positions(angle)",
+    "CREATE INDEX IF NOT EXISTS idx_lattice_pos_placed ON lattice_positions(placed_at DESC)",
 
     """
     CREATE TABLE IF NOT EXISTS resonances (
@@ -208,6 +225,9 @@ TABLES = [
         semantic_strength       REAL NOT NULL DEFAULT 0.0,
         semiotic_forward        REAL NOT NULL DEFAULT 0.0,
         semiotic_reverse        REAL NOT NULL DEFAULT 0.0,
+        glyph_strength          REAL NOT NULL DEFAULT 0.0,
+        inhibition_strength     REAL NOT NULL DEFAULT 0.0,
+        parallelness            REAL NOT NULL DEFAULT 0.0,
         memory_ids             TEXT NOT NULL DEFAULT '[]',
         updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
         PRIMARY KEY (tag_a_id, tag_b_id),
@@ -244,6 +264,34 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_centroid_edges_a ON centroid_edges(tag_a_id)",
     "CREATE INDEX IF NOT EXISTS idx_centroid_edges_b ON centroid_edges(tag_b_id)",
     "CREATE INDEX IF NOT EXISTS idx_centroid_edges_strength ON centroid_edges(edge_strength DESC)",
+
+    # -- Layer 3.5: Glyph Ramsey Lattice --
+    """
+    CREATE TABLE IF NOT EXISTS glyph_positions (
+        tag_id          INTEGER PRIMARY KEY REFERENCES tags(id),
+        angle           REAL NOT NULL,
+        prime_slots     TEXT NOT NULL,
+        glyph_vector    BLOB NOT NULL,
+        glyph_dimension INTEGER NOT NULL DEFAULT 26,
+        placed_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_glyph_pos_angle ON glyph_positions(angle)",
+
+    """
+    CREATE TABLE IF NOT EXISTS glyph_resonances (
+        tag_a_id           INTEGER NOT NULL REFERENCES tags(id),
+        tag_b_id           INTEGER NOT NULL REFERENCES tags(id),
+        shared_primes      TEXT NOT NULL,
+        resonance_strength REAL NOT NULL,
+        detected_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (tag_a_id, tag_b_id),
+        CHECK (tag_a_id < tag_b_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_glyph_res_strength ON glyph_resonances(resonance_strength DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_glyph_res_a ON glyph_resonances(tag_a_id)",
+    "CREATE INDEX IF NOT EXISTS idx_glyph_res_b ON glyph_resonances(tag_b_id)",
 
     # -- Layer 4: Meta-Patterns --
     """
@@ -301,6 +349,272 @@ TABLES = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_pending_signals_unprocessed ON pending_signals(processed) WHERE processed = 0",
+
+    # -- Glyph Bridge Cache (GPT-GU integration) --
+    """
+    CREATE TABLE IF NOT EXISTS glyph_bridge_cache (
+        tag_name      TEXT PRIMARY KEY,
+        glyph_symbol  TEXT NOT NULL,
+        glyph_concept TEXT,
+        embedding     BLOB NOT NULL,
+        embedding_dim INTEGER NOT NULL,
+        source        TEXT NOT NULL,
+        cached_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+
+    # -- Glyph Content Analysis Metadata --
+    """
+    CREATE TABLE IF NOT EXISTS glyph_metadata (
+        memory_id   TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+        glyph_json  TEXT NOT NULL,
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+
+    # -- Forest Layer: Co-occurrence --
+    """
+    CREATE TABLE IF NOT EXISTS cooccurrence_edges (
+        left_type TEXT NOT NULL,
+        left_id TEXT NOT NULL,
+        right_type TEXT NOT NULL,
+        right_id TEXT NOT NULL,
+        scope_type TEXT NOT NULL,
+        raw_count REAL NOT NULL DEFAULT 0.0,
+        expected_count REAL NOT NULL DEFAULT 0.0,
+        lift REAL NOT NULL DEFAULT 0.0,
+        pmi REAL NOT NULL DEFAULT 0.0,
+        co_strength REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (left_type, left_id, right_type, right_id, scope_type)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cooccurrence_edges_strength ON cooccurrence_edges(scope_type, co_strength DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_cooccurrence_edges_left ON cooccurrence_edges(left_type, left_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cooccurrence_edges_right ON cooccurrence_edges(right_type, right_id)",
+
+    # -- Forest Layer: Blocks & Memberships --
+    """
+    CREATE TABLE IF NOT EXISTS forest_blocks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        block_key TEXT NOT NULL UNIQUE,
+        block_type TEXT NOT NULL,
+        forest_type TEXT NOT NULL,
+        internal_density REAL NOT NULL DEFAULT 0.0,
+        external_bridge_strength REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_forest_blocks_type_density ON forest_blocks(forest_type, internal_density DESC)",
+
+    """
+    CREATE TABLE IF NOT EXISTS block_memberships (
+        block_id INTEGER NOT NULL REFERENCES forest_blocks(id) ON DELETE RESTRICT,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        membership_strength REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (block_id, target_type, target_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_block_memberships_target ON block_memberships(target_type, target_id)",
+
+    # -- Forest Layer: Bridge Edges & Adjacency --
+    """
+    CREATE TABLE IF NOT EXISTS bridge_edges (
+        left_block_id INTEGER NOT NULL REFERENCES forest_blocks(id) ON DELETE RESTRICT,
+        right_block_id INTEGER NOT NULL REFERENCES forest_blocks(id) ON DELETE RESTRICT,
+        connection_strength REAL NOT NULL DEFAULT 0.0,
+        cluster_distance REAL NOT NULL DEFAULT 0.0,
+        rarity_bonus REAL NOT NULL DEFAULT 0.0,
+        bridge_strength REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (left_block_id, right_block_id),
+        CHECK (left_block_id < right_block_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_bridge_edges_strength ON bridge_edges(bridge_strength DESC)",
+
+    """
+    CREATE TABLE IF NOT EXISTS block_adjacency (
+        left_block_id INTEGER NOT NULL REFERENCES forest_blocks(id) ON DELETE RESTRICT,
+        right_block_id INTEGER NOT NULL REFERENCES forest_blocks(id) ON DELETE RESTRICT,
+        adjacency_type TEXT NOT NULL,
+        cooccurrence_weight REAL NOT NULL DEFAULT 0.0,
+        bridge_weight REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        last_observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (left_block_id, right_block_id, adjacency_type),
+        CHECK (left_block_id < right_block_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_block_adjacency_left ON block_adjacency(left_block_id)",
+
+    # -- Forest Layer: Snapshots --
+    """
+    CREATE TABLE IF NOT EXISTS forest_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        trigger_type TEXT NOT NULL,
+        trigger_id TEXT,
+        touched_memory_ids TEXT NOT NULL DEFAULT '[]',
+        touched_tag_ids TEXT NOT NULL DEFAULT '[]',
+        touched_block_ids TEXT NOT NULL DEFAULT '[]',
+        co_edge_count INTEGER NOT NULL DEFAULT 0,
+        bridge_edge_count INTEGER NOT NULL DEFAULT 0,
+        block_count INTEGER NOT NULL DEFAULT 0,
+        notes TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_forest_snapshots_time ON forest_snapshots(snapshot_at DESC)",
+
+    # -- Canopy Layer: Blocks --
+    """
+    CREATE TABLE IF NOT EXISTS canopy_blocks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        block_key TEXT NOT NULL UNIQUE,
+        block_type TEXT NOT NULL,
+        layer_depth INTEGER NOT NULL DEFAULT 0,
+        tag_ids TEXT NOT NULL DEFAULT '[]',
+        memory_ids TEXT NOT NULL DEFAULT '[]',
+        parent_block_keys TEXT NOT NULL DEFAULT '[]',
+        source_event_types TEXT NOT NULL DEFAULT '[]',
+        peak_bridge REAL NOT NULL DEFAULT 0.0,
+        peak_heat REAL NOT NULL DEFAULT 0.0,
+        peak_recurrence REAL NOT NULL DEFAULT 0.0,
+        peak_cooccurrence REAL NOT NULL DEFAULT 0.0,
+        peak_similarity REAL NOT NULL DEFAULT 0.0,
+        peak_relevance REAL NOT NULL DEFAULT 0.0,
+        peak_semantics REAL NOT NULL DEFAULT 0.0,
+        peak_pressure REAL NOT NULL DEFAULT 0.0,
+        peak_threshold REAL NOT NULL DEFAULT 0.0,
+        peak_growth_potential REAL NOT NULL DEFAULT 0.0,
+        peak_canopy_growth REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        first_growth_at TEXT,
+        canonical_block_key TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_canopy_blocks_type_growth ON canopy_blocks(layer_depth, block_type, peak_canopy_growth DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_canopy_blocks_first_growth ON canopy_blocks(first_growth_at)",
+    "CREATE INDEX IF NOT EXISTS idx_canopy_blocks_last_observed ON canopy_blocks(last_observed_at DESC)",
+
+    # -- Canopy Layer: Cross-Layer Inhibition Edges --
+    """
+    CREATE TABLE IF NOT EXISTS canopy_cross_layer_edges (
+        relevance_block_id INTEGER NOT NULL REFERENCES canopy_blocks(id) ON DELETE RESTRICT,
+        semantic_block_id INTEGER NOT NULL REFERENCES canopy_blocks(id) ON DELETE RESTRICT,
+        edge_inhibition REAL NOT NULL DEFAULT 0.0,
+        a_heat REAL NOT NULL DEFAULT 0.0,
+        a_similarity REAL NOT NULL DEFAULT 0.0,
+        a_cooccurrence REAL NOT NULL DEFAULT 0.0,
+        a_recurrence REAL NOT NULL DEFAULT 0.0,
+        a_bridge REAL NOT NULL DEFAULT 0.0,
+        edge_heat REAL NOT NULL DEFAULT 0.0,
+        edge_similarity REAL NOT NULL DEFAULT 0.0,
+        edge_cooccurrence REAL NOT NULL DEFAULT 0.0,
+        edge_recurrence REAL NOT NULL DEFAULT 0.0,
+        edge_bridge REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (relevance_block_id, semantic_block_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_canopy_cross_layer_edges_inhibition ON canopy_cross_layer_edges(edge_inhibition DESC)",
+
+    # -- Canopy Layer: Support Edges --
+    """
+    CREATE TABLE IF NOT EXISTS canopy_support_edges (
+        canopy_block_id INTEGER NOT NULL REFERENCES canopy_blocks(id) ON DELETE RESTRICT,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        edge_type TEXT NOT NULL,
+        strength REAL NOT NULL DEFAULT 0.0,
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (canopy_block_id, target_type, target_id, edge_type)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_canopy_support_edges_target ON canopy_support_edges(target_type, target_id)",
+
+    # -- Canopy Layer: Observations (append-only) --
+    """
+    CREATE TABLE IF NOT EXISTS canopy_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        block_key TEXT NOT NULL,
+        observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        source TEXT NOT NULL,
+        source_id TEXT,
+        layer_depth INTEGER NOT NULL DEFAULT 0,
+        tag_ids TEXT NOT NULL DEFAULT '[]',
+        memory_ids TEXT NOT NULL DEFAULT '[]',
+        source_canopy_block_ids TEXT NOT NULL DEFAULT '[]',
+        bridge REAL NOT NULL,
+        heat REAL NOT NULL,
+        recurrence REAL NOT NULL,
+        cooccurrence REAL NOT NULL,
+        similarity REAL NOT NULL,
+        relevance REAL NOT NULL,
+        semantics REAL NOT NULL,
+        pressure REAL NOT NULL,
+        threshold REAL NOT NULL,
+        growth_potential REAL NOT NULL,
+        canopy_growth REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_canopy_observations_key_time ON canopy_observations(block_key, observed_at DESC)",
+
+    # -- Episodic Relational Tensor: memory-to-memory edge cache --
+    """
+    CREATE TABLE IF NOT EXISTS memory_relational_tensor (
+        memory_a_id              TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        memory_b_id              TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+
+        semantic_strength        REAL NOT NULL DEFAULT 0.0,
+        tag_projected_strength   REAL NOT NULL DEFAULT 0.0,
+        co_retrieval_strength    REAL NOT NULL DEFAULT 0.0,
+        temporal_proximity       REAL NOT NULL DEFAULT 0.0,
+        source_proximity         REAL NOT NULL DEFAULT 0.0,
+
+        tag_semantic_projected   REAL NOT NULL DEFAULT 0.0,
+        tag_sync_projected       REAL NOT NULL DEFAULT 0.0,
+        tag_cooccurrence_projected REAL NOT NULL DEFAULT 0.0,
+        tag_inhibition_projected REAL NOT NULL DEFAULT 0.0,
+        tag_glyph_projected      REAL NOT NULL DEFAULT 0.0,
+
+        retrieval_reinforcement  REAL NOT NULL DEFAULT 0.0,
+        narrative_continuity     REAL NOT NULL DEFAULT 0.0,
+        supersession_strength    REAL NOT NULL DEFAULT 0.0,
+        supersession_direction   INTEGER NOT NULL DEFAULT 0,
+        contradiction_strength   REAL NOT NULL DEFAULT 0.0,
+        bridge_strength          REAL NOT NULL DEFAULT 0.0,
+
+        activation_count         INTEGER NOT NULL DEFAULT 0,
+        edge_status              TEXT NOT NULL DEFAULT 'candidate',
+        created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_activated_at        TEXT,
+
+        PRIMARY KEY (memory_a_id, memory_b_id),
+        CHECK (memory_a_id < memory_b_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_mrt_a ON memory_relational_tensor(memory_a_id)",
+    "CREATE INDEX IF NOT EXISTS idx_mrt_b ON memory_relational_tensor(memory_b_id)",
+    "CREATE INDEX IF NOT EXISTS idx_mrt_status ON memory_relational_tensor(edge_status)",
+    "CREATE INDEX IF NOT EXISTS idx_mrt_tag_projected ON memory_relational_tensor(tag_projected_strength DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_mrt_bridge ON memory_relational_tensor(bridge_strength DESC)",
 ]
 
 
@@ -335,6 +649,28 @@ def apply_schema(db: DatabaseEngine) -> None:
             _migrate_v9_to_v10(db)
         if current_version <= 10:
             _migrate_v10_to_v11(db)
+        if current_version <= 11:
+            _migrate_v11_to_v12(db)
+        if current_version <= 12:
+            _migrate_v12_to_v13(db)
+        if current_version <= 13:
+            _migrate_v13_to_v14(db)
+        if current_version <= 14:
+            _migrate_v14_to_v15(db)
+        if current_version <= 15:
+            _migrate_v15_to_v16(db)
+        if current_version <= 16:
+            _migrate_v16_to_v17(db)
+        if current_version <= 17:
+            _migrate_v17_to_v18(db)
+        if current_version <= 18:
+            _migrate_v18_to_v19(db)
+        if current_version <= 19:
+            _migrate_v19_to_v20(db)
+        if current_version <= 20:
+            _migrate_v20_to_v21(db)
+        if current_version <= 21:
+            _migrate_v21_to_v22(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -348,7 +684,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Centroid sub-graph: retrieval-driven inhibition"),
+                (SCHEMA_VERSION, "Two-tier document ingestion (critical/reference)"),
             )
 
 
@@ -503,3 +839,230 @@ def _migrate_v10_to_v11(db: DatabaseEngine) -> None:
     Centroid backfill from existing embeddings is deferred to orchestrator boot.
     """
     pass
+
+
+def _migrate_v11_to_v12(db: DatabaseEngine) -> None:
+    """Add content_hash column to memories for O(1) dedup lookups."""
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    cols = db.execute("PRAGMA table_info(memories)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "content_hash" in col_names:
+        return
+
+    db.execute("ALTER TABLE memories ADD COLUMN content_hash TEXT")
+
+    # Backfill from existing <!-- chicory:hash=XXXX --> markers
+    import re
+    rows = db.execute("SELECT id, content FROM memories").fetchall()
+    for row in rows:
+        m = re.search(r"<!-- chicory:hash=([0-9a-f]+) -->", row["content"])
+        if m:
+            db.execute(
+                "UPDATE memories SET content_hash = ? WHERE id = ?",
+                (m.group(1), row["id"]),
+            )
+
+    # Deduplicate: keep only the newest memory per content_hash, NULL the rest.
+    # Duplicate hashes arise from repeated codebase ingestions.
+    db.execute("""
+        UPDATE memories SET content_hash = NULL
+        WHERE content_hash IS NOT NULL
+          AND rowid NOT IN (
+              SELECT MAX(rowid) FROM memories
+              WHERE content_hash IS NOT NULL
+              GROUP BY content_hash
+          )
+    """)
+
+
+def _migrate_v12_to_v13(db: DatabaseEngine) -> None:
+    """Add glyph Ramsey lattice tables and glyph_strength column to tensor."""
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_relational_tensor'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    cols = db.execute("PRAGMA table_info(tag_relational_tensor)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "glyph_strength" in col_names:
+        return
+
+    db.execute(
+        "ALTER TABLE tag_relational_tensor ADD COLUMN glyph_strength REAL NOT NULL DEFAULT 0.0"
+    )
+
+
+def _migrate_v13_to_v14(db: DatabaseEngine) -> None:
+    """Convert glyph_vector from TEXT (JSON) to BLOB (float32 array).
+
+    Glyph data is fully rebuildable from tag names, so drop and recreate.
+    The orchestrator's _maybe_seed_glyph_lattice will rebuild on next boot.
+    """
+    db.execute("DROP TABLE IF EXISTS glyph_resonances")
+    db.execute("DROP TABLE IF EXISTS glyph_positions")
+    # Tables are recreated by the CREATE IF NOT EXISTS pass in apply_schema.
+    # Reset glyph_strength in tensor so rebuild repopulates it.
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_relational_tensor'"
+    ).fetchone()
+    if table_exists:
+        db.execute("UPDATE tag_relational_tensor SET glyph_strength = 0.0")
+
+
+def _migrate_v14_to_v15(db: DatabaseEngine) -> None:
+    """Add glyph_bridge_cache table for GPT-GU glyph translation caching.
+
+    Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v15_to_v16(db: DatabaseEngine) -> None:
+    """Add inhibition_strength and parallelness columns to tag_relational_tensor."""
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_relational_tensor'"
+    ).fetchone()
+    if not table_exists:
+        return  # Will be created by TABLES loop
+
+    cols = db.execute("PRAGMA table_info(tag_relational_tensor)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "inhibition_strength" not in col_names:
+        db.execute(
+            "ALTER TABLE tag_relational_tensor ADD COLUMN inhibition_strength REAL NOT NULL DEFAULT 0.0"
+        )
+    if "parallelness" not in col_names:
+        db.execute(
+            "ALTER TABLE tag_relational_tensor ADD COLUMN parallelness REAL NOT NULL DEFAULT 0.0"
+        )
+
+
+def _migrate_v16_to_v17(db: DatabaseEngine) -> None:
+    """Add glyph_metadata table for content-level glyph analysis.
+
+    Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v17_to_v18(db: DatabaseEngine) -> None:
+    """Add Poincaré disk coordinates to lattice_positions."""
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='lattice_positions'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    cols = db.execute("PRAGMA table_info(lattice_positions)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "poincare_x" in col_names:
+        return
+
+    db.execute("ALTER TABLE lattice_positions ADD COLUMN poincare_x REAL")
+    db.execute("ALTER TABLE lattice_positions ADD COLUMN poincare_y REAL")
+
+    # Backfill: place existing positions at r=0.5 using their existing angle.
+    # The engine's reseed() will recompute proper Poincaré coords with depth.
+    import math
+    rows = db.execute("SELECT id, angle FROM lattice_positions").fetchall()
+    for row in rows:
+        angle = row["angle"]
+        r = 0.5
+        px = r * math.cos(angle)
+        py = r * math.sin(angle)
+        db.execute(
+            "UPDATE lattice_positions SET poincare_x = ?, poincare_y = ? WHERE id = ?",
+            (px, py, row["id"]),
+        )
+
+
+def _migrate_v18_to_v19(db: DatabaseEngine) -> None:
+    """Create sync_event_memories junction table and backfill from JSON."""
+    import json
+
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='sync_event_memories'"
+    ).fetchone()
+    if table_exists:
+        return
+
+    source_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='synchronicity_events'"
+    ).fetchone()
+
+    db.execute("""
+        CREATE TABLE sync_event_memories (
+            event_id   INTEGER NOT NULL REFERENCES synchronicity_events(id) ON DELETE CASCADE,
+            memory_id  TEXT NOT NULL,
+            PRIMARY KEY (event_id, memory_id)
+        )
+    """)
+    db.execute(
+        "CREATE INDEX idx_sync_event_memories_mid ON sync_event_memories(memory_id)"
+    )
+
+    if not source_exists:
+        return
+
+    cursor = db.execute(
+        "SELECT id, involved_memories FROM synchronicity_events WHERE involved_memories IS NOT NULL"
+    )
+    rows_to_insert = []
+    while True:
+        batch = cursor.fetchmany(500)
+        if not batch:
+            break
+        for row in batch:
+            try:
+                mids = json.loads(row["involved_memories"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for mid in mids:
+                rows_to_insert.append((row["id"], str(mid)))
+
+    if rows_to_insert:
+        db.connection.executemany(
+            "INSERT OR IGNORE INTO sync_event_memories (event_id, memory_id) VALUES (?, ?)",
+            rows_to_insert,
+        )
+
+
+def _migrate_v19_to_v20(db: DatabaseEngine) -> None:
+    """Add forest and canopy graph tables.
+
+    All tables use IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v20_to_v21(db: DatabaseEngine) -> None:
+    """Add memory_relational_tensor table for episodic edge cache.
+
+    Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v21_to_v22(db: DatabaseEngine) -> None:
+    """Add source_path and ingestion_tier columns to memories for two-tier ingestion."""
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    cols = db.execute("PRAGMA table_info(memories)").fetchall()
+    col_names = {c["name"] for c in cols}
+
+    if "source_path" not in col_names:
+        db.execute("ALTER TABLE memories ADD COLUMN source_path TEXT")
+    if "ingestion_tier" not in col_names:
+        db.execute(
+            "ALTER TABLE memories ADD COLUMN ingestion_tier TEXT NOT NULL DEFAULT 'critical'"
+        )

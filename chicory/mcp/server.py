@@ -69,24 +69,19 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     except Exception:
         logger.exception("Eager model/index load failed (will retry lazily)")
 
-    # Initialize signal processor if pending_signals table exists (commons mode)
-    signal_processor = None
-    try:
-        table_check = orchestrator.db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_signals'"
-        ).fetchone()
-        if table_check:
-            from chicory_commons import SignalProcessor
-
-            signal_processor = SignalProcessor(orchestrator)
-            logger.info("Signal processor initialized (commons mode)")
-    except Exception:
-        logger.exception("Signal processor init failed")
+    # Eagerly load ByT5 glyph encoder (same reason: torch deadlocks in thread pool)
+    if orchestrator.glyph_encoder is not None:
+        try:
+            t2 = time.time()
+            orchestrator.glyph_encoder._load_model()
+            logger.info("Glyph encoder loaded in %.1fs", time.time() - t2)
+        except Exception:
+            logger.exception("Glyph encoder load failed (will use letter-count fallback)")
 
     try:
         yield AppContext(
             orchestrator=orchestrator,
-            signal_processor=signal_processor,
+            signal_processor=orchestrator._signal_processor,
         )
     finally:
         orchestrator.close()
@@ -99,6 +94,42 @@ mcp_server = FastMCP(
     "Chicory",
     lifespan=lifespan,
 )
+
+
+# ── Glyph legend injection ─────────────────────────────────────────
+
+_GLYPH_LEGEND: dict[str, str] = {}  # glyph -> concept name
+
+
+def _ensure_glyph_legend() -> dict[str, str]:
+    """Load the glyph->concept mapping once."""
+    global _GLYPH_LEGEND
+    if _GLYPH_LEGEND:
+        return _GLYPH_LEGEND
+    try:
+        from chicory.layer1.glyph_lexicon import GLYPH2DICT
+        _GLYPH_LEGEND = dict(GLYPH2DICT)
+    except ImportError:
+        pass
+    return _GLYPH_LEGEND
+
+
+def _inject_glyph_definitions(response_text: str) -> str:
+    """Scan a response string for glyph symbols and append a definitions block."""
+    legend = _ensure_glyph_legend()
+    if not legend:
+        return response_text
+
+    found: dict[str, str] = {}
+    for char in response_text:
+        if char in legend and char not in found:
+            found[char] = legend[char]
+
+    if not found:
+        return response_text
+
+    defs = ", ".join(f"{g}={name}" for g, name in found.items())
+    return f"{response_text}\n\n[glyph definitions: {defs}]"
 
 
 # ── Helper ──────────────────────────────────────────────────────────
@@ -116,13 +147,6 @@ def _call(ctx: Context, tool_name: str, tool_input: dict) -> str:
     app_ctx = ctx.request_context.lifespan_context
     orchestrator: Orchestrator = app_ctx.orchestrator
 
-    # Auto-process pending signals if this is a commons instance
-    if app_ctx.signal_processor:
-        try:
-            app_ctx.signal_processor.maybe_auto_process()
-        except Exception:
-            logger.exception("Signal auto-processing failed")
-
     try:
         result = dispatch_tool_call(orchestrator, tool_name, tool_input)
     except Exception:
@@ -131,7 +155,8 @@ def _call(ctx: Context, tool_name: str, tool_input: dict) -> str:
     elapsed = time.time() - t0
     n = len(result.get("results", [])) if isinstance(result, dict) else "?"
     logger.info("TOOL DONE: %s  %.1fs  results=%s", tool_name, elapsed, n)
-    return json.dumps(result, default=str)
+    response = json.dumps(result, default=str)
+    return _inject_glyph_definitions(response)
 
 
 # ── Tools ───────────────────────────────────────────────────────────
@@ -299,6 +324,90 @@ def ingest_codebase(
 
 
 @mcp_server.tool()
+def ingest_documents(
+    ctx: Context,
+    path: str,
+    file_patterns: Optional[list[str]] = None,
+    exclude_patterns: Optional[list[str]] = None,
+    critical: Optional[bool] = None,
+) -> str:
+    """Ingest documents into the memory network with two-tier depth.
+
+    Each file is auto-classified based on tag overlap with the existing
+    memory network:
+
+    - **critical**: Full content stored (chunked for long files), embedded,
+      and deeply integrated into the tensor/lattice/centroid/canopy network.
+    - **reference**: Extractive whole-document summary stored with a
+      source_path pointer to the original file. Tags assigned and summary
+      embedded for search, but no deep network integration.
+
+    Use the `critical` parameter to override auto-classification.
+
+    Args:
+        path: File or directory to ingest (absolute or relative).
+        file_patterns: Optional glob patterns to include (e.g. ["*.txt", "*.md"]).
+            Defaults to all text-based files.
+        exclude_patterns: Optional directory names to skip.
+        critical: Force all files to critical (True) or reference (False).
+            When None (default), each file is auto-classified by network relevance.
+    """
+    inp: dict = {"path": path}
+    if file_patterns is not None:
+        inp["file_patterns"] = file_patterns
+    if exclude_patterns is not None:
+        inp["exclude_patterns"] = exclude_patterns
+    if critical is not None:
+        inp["critical"] = critical
+    return _call(ctx, "ingest_documents", inp)
+
+
+@mcp_server.tool()
+def get_canopy(
+    ctx: Context,
+    block_key: Optional[str] = None,
+    top_k: Optional[int] = None,
+) -> str:
+    """Inspect the self-building canopy graph.
+
+    Without arguments: returns a summary of all canopy blocks, how many
+    have grown, and the top blocks by growth potential.
+
+    With block_key: returns full detail for one canopy block including
+    support edges, recent observations, and cross-layer inhibition edges.
+
+    Args:
+        block_key: Optional specific block key to inspect.
+        top_k: How many top blocks to return in summary mode (default 20).
+    """
+    inp: dict = {}
+    if block_key is not None:
+        inp["block_key"] = block_key
+    if top_k is not None:
+        inp["top_k"] = top_k
+    return _call(ctx, "get_canopy", inp)
+
+
+@mcp_server.tool()
+def sync_network(ctx: Context) -> str:
+    """Run full network synchronization after a large ingest.
+
+    Executes all expensive network-building passes in order: centroids,
+    glyph lattice, lateral inhibition, tensor channels (co-occurrence,
+    semantic, glyph, semiotic), episodic edges, canopy growth,
+    synchronicity detection, and meta-pattern analysis.
+
+    Use this after bulk ingestion (ingest_codebase / ingest_documents /
+    corpus loading) to bring the network up to date. Runs against all
+    memories, not just newly ingested ones.
+    """
+    app_ctx = ctx.request_context.lifespan_context
+    orchestrator = app_ctx.orchestrator
+    stats = orchestrator.run_sync()
+    return _inject_glyph_definitions(json.dumps(stats, default=str))
+
+
+@mcp_server.tool()
 def process_signals(ctx: Context) -> str:
     """Process pending cross-project signals into commons memories.
 
@@ -307,12 +416,39 @@ def process_signals(ctx: Context) -> str:
     triggers embedding generation.
     """
     app_ctx = ctx.request_context.lifespan_context
-    if not app_ctx.signal_processor:
-        from chicory_commons import SignalProcessor
+    processor = app_ctx.signal_processor
+    if not processor:
+        return json.dumps({"error": "Commons not enabled or chicory-commons-man not installed"})
+    result = processor.process_pending()
+    return _inject_glyph_definitions(json.dumps(result, default=str))
 
-        app_ctx.signal_processor = SignalProcessor(app_ctx.orchestrator)
-    result = app_ctx.signal_processor.process_pending()
-    return json.dumps(result, default=str)
+
+@mcp_server.tool()
+def get_commons_log(
+    ctx: Context,
+    last_n: Optional[int] = None,
+    hours: Optional[float] = None,
+) -> str:
+    """View the chicory-commons activity log.
+
+    Shows a chronological history of signals emitted, signals processed,
+    glyph translations, heat map changes, and synchronicity detections.
+
+    Args:
+        last_n: Return the last N entries (default 50).
+        hours: Return entries from the past N hours instead.
+    """
+    try:
+        from chicory_commons.activity_log import read_recent, read_since
+
+        if hours is not None:
+            entries = read_since(hours)
+        else:
+            entries = read_recent(last_n or 50)
+
+        return _inject_glyph_definitions(json.dumps(entries, default=str))
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 # ── Entry point ─────────────────────────────────────────────────────

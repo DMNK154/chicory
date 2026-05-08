@@ -34,7 +34,7 @@ class DatabaseEngine:
         if not is_memory:
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         if not is_memory:
@@ -52,6 +52,30 @@ class DatabaseEngine:
             except sqlite3.Error as e:
                 raise DatabaseError(f"SQL execution failed: {e}") from e
 
+    def query(self, sql: str, params: tuple[Any, ...] | None = None) -> list[sqlite3.Row]:
+        """Execute a SELECT and fetchall() atomically within the lock.
+
+        Prevents race conditions where another thread's execute() could
+        interfere with the cursor between execute() and fetchall().
+        """
+        with self._lock:
+            try:
+                if params is not None:
+                    return self.connection.execute(sql, params).fetchall()
+                return self.connection.execute(sql).fetchall()
+            except sqlite3.Error as e:
+                raise DatabaseError(f"SQL query failed: {e}") from e
+
+    def query_one(self, sql: str, params: tuple[Any, ...] | None = None) -> sqlite3.Row | None:
+        """Execute a SELECT and fetchone() atomically within the lock."""
+        with self._lock:
+            try:
+                if params is not None:
+                    return self.connection.execute(sql, params).fetchone()
+                return self.connection.execute(sql).fetchone()
+            except sqlite3.Error as e:
+                raise DatabaseError(f"SQL query failed: {e}") from e
+
     def executemany(self, sql: str, params_list: list[tuple[Any, ...]]) -> sqlite3.Cursor:
         """Execute a SQL statement against multiple parameter sets (thread-safe)."""
         with self._lock:
@@ -62,15 +86,26 @@ class DatabaseEngine:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Context manager for atomic operations (thread-safe)."""
+        """Context manager for atomic operations (thread-safe).
+
+        With isolation_level=None (autocommit), we manage transactions
+        explicitly. Tolerates inner .commit() calls that may end the
+        transaction early.
+        """
         with self._lock:
             conn = self.connection
+            conn.execute("BEGIN")
             try:
-                conn.execute("BEGIN")
                 yield conn
-                conn.execute("COMMIT")
+                try:
+                    conn.execute("COMMIT")
+                except sqlite3.OperationalError:
+                    pass  # Already committed by inner .commit()
             except Exception:
-                conn.execute("ROLLBACK")
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass  # Already committed by inner .commit()
                 raise
 
     def close(self) -> None:

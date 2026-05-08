@@ -68,6 +68,9 @@ def _parse_pdf(path: Path) -> str:
     import fitz  # pymupdf
 
     doc = fitz.open(str(path))
+    if doc.needs_pass:
+        doc.close()
+        raise ValueError(f"Password-protected PDF: {path.name}")
     pages = []
     for page in doc:
         pages.append(page.get_text())

@@ -313,7 +313,8 @@ class TagManager:
             """
             SELECT tag_a_id, tag_b_id, cooccurrence_strength,
                    synchronicity_strength, semantic_strength,
-                   semiotic_forward, semiotic_reverse, memory_ids
+                   semiotic_forward, semiotic_reverse, glyph_strength,
+                   memory_ids
             FROM tag_relational_tensor
             WHERE tag_a_id = ? OR tag_b_id = ?
             """,
@@ -321,6 +322,14 @@ class TagManager:
         ).fetchall()
 
         if not rows:
+            # Still clean up glyph data even if no tensor entries
+            self._db.execute(
+                "DELETE FROM glyph_positions WHERE tag_id = ?", (source_id,),
+            )
+            self._db.execute(
+                "DELETE FROM glyph_resonances WHERE tag_a_id = ? OR tag_b_id = ?",
+                (source_id, source_id),
+            )
             return
 
         self._db.execute(
@@ -354,8 +363,9 @@ class TagManager:
                 INSERT INTO tag_relational_tensor
                     (tag_a_id, tag_b_id, cooccurrence_strength,
                      synchronicity_strength, semantic_strength,
-                     semiotic_forward, semiotic_reverse, memory_ids)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     semiotic_forward, semiotic_reverse, glyph_strength,
+                     memory_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tag_a_id, tag_b_id) DO UPDATE SET
                     cooccurrence_strength = MAX(
                         tag_relational_tensor.cooccurrence_strength,
@@ -377,6 +387,10 @@ class TagManager:
                         tag_relational_tensor.semiotic_reverse,
                         excluded.semiotic_reverse
                     ),
+                    glyph_strength = MAX(
+                        tag_relational_tensor.glyph_strength,
+                        excluded.glyph_strength
+                    ),
                     memory_ids = CASE
                         WHEN length(tag_relational_tensor.memory_ids) > length(excluded.memory_ids)
                         THEN tag_relational_tensor.memory_ids
@@ -390,17 +404,29 @@ class TagManager:
                     row["synchronicity_strength"],
                     row["semantic_strength"],
                     sem_fwd, sem_rev,
+                    row["glyph_strength"],
                     row["memory_ids"],
                 ),
             )
 
+        # Clean up source tag's glyph data
+        self._db.execute(
+            "DELETE FROM glyph_positions WHERE tag_id = ?", (source_id,),
+        )
+        self._db.execute(
+            "DELETE FROM glyph_resonances WHERE tag_a_id = ? OR tag_b_id = ?",
+            (source_id, source_id),
+        )
+
     @staticmethod
     def _row_to_tag(row) -> Tag:
+        raw_ts = row["created_at"]
+        created_at = datetime.fromisoformat(raw_ts) if isinstance(raw_ts, str) else datetime.utcnow()
         return Tag(
             id=row["id"],
             name=row["name"],
             description=row["description"],
-            created_at=datetime.fromisoformat(row["created_at"]),
+            created_at=created_at,
             created_by=row["created_by"],
             is_active=bool(row["is_active"]),
             parent_id=row["parent_id"],
