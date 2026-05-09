@@ -319,19 +319,20 @@ class Orchestrator:
             self._centroid_subgraph.rebuild_edges_from_history()
 
     def _maybe_seed_temporal_episodes(self) -> None:
-        """Bootstrap temporal episodes on first boot after upgrade."""
+        """Bootstrap temporal episodes on first boot or resume partial bootstrap."""
         if not self._config.episode_enabled:
-            return
-        episode_count = self._db.execute(
-            "SELECT COUNT(*) as cnt FROM temporal_episodes"
-        ).fetchone()["cnt"]
-        if episode_count > 0:
             return
         memory_count = self._db.execute(
             "SELECT COUNT(*) as cnt FROM memories WHERE is_archived = 0"
         ).fetchone()["cnt"]
-        if memory_count > 0:
-            self._temporal_episodes.bootstrap()
+        if memory_count == 0:
+            return
+        assigned_count = self._db.execute(
+            "SELECT COUNT(DISTINCT memory_id) as cnt FROM memory_episode_assignments"
+        ).fetchone()["cnt"]
+        if assigned_count >= memory_count:
+            return
+        self._temporal_episodes.bootstrap()
 
     def _init_signal_processor(self):
         """Initialize the commons SignalProcessor with optional glyph integration."""

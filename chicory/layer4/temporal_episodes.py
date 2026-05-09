@@ -445,6 +445,13 @@ class TemporalEpisodeTracker:
     def bootstrap(self, batch_size: int = 500) -> int:
         log.info("Bootstrapping temporal episodes from existing memories...")
 
+        already_assigned = {
+            r["memory_id"]
+            for r in self._db.execute(
+                "SELECT DISTINCT memory_id FROM memory_episode_assignments"
+            ).fetchall()
+        }
+
         rows = self._db.execute(
             "SELECT m.id, m.created_at FROM memories m "
             "WHERE m.is_archived = 0 "
@@ -461,8 +468,12 @@ class TemporalEpisodeTracker:
             all_mem_tags.setdefault(r["memory_id"], []).append(r["tag_id"])
 
         count = 0
+        skipped = 0
         for i, r in enumerate(rows):
             mid = r["id"]
+            if mid in already_assigned:
+                skipped += 1
+                continue
             tag_ids = all_mem_tags.get(mid, [])
             if not tag_ids:
                 continue
@@ -476,8 +487,9 @@ class TemporalEpisodeTracker:
             "SELECT COUNT(*) as c FROM temporal_episodes"
         ).fetchone()["c"]
         log.info(
-            "Episode bootstrap complete: %d memories processed, %d episodes created",
-            count, episode_count,
+            "Episode bootstrap complete: %d new memories processed, "
+            "%d skipped (already assigned), %d total episodes",
+            count, skipped, episode_count,
         )
         return episode_count
 

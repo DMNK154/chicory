@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 TABLES = [
     # -- Schema version tracking --
@@ -638,12 +638,12 @@ TABLES = [
 
     """
     CREATE TABLE IF NOT EXISTS episode_transitions (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
         from_episode_id   INTEGER NOT NULL REFERENCES temporal_episodes(id),
         to_episode_id     INTEGER NOT NULL REFERENCES temporal_episodes(id),
         transition_type   TEXT NOT NULL,
         transition_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
-        metadata          TEXT,
-        PRIMARY KEY (from_episode_id, to_episode_id, transition_at)
+        metadata          TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_episode_transitions_from ON episode_transitions(from_episode_id)",
@@ -719,6 +719,8 @@ def apply_schema(db: DatabaseEngine) -> None:
             _migrate_v21_to_v22(db)
         if current_version <= 22:
             _migrate_v22_to_v23(db)
+        if current_version <= 23:
+            _migrate_v23_to_v24(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1122,3 +1124,34 @@ def _migrate_v22_to_v23(db: DatabaseEngine) -> None:
     Tables use IF NOT EXISTS in TABLES, so no explicit migration needed.
     """
     pass
+
+
+def _migrate_v23_to_v24(db: DatabaseEngine) -> None:
+    """Replace composite PK on episode_transitions with autoincrement id."""
+    tables = {
+        r["name"]
+        for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "episode_transitions" not in tables:
+        return
+
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS episode_transitions_new ("
+        "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  from_episode_id INTEGER NOT NULL REFERENCES temporal_episodes(id),"
+        "  to_episode_id   INTEGER NOT NULL REFERENCES temporal_episodes(id),"
+        "  transition_type TEXT NOT NULL,"
+        "  transition_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),"
+        "  metadata        TEXT"
+        ")"
+    )
+    db.execute(
+        "INSERT INTO episode_transitions_new "
+        "(from_episode_id, to_episode_id, transition_type, transition_at, metadata) "
+        "SELECT from_episode_id, to_episode_id, transition_type, transition_at, metadata "
+        "FROM episode_transitions"
+    )
+    db.execute("DROP TABLE episode_transitions")
+    db.execute("ALTER TABLE episode_transitions_new RENAME TO episode_transitions")
