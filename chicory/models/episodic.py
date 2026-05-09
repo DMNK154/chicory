@@ -1,4 +1,4 @@
-"""Episodic relational tensor models — memory-to-memory edge cache."""
+"""Episodic relational tensor models — memory-to-memory edge cache and temporal episodes."""
 
 from __future__ import annotations
 
@@ -6,6 +6,29 @@ from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
+
+
+class TemporalEpisode(BaseModel):
+    """A contiguous period of coherent tag-space activity."""
+
+    id: Optional[int] = None
+    tag_ids: list[int] = []
+    status: str = "active"
+    visit_count: int = 1
+    operation_count: int = 0
+    created_at: Optional[datetime] = None
+    last_active_at: Optional[datetime] = None
+    snapshot_at: Optional[datetime] = None
+
+
+class EpisodeTransition(BaseModel):
+    """An edge in the episode graph."""
+
+    from_episode_id: int
+    to_episode_id: int
+    transition_type: str
+    transition_at: Optional[datetime] = None
+    metadata: Optional[dict] = None
 
 
 class EpisodicEdge(BaseModel):

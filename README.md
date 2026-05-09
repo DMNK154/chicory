@@ -1,6 +1,6 @@
 # Chicory
 
-A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with optional lateral inhibition and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps.
+A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with optional lateral inhibition and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. Temporal tag episodes track drift in tag-space and detect when conversation returns to a previous topic region — episodes form a revisitable graph, not a timeline. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps.
 
 ## Install
 
@@ -267,6 +267,16 @@ Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other f
                                       |
                                       v
                   +-------------------------------------------+
+  Layer 4         |       Temporal Tag Episodes                |
+                  |  drift-detected tag-space clusters          |
+                  |  adaptive threshold (Welford variance)      |
+                  |  revisitable: returns to old topic region   |
+                  |  sync events can force episode boundaries   |
+                  |  episodes form a graph, not a timeline      |
+                  +-------------------------------------------+
+                                      |
+                                      v
+                  +-------------------------------------------+
   Layer 4         |    Forest (co-occurrence + bridge base)    |
                   |  co-occurrence optimizer: compress local    |
                   |  bridge optimizer: preserve traversability  |
@@ -381,9 +391,9 @@ Lattice positions are optionally projected into the Poincaré disk model of hype
 - Geodesic distance (arccosh metric) gives a natural measure of relatedness that respects the hierarchy
 - Einstein midpoint computes weighted hyperbolic centroids for cluster analysis
 
-## Three-Tier Architecture: Tag Tensor → Episodic Tensor → Canopy
+## Four-Tier Architecture: Tag Tensor → Episodic Tensor → Temporal Episodes → Canopy
 
-The system maintains three tiers of relational structure at different granularities:
+The system maintains four tiers of relational structure at different granularities:
 
 **Tag Tensor** (global, abstract) — The four-network tensor described above. Operates on tag pairs — there are relatively few tags (~thousands), so the tensor can track all resonant pairs. Answers: "How do concepts relate globally?"
 
@@ -401,6 +411,15 @@ Each edge carries a composite strength = `semantic + tag_projected + co_retrieva
 - **mature → protected**: exempt from weak-edge pruning and decay
 
 No arbitrary K or per-memory caps. Edge discovery, lifecycle promotion, and pruning are all driven by the same composite signal — the combined mathematical evidence from embeddings, tensor channels, co-retrieval history, and bridge structure. Heavily-connected memories form natural super-hubs. Edges that stop being activated decay and are eventually archived.
+
+**Temporal Tag Episodes** (temporal, revisitable) — Tracks drift in the tag-space centroid over time and segments activity into episodes. Each episode is a contiguous period where stores and retrievals operate in a coherent region of tag space:
+
+- **Drift detection**: On each store or retrieval, compute the mean of the operation's tag centroids (reusing centroid sub-graph embeddings). Compare cosine distance to the current episode's centroid. If distance exceeds an adaptive threshold → snapshot the current episode and start a new one.
+- **Adaptive threshold**: Welford's online variance tracks the running mean and variance of tag-centroid distances within each episode. The drift threshold is `mean + k * sqrt(variance)` (`k` = `episode_drift_sigma`, default 2.0), adapting to the project's natural tag-space movement scale.
+- **Revisitation**: Before creating a new episode, the tracker checks the 50 most recent dormant episodes. If one is closer than the drift threshold, the old episode is revisited (visit count incremented, centroid EMA-blended) rather than duplicated. Episodes form a graph via transitions, not a timeline.
+- **Sync boundaries**: Strong synchronicity events (`effective_strength >= episode_sync_boundary_strength`) force an episode boundary, marking the transition with the sync event ID.
+- **Transitions**: Episode-to-episode edges record transition type: `drift` (gradual divergence), `revisit` (return to old topic), `sync_boundary` (forced by sync detection).
+- **Cross-episode bridges**: Memory-pair edges (from the episodic tensor) that span different episodes are identifiable via the `memory_episode_assignments` junction table. Bridges between revisited episodes are the strongest structural signals.
 
 **Forest + Canopy** (emergent, structural) — Two layers that organize memories into blocks:
 
@@ -431,8 +450,10 @@ t=N+k  Retrievals build co-retrieval edges and tag hit history.
        - semantic channel activates (co-retrieval gate satisfied)
        - co-occurrence and semiotic strengthened by retrieval PMI
        - query relevance filter focuses downstream analysis
+       - temporal episodes begin tracking tag-space drift
        Synchronicity detection fires (rate-limited, 1/min).
        Events placed on lattice. All four channels operational.
+       Strong sync events force episode boundaries.
 ```
 
 Each instance starts with a unique random PCA basis — a random 2D plane through the embedding space — giving the lattice immediate angular diversity. Once 20+ real embeddings exist, SVD replaces the scaffold with a data-driven projection.
@@ -474,7 +495,7 @@ chicory/
     display.py                  Rich terminal formatting
   db/
     engine.py                   SQLite with WAL mode, thread-safe RLock
-    schema.py                   Schema v22, versioned migrations with idempotency
+    schema.py                   Schema v23, versioned migrations with idempotency
   ingest/
     parsers.py                  40+ file types (PDF, docx, code, markdown...)
     chunker.py                  Section/paragraph/sentence splitting
@@ -505,8 +526,9 @@ chicory/
     cross_project_alignment.py  Cross-project signal alignment
     poincare.py                 Poincaré disk projection (exponential map, geodesics, Einstein midpoint)
     square_finder.py            Ramsey square detection in the tensor
-  layer4/                       Episodic tensor, forest, canopy, meta-analysis, feedback
+  layer4/                       Episodic tensor, temporal episodes, forest, canopy, meta-analysis, feedback
     episodic_tensor.py          Sparse memory-to-memory edge cache (~48 neighbors/memory)
+    temporal_episodes.py        Drift-detected, revisitable tag-space episode tracking
     forest.py                   Forest reorganizer (co-occurrence + bridge optimizers)
     cooccurrence_optimizer.py   Local neighborhood compression into blocks
     bridge_optimizer.py         Global traversability preservation between blocks
@@ -558,6 +580,8 @@ User sends message
         -> update tag centroids (EMA)
         -> glyph analysis: scan content for concept words
         -> forest reorganization (co-occurrence + bridge)
+        -> episodic tensor: create candidate edges
+        -> temporal episode: drift/revisit check, assign memory
         -> canopy observation (if block touched)
         -> invalidate PCA cache
 
@@ -576,6 +600,7 @@ User sends message
            -> rank, invert, scale by parallelness
            -> add/subtract to tensor + resonance strengths
         -> activate episodic edges for co-retrieved memory pairs
+        -> temporal episode: drift/revisit check, assign retrieved memories
         -> forest reorganization + canopy observation
         -> [background thread]:
            -> update salience on access
@@ -594,6 +619,8 @@ User sends message
                     -> INSERT resonances
                     -> UPSERT tensor synchronicity_strength
                     -> lateral inhibition pass
+              -> force_sync_boundary (if effective_strength >= threshold)
+                 -> snapshot current episode, start new or revisit old
 ```
 
 ## Configuration
@@ -625,6 +652,10 @@ Key parameters in `ChicoryConfig` (70+ total, all overridable via environment va
 | `canopy_enabled` | `true` | Enable forest/canopy/episodic tensor |
 | `episodic_tag_affinity_threshold` | `0.15` | Composite strength for candidate→warm promotion |
 | `canopy_ramsey_min_shared_primes` | `7` | Glyph prime overlap for canopy shape generation |
+| `episode_enabled` | `true` | Enable temporal tag episode tracking |
+| `episode_drift_sigma` | `2.0` | Welford k: threshold = mean + k*sqrt(variance) |
+| `episode_sync_boundary_strength` | `0.7` | Min effective strength for sync-forced boundary |
+| `episode_revisit_max_candidates` | `50` | Max dormant episodes checked for revisitation |
 | `commons_enabled` | `false` | Enable cross-project signal federation |
 
 ## Tests
@@ -649,7 +680,7 @@ pytest tests/test_glyph_analyzer.py -v              # Glyph analysis tests
 
 ## Database
 
-SQLite with WAL mode. Schema v22, versioned migrations with idempotency checks. Thread-safe via `threading.RLock` on all execute/executemany calls.
+SQLite with WAL mode. Schema v23, versioned migrations with idempotency checks. Thread-safe via `threading.RLock` on all execute/executemany calls.
 
 ```bash
 chicory status          # Show memory count, tag count, tensor state

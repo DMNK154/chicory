@@ -2072,33 +2072,14 @@ class SynchronicityEngine:
 
         par_values = np.cos(np.array(deltas, dtype=np.float64))
 
-        self._db.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _par_batch "
-            "(tag_a_id INTEGER, tag_b_id INTEGER, par REAL)"
-        )
-        self._db.execute("DELETE FROM _par_batch")
+        now = "strftime('%Y-%m-%dT%H:%M:%f', 'now')"
         self._db.executemany(
-            "INSERT INTO _par_batch VALUES (?, ?, ?)",
-            [(int(a_ids[i]), int(b_ids[i]), float(par_values[i]))
+            f"UPDATE tag_relational_tensor "
+            f"SET parallelness = ?, updated_at = {now} "
+            f"WHERE tag_a_id = ? AND tag_b_id = ?",
+            [(float(par_values[i]), int(a_ids[i]), int(b_ids[i]))
              for i in range(len(a_ids))],
         )
-        self._db.execute(
-            """
-            UPDATE tag_relational_tensor
-            SET parallelness = (
-                    SELECT par FROM _par_batch p
-                    WHERE p.tag_a_id = tag_relational_tensor.tag_a_id
-                      AND p.tag_b_id = tag_relational_tensor.tag_b_id
-                ),
-                updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
-            WHERE EXISTS (
-                SELECT 1 FROM _par_batch p
-                WHERE p.tag_a_id = tag_relational_tensor.tag_a_id
-                  AND p.tag_b_id = tag_relational_tensor.tag_b_id
-            )
-            """
-        )
-        self._db.execute("DROP TABLE IF EXISTS _par_batch")
         self._db.connection.commit()
         return len(a_ids)
 

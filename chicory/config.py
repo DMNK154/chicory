@@ -173,6 +173,16 @@ class ChicoryConfig(BaseModel):
     # Ramsey adjacency filter (glyph lattice)
     canopy_ramsey_min_shared_primes: int = Field(default=7)
 
+    # Temporal tag episodes — drift-detected, revisitable tag-space clusters
+    episode_enabled: bool = Field(default=True)
+    episode_ema_alpha: float = Field(default=0.2)
+    episode_drift_sigma: float = Field(default=2.0)
+    episode_revisit_max_candidates: int = Field(default=50)
+    episode_sync_boundary_strength: float = Field(default=0.7)
+    episode_min_samples_for_adaptive: int = Field(default=10)
+    episode_dormant_after_hours: float = Field(default=168.0)
+    episode_archive_after_hours: float = Field(default=4320.0)
+
     # Episodic relational tensor — memory-to-memory edge cache
     episodic_tag_affinity_threshold: float = Field(default=0.15)
     episodic_temporal_halflife_hours: float = Field(default=720.0)

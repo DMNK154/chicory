@@ -80,11 +80,8 @@ class EpisodicTensor:
         candidates.update(block_pairs)
         log.info("  %d pairs from forest blocks", len(block_pairs))
 
-        # Gateway 4: High tag-projected affinity
-        log.info("Gateway 4: tag-projected affinity...")
-        tag_pairs = self._gateway_tag_affinity(mem_ids)
-        candidates.update(tag_pairs)
-        log.info("  %d pairs from tag affinity", len(tag_pairs))
+        # Tag tensor data contributes to edge scores via tag_projected_strength
+        # in _compute_eager_fields — no separate candidate gateway needed.
 
         log.info("Total unique candidate pairs: %d", len(candidates))
 
@@ -186,38 +183,6 @@ class EpisodicTensor:
         ).fetchall()
         return {(r["a"], r["b"]) for r in rows}
 
-    def _gateway_tag_affinity(
-        self, mem_ids: list[str],
-    ) -> set[tuple[str, str]]:
-        threshold = self._cfg.episodic_tag_affinity_threshold
-        mem_tags = self._load_all_memory_tags()
-
-        tag_to_mems: dict[int, list[str]] = {}
-        for mid, tags in mem_tags.items():
-            for tid in tags:
-                tag_to_mems.setdefault(tid, []).append(mid)
-
-        pairs: set[tuple[str, str]] = set()
-
-        tag_tensor_rows = self._db.execute(
-            """SELECT tag_a_id, tag_b_id
-               FROM tag_relational_tensor
-               WHERE cooccurrence_strength + synchronicity_strength +
-                     semantic_strength + glyph_strength > ?""",
-            (threshold,),
-        ).fetchall()
-
-        for row in tag_tensor_rows:
-            ta, tb = row["tag_a_id"], row["tag_b_id"]
-            mems_a = tag_to_mems.get(ta, [])
-            mems_b = tag_to_mems.get(tb, [])
-            for ma in mems_a:
-                for mb in mems_b:
-                    if ma == mb:
-                        continue
-                    pairs.add((min(ma, mb), max(ma, mb)))
-
-        return pairs
 
     # ------------------------------------------------------------------
     # Eager field computation

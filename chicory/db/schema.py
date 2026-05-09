@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 TABLES = [
     # -- Schema version tracking --
@@ -615,6 +615,52 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_mrt_status ON memory_relational_tensor(edge_status)",
     "CREATE INDEX IF NOT EXISTS idx_mrt_tag_projected ON memory_relational_tensor(tag_projected_strength DESC)",
     "CREATE INDEX IF NOT EXISTS idx_mrt_bridge ON memory_relational_tensor(bridge_strength DESC)",
+
+    # -- Temporal tag episodes --
+    """
+    CREATE TABLE IF NOT EXISTS temporal_episodes (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        centroid          BLOB NOT NULL,
+        tag_ids           TEXT NOT NULL DEFAULT '[]',
+        status            TEXT NOT NULL DEFAULT 'active',
+        visit_count       INTEGER NOT NULL DEFAULT 1,
+        operation_count   INTEGER NOT NULL DEFAULT 0,
+        created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_active_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        snapshot_at       TEXT,
+        mean_distance     REAL NOT NULL DEFAULT 0.3,
+        variance_sum      REAL NOT NULL DEFAULT 0.0,
+        distance_samples  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_temporal_episodes_status ON temporal_episodes(status)",
+    "CREATE INDEX IF NOT EXISTS idx_temporal_episodes_last_active ON temporal_episodes(last_active_at DESC)",
+
+    """
+    CREATE TABLE IF NOT EXISTS episode_transitions (
+        from_episode_id   INTEGER NOT NULL REFERENCES temporal_episodes(id),
+        to_episode_id     INTEGER NOT NULL REFERENCES temporal_episodes(id),
+        transition_type   TEXT NOT NULL,
+        transition_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        metadata          TEXT,
+        PRIMARY KEY (from_episode_id, to_episode_id, transition_at)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_episode_transitions_from ON episode_transitions(from_episode_id)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_transitions_to ON episode_transitions(to_episode_id)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_transitions_type ON episode_transitions(transition_type)",
+
+    """
+    CREATE TABLE IF NOT EXISTS memory_episode_assignments (
+        memory_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        episode_id      INTEGER NOT NULL REFERENCES temporal_episodes(id),
+        assigned_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        assignment_type TEXT NOT NULL DEFAULT 'store',
+        PRIMARY KEY (memory_id, episode_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_mem_episode_memory ON memory_episode_assignments(memory_id)",
+    "CREATE INDEX IF NOT EXISTS idx_mem_episode_episode ON memory_episode_assignments(episode_id)",
 ]
 
 
@@ -671,6 +717,8 @@ def apply_schema(db: DatabaseEngine) -> None:
             _migrate_v20_to_v21(db)
         if current_version <= 21:
             _migrate_v21_to_v22(db)
+        if current_version <= 22:
+            _migrate_v22_to_v23(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -684,7 +732,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Two-tier document ingestion (critical/reference)"),
+                (SCHEMA_VERSION, "Temporal tag episodes"),
             )
 
 
@@ -1066,3 +1114,11 @@ def _migrate_v21_to_v22(db: DatabaseEngine) -> None:
         db.execute(
             "ALTER TABLE memories ADD COLUMN ingestion_tier TEXT NOT NULL DEFAULT 'critical'"
         )
+
+
+def _migrate_v22_to_v23(db: DatabaseEngine) -> None:
+    """Add temporal tag episode tables.
+
+    Tables use IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass

@@ -24,6 +24,7 @@ from chicory.layer3.synchronicity_engine import SynchronicityEngine
 from chicory.layer4.adaptive_thresholds import AdaptiveThresholds
 from chicory.layer4.canopy import CanopyObserver
 from chicory.layer4.episodic_tensor import EpisodicTensor
+from chicory.layer4.temporal_episodes import TemporalEpisodeTracker
 from chicory.layer4.feedback import FeedbackEngine
 from chicory.layer4.meta_analyzer import MetaAnalyzer
 from chicory.layer4.forest import ForestReorganizer
@@ -118,6 +119,10 @@ class Orchestrator:
         self._forest = ForestReorganizer(self._db, config)
         self._canopy = CanopyObserver(self._db, config, self._forest)
         self._episodic_tensor = EpisodicTensor(self._db, config)
+        self._temporal_episodes = TemporalEpisodeTracker(
+            self._db, config, self._centroid_subgraph,
+        )
+        self._maybe_seed_temporal_episodes()
 
         # Rate limiting for detection — initialise to "now" so the first
         # retrieval isn't blocked by expensive sync/meta detection.
@@ -312,6 +317,21 @@ class Orchestrator:
         ).fetchone()["cnt"]
         if retrieval_count > 0:
             self._centroid_subgraph.rebuild_edges_from_history()
+
+    def _maybe_seed_temporal_episodes(self) -> None:
+        """Bootstrap temporal episodes on first boot after upgrade."""
+        if not self._config.episode_enabled:
+            return
+        episode_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM temporal_episodes"
+        ).fetchone()["cnt"]
+        if episode_count > 0:
+            return
+        memory_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM memories WHERE is_archived = 0"
+        ).fetchone()["cnt"]
+        if memory_count > 0:
+            self._temporal_episodes.bootstrap()
 
     def _init_signal_processor(self):
         """Initialize the commons SignalProcessor with optional glyph integration."""
@@ -515,6 +535,18 @@ class Orchestrator:
             self._feedback.apply_pattern_actions(pattern)
         stats["meta_patterns"] = len(patterns)
         stats["meta_analysis_seconds"] = round(time.time() - t0, 1)
+
+        # 14. Episode lifecycle
+        _report("episode_lifecycle", "Running episode lifecycle pass")
+        t0 = time.time()
+        if self._config.episode_enabled:
+            ep_stats = self._temporal_episodes.lifecycle_pass()
+            stats["episodes_dormant"] = ep_stats.get("dormant", 0)
+            stats["episodes_archived"] = ep_stats.get("archived", 0)
+        else:
+            stats["episodes_dormant"] = 0
+            stats["episodes_archived"] = 0
+        stats["episode_lifecycle_seconds"] = round(time.time() - t0, 1)
 
         stats["total_seconds"] = round(time.time() - t_total, 1)
 
@@ -1719,20 +1751,23 @@ class Orchestrator:
             ).start()
 
         # Forest reorganization + canopy observation on store
-        if self._config.canopy_enabled:
-            tag_ids = []
-            for tag_name in memory.tags:
-                tag = self._tag_manager.get_by_name(tag_name)
-                if tag:
-                    tag_ids.append(tag.id)
-            if tag_ids:
-                self._forest.update_on_store(memory.id, tag_ids)
-                self._episodic_tensor.update_on_store(memory.id)
-                self._canopy.observe_single_memory(
-                    source="store",
-                    source_id=memory.id,
-                    memory_id=memory.id,
-                )
+        store_tag_ids: list[int] = []
+        for tag_name in memory.tags:
+            tag = self._tag_manager.get_by_name(tag_name)
+            if tag:
+                store_tag_ids.append(tag.id)
+
+        if self._config.canopy_enabled and store_tag_ids:
+            self._forest.update_on_store(memory.id, store_tag_ids)
+            self._episodic_tensor.update_on_store(memory.id)
+            self._canopy.observe_single_memory(
+                source="store",
+                source_id=memory.id,
+                memory_id=memory.id,
+            )
+
+        if self._config.episode_enabled and store_tag_ids:
+            self._temporal_episodes.update_on_store(memory.id, store_tag_ids)
 
     def _on_retrieval_completed(
         self,
@@ -1868,6 +1903,15 @@ class Orchestrator:
                     memory_ids=memory_ids,
                 )
 
+        if self._config.episode_enabled:
+            all_ep_tags = list(set(
+                tid for tids in tag_ids_map.values() for tid in tids
+            ))
+            if all_ep_tags:
+                self._temporal_episodes.update_on_retrieval(
+                    memory_ids, all_ep_tags,
+                )
+
     def _filter_relevant_tags(
         self,
         tag_ids_map: dict[str, list[int]],
@@ -1975,6 +2019,19 @@ class Orchestrator:
                             source_id=str(event.id),
                             memory_ids=involved_mids,
                         )
+
+        # Force episode boundary on strong sync events
+        if new_events and self._config.episode_enabled:
+            for event in new_events:
+                eff = self._sync_detector.effective_strength(event)
+                try:
+                    ep_tag_ids = [int(t) for t in json.loads(event.involved_tags)]
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    ep_tag_ids = []
+                if ep_tag_ids:
+                    self._temporal_episodes.force_sync_boundary(
+                        event.id, ep_tag_ids, eff,
+                    )
 
         # Also maybe run meta-analysis
         self._maybe_run_meta_analysis()
