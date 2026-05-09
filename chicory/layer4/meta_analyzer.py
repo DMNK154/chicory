@@ -53,15 +53,18 @@ class MetaAnalyzer:
 
         return patterns
 
+    _META_EVENT_CAP = 500
+
     def _get_analysis_events(self) -> list[SynchronicityEvent]:
         """Get deduplicated sync events for meta-pattern analysis.
 
         Combines time-windowed recent events with lattice-resonant events
-        (wider window) using SQL UNION for server-side dedup.  A hard row
-        cap prevents OOM on databases with millions of sync events.
+        (wider window) using SQL UNION for server-side dedup.  Capped at
+        _META_EVENT_CAP strongest events to bound downstream work.
         """
         window = self._config.meta_analysis_interval_hours * 7
         cutoff = (datetime.utcnow() - timedelta(hours=window)).isoformat()
+        cap = self._META_EVENT_CAP
 
         use_lattice = (
             self._sync_engine is not None
@@ -87,8 +90,9 @@ class MetaAnalyzer:
                       )
                 )
                 ORDER BY strength DESC, detected_at DESC
+                LIMIT ?
                 """,
-                (cutoff, lattice_cutoff),
+                (cutoff, lattice_cutoff, cap),
             ).fetchall()
         else:
             rows = self._db.execute(
@@ -96,8 +100,9 @@ class MetaAnalyzer:
                 SELECT * FROM synchronicity_events
                 WHERE detected_at > ?
                 ORDER BY strength DESC, detected_at DESC
+                LIMIT ?
                 """,
-                (cutoff,),
+                (cutoff, cap),
             ).fetchall()
 
         return [self._row_to_event(r) for r in rows]
@@ -162,6 +167,8 @@ class MetaAnalyzer:
                 uf_rank[a] += 1
 
         for indices in tag_to_events.values():
+            if len(indices) > 50:
+                indices = indices[:50]
             for a in range(len(indices)):
                 i = indices[a]
                 for b in range(a + 1, len(indices)):
@@ -231,35 +238,34 @@ class MetaAnalyzer:
         )
 
     def _get_tag_clusters(self, tag_ids: set[int]) -> list[set[int]]:
-        """Group tags into clusters based on co-occurrence.
+        """Group tags into clusters based on co-retrieval edges.
 
-        Single GROUP BY query replaces O(k²) per-pair queries.
+        Uses the pre-computed centroid_edges table (maintained by
+        CentroidSubgraph) instead of a quadratic self-join on memory_tags.
         """
         if not tag_ids:
             return []
 
         tag_list = list(tag_ids)
         adjacency: dict[int, set[int]] = {t: set() for t in tag_list}
+        tag_set = tag_ids
 
-        # Single query: all co-occurring pairs among the given tags with count > 2
         placeholders = ",".join("?" * len(tag_list))
         rows = self._db.execute(
             f"""
-            SELECT a.tag_id AS tag_a, b.tag_id AS tag_b, COUNT(*) AS cnt
-            FROM memory_tags a
-            JOIN memory_tags b ON a.memory_id = b.memory_id
-            WHERE a.tag_id IN ({placeholders})
-              AND b.tag_id IN ({placeholders})
-              AND a.tag_id < b.tag_id
-            GROUP BY a.tag_id, b.tag_id
-            HAVING cnt > 2
+            SELECT tag_a_id, tag_b_id FROM centroid_edges
+            WHERE tag_a_id IN ({placeholders})
+              AND tag_b_id IN ({placeholders})
+              AND strength > 0.05
             """,
             (*tag_list, *tag_list),
         ).fetchall()
 
         for r in rows:
-            adjacency[r["tag_a"]].add(r["tag_b"])
-            adjacency[r["tag_b"]].add(r["tag_a"])
+            a, b = r["tag_a_id"], r["tag_b_id"]
+            if a in tag_set and b in tag_set:
+                adjacency[a].add(b)
+                adjacency[b].add(a)
 
         # Connected components
         visited: set[int] = set()
@@ -297,13 +303,14 @@ class MetaAnalyzer:
         for e in cluster:
             all_tags.update(json.loads(e.involved_tags))
 
-        tag_names = []
-        for tid in list(all_tags)[:5]:
-            row = self._db.execute(
-                "SELECT name FROM tags WHERE id = ?", (tid,)
-            ).fetchone()
-            if row:
-                tag_names.append(row["name"])
+        sample_ids = list(all_tags)[:5]
+        ph = ",".join("?" * len(sample_ids))
+        tag_names = [
+            r["name"]
+            for r in self._db.execute(
+                f"SELECT name FROM tags WHERE id IN ({ph})", sample_ids
+            ).fetchall()
+        ]
 
         tags_str = ", ".join(tag_names)
         types_str = ", ".join(event_types)
