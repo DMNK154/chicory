@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 26
 
 TABLES = [
     # -- Schema version tracking --
@@ -179,6 +179,16 @@ TABLES = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_sync_event_memories_mid ON sync_event_memories(memory_id)",
+
+    # -- Layer 3: Synchronicity event ↔ tag junction --
+    """
+    CREATE TABLE IF NOT EXISTS sync_event_tags (
+        event_id   INTEGER NOT NULL REFERENCES synchronicity_events(id) ON DELETE CASCADE,
+        tag_id     INTEGER NOT NULL REFERENCES tags(id),
+        PRIMARY KEY (event_id, tag_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_sync_event_tags_tid ON sync_event_tags(tag_id)",
 
     # -- Layer 3.5: Prime Ramsey Lattice --
     """
@@ -675,52 +685,57 @@ def apply_schema(db: DatabaseEngine) -> None:
         ).fetchone()
         current_version = current["v"] if current and current["v"] else 0
 
-        if current_version == 1:
-            _migrate_v1_to_v2(db)
-        if current_version <= 2:
-            _migrate_v2_to_v3(db)
-        if current_version <= 3:
-            _migrate_v3_to_v4(db)
-        if current_version <= 4:
-            _migrate_v4_to_v5(db)
-        if current_version <= 5:
-            _migrate_v5_to_v6(db)
-        if current_version <= 6:
-            _migrate_v6_to_v7(db)
-        if current_version <= 7:
-            _migrate_v7_to_v8(db)
-        if current_version <= 8:
-            _migrate_v8_to_v9(db)
-        if current_version <= 9:
-            _migrate_v9_to_v10(db)
-        if current_version <= 10:
-            _migrate_v10_to_v11(db)
-        if current_version <= 11:
-            _migrate_v11_to_v12(db)
-        if current_version <= 12:
-            _migrate_v12_to_v13(db)
-        if current_version <= 13:
-            _migrate_v13_to_v14(db)
-        if current_version <= 14:
-            _migrate_v14_to_v15(db)
-        if current_version <= 15:
-            _migrate_v15_to_v16(db)
-        if current_version <= 16:
-            _migrate_v16_to_v17(db)
-        if current_version <= 17:
-            _migrate_v17_to_v18(db)
-        if current_version <= 18:
-            _migrate_v18_to_v19(db)
-        if current_version <= 19:
-            _migrate_v19_to_v20(db)
-        if current_version <= 20:
-            _migrate_v20_to_v21(db)
-        if current_version <= 21:
-            _migrate_v21_to_v22(db)
-        if current_version <= 22:
-            _migrate_v22_to_v23(db)
-        if current_version <= 23:
-            _migrate_v23_to_v24(db)
+        if current_version > 0:
+            if current_version == 1:
+                _migrate_v1_to_v2(db)
+            if current_version <= 2:
+                _migrate_v2_to_v3(db)
+            if current_version <= 3:
+                _migrate_v3_to_v4(db)
+            if current_version <= 4:
+                _migrate_v4_to_v5(db)
+            if current_version <= 5:
+                _migrate_v5_to_v6(db)
+            if current_version <= 6:
+                _migrate_v6_to_v7(db)
+            if current_version <= 7:
+                _migrate_v7_to_v8(db)
+            if current_version <= 8:
+                _migrate_v8_to_v9(db)
+            if current_version <= 9:
+                _migrate_v9_to_v10(db)
+            if current_version <= 10:
+                _migrate_v10_to_v11(db)
+            if current_version <= 11:
+                _migrate_v11_to_v12(db)
+            if current_version <= 12:
+                _migrate_v12_to_v13(db)
+            if current_version <= 13:
+                _migrate_v13_to_v14(db)
+            if current_version <= 14:
+                _migrate_v14_to_v15(db)
+            if current_version <= 15:
+                _migrate_v15_to_v16(db)
+            if current_version <= 16:
+                _migrate_v16_to_v17(db)
+            if current_version <= 17:
+                _migrate_v17_to_v18(db)
+            if current_version <= 18:
+                _migrate_v18_to_v19(db)
+            if current_version <= 19:
+                _migrate_v19_to_v20(db)
+            if current_version <= 20:
+                _migrate_v20_to_v21(db)
+            if current_version <= 21:
+                _migrate_v21_to_v22(db)
+            if current_version <= 22:
+                _migrate_v22_to_v23(db)
+            if current_version <= 23:
+                _migrate_v23_to_v24(db)
+            if current_version <= 24:
+                _migrate_v24_to_v25(db)
+            if current_version <= 25:
+                _migrate_v25_to_v26(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1155,3 +1170,88 @@ def _migrate_v23_to_v24(db: DatabaseEngine) -> None:
     )
     db.execute("DROP TABLE episode_transitions")
     db.execute("ALTER TABLE episode_transitions_new RENAME TO episode_transitions")
+
+
+def _migrate_v24_to_v25(db: DatabaseEngine) -> None:
+    """Add sync_event_tags junction table and backfill from involved_tags JSON."""
+    import json as _json
+
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS sync_event_tags ("
+        "  event_id INTEGER NOT NULL REFERENCES synchronicity_events(id) ON DELETE CASCADE,"
+        "  tag_id   INTEGER NOT NULL REFERENCES tags(id),"
+        "  PRIMARY KEY (event_id, tag_id)"
+        ")"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sync_event_tags_tid ON sync_event_tags(tag_id)"
+    )
+
+    rows = db.execute(
+        "SELECT id, involved_tags FROM synchronicity_events"
+    ).fetchall()
+    inserts = []
+    for r in rows:
+        try:
+            tag_ids = _json.loads(r["involved_tags"])
+        except (TypeError, _json.JSONDecodeError):
+            continue
+        for tid in tag_ids:
+            inserts.append((r["id"], int(tid)))
+
+    if inserts:
+        for i in range(0, len(inserts), 500):
+            chunk = inserts[i:i + 500]
+            db.executemany(
+                "INSERT OR IGNORE INTO sync_event_tags (event_id, tag_id) VALUES (?, ?)",
+                chunk,
+            )
+
+
+def _migrate_v25_to_v26(db: DatabaseEngine) -> None:
+    """Normalize resonance_strength to [0, 1] via min-max scaling.
+
+    Uses batched updates by rowid range to avoid WAL journal overflow
+    on large databases.
+    """
+    row = db.execute(
+        "SELECT MIN(resonance_strength) AS mn, MAX(resonance_strength) AS mx "
+        "FROM resonances"
+    ).fetchone()
+    if not row or row["mn"] is None:
+        return
+    mn, mx = row["mn"], row["mx"]
+
+    BATCH = 50_000
+
+    if mx - mn < 1e-9:
+        bounds = db.execute(
+            "SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM resonances"
+        ).fetchone()
+        if not bounds or bounds["lo"] is None:
+            return
+        lo, hi = bounds["lo"], bounds["hi"]
+        while lo <= hi:
+            db.execute(
+                "UPDATE resonances SET resonance_strength = 0.5 "
+                "WHERE rowid BETWEEN ? AND ?",
+                (lo, lo + BATCH - 1),
+            )
+            db.connection.commit()
+            lo += BATCH
+    else:
+        bounds = db.execute(
+            "SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM resonances"
+        ).fetchone()
+        if not bounds or bounds["lo"] is None:
+            return
+        lo, hi = bounds["lo"], bounds["hi"]
+        while lo <= hi:
+            db.execute(
+                "UPDATE resonances SET resonance_strength = "
+                "(resonance_strength - ?) / ? "
+                "WHERE rowid BETWEEN ? AND ?",
+                (mn, mx - mn, lo, lo + BATCH - 1),
+            )
+            db.connection.commit()
+            lo += BATCH

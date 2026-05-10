@@ -377,6 +377,16 @@ class SynchronicityDetector:
                     [(event_id, str(mid)) for mid in mids],
                 )
 
+            try:
+                tag_ids = [int(t) for t in json.loads(event.involved_tags)]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                tag_ids = []
+            if tag_ids:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO sync_event_tags (event_id, tag_id) VALUES (?, ?)",
+                    [(event_id, tid) for tid in tag_ids],
+                )
+
         return event_id
 
     def get_recent(self, limit: int = 20, unacknowledged_only: bool = False) -> list[SynchronicityEvent]:

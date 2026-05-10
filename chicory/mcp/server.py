@@ -295,6 +295,16 @@ def deep_retrieve(
 
 
 @mcp_server.tool()
+def get_last_trace(ctx: Context) -> str:
+    """Get the activation trace from the most recent retrieval.
+
+    Shows which tags activated and with what strength, per-memory score
+    breakdowns (semantic, tag, lattice, glyph), and timing data.
+    """
+    return _call(ctx, "get_last_trace", {})
+
+
+@mcp_server.tool()
 def ingest_codebase(
     ctx: Context,
     path: str,

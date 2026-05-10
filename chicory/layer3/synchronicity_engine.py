@@ -1423,32 +1423,66 @@ class SynchronicityEngine:
     def get_resonant_memory_ids_fast(
         self,
         tag_ids: list[int],
+        candidate_memory_ids: list[str] | None = None,
+        candidate_tag_ids_map: dict[str, list[int]] | None = None,
+        seed_memory_ids: list[str] | None = None,
     ) -> list[tuple[str, float]]:
-        """Tensor-based lookup for resonant memories.
+        """Tensor-based resonance scoring for candidate memories.
 
-        Given query-context tag_ids, look up the tag relational tensor and
-        combine the five network strengths plus the meta-resonance interaction
-        term using configurable weights.
+        Two pathways, scores additive when a memory appears in both:
 
-        The semiotic layer is direction-aware: when a query tag is tag_a_id,
-        we use semiotic_forward (P(B|A)); when it's tag_b_id, we use
-        semiotic_reverse (P(A|B)).
-
-        The meta-resonance term (R_sync * R_glyph) fires only when a tag
-        pair resonates on both the event lattice and the glyph lattice.
-
-        Phase 1: compute a combined strength per *partner tag* (tags not in
-        the query set that are connected via the tensor).  This avoids
-        parsing the memory_ids JSON column entirely.
-
-        Phase 2: resolve partner tags to memories via the indexed
-        memory_tags table.
+        1. Centroid path: compute partner tag scores from the tensor,
+           then score candidate memories by which partner tags they carry.
+           No full memory_tags scan — works on the pre-filtered candidate set.
+        2. Episodic path: direct memory-to-memory edges from the episodic
+           tensor, seeded by the FAISS results.
         """
         if not tag_ids:
             return []
 
+        memory_scores: dict[str, float] = {}
+
+        # ── Centroid path: tensor → partner tag scores → score candidates ──
+        partner_tag_scores = self._centroid_path(tag_ids)
+        self._last_partner_tag_scores = dict(partner_tag_scores)
+        if partner_tag_scores and candidate_memory_ids and candidate_tag_ids_map:
+            max_partner = max(partner_tag_scores.values())
+            if max_partner > 0:
+                for mid in candidate_memory_ids:
+                    mem_tags = candidate_tag_ids_map.get(mid, [])
+                    best = 0.0
+                    for tid in mem_tags:
+                        s = partner_tag_scores.get(tid, 0.0)
+                        if s > best:
+                            best = s
+                    if best > 0:
+                        memory_scores[mid] = best / max_partner
+
+        # ── Episodic path: seed memories → episodic tensor neighbors ──
+        if seed_memory_ids:
+            episodic_scores = self._episodic_path(seed_memory_ids)
+            for mid, score in episodic_scores.items():
+                memory_scores[mid] = memory_scores.get(mid, 0.0) + score
+
+        if not memory_scores:
+            return []
+
+        max_score = max(memory_scores.values())
+        if max_score > 0:
+            memory_scores = {mid: s / max_score for mid, s in memory_scores.items()}
+
+        return sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)
+
+    def _centroid_path(self, tag_ids: list[int]) -> dict[str, float]:
+        """Tensor partners gated by co-retrieval edges, resolved to memories."""
+        import time as _time
+        _cp = {}
+        _cp0 = _time.perf_counter()
+
         query_tag_set = set(tag_ids)
         placeholders = ",".join("?" * len(tag_ids))
+
+        _s = _time.perf_counter()
         rows = self._db.execute(
             f"""
             SELECT tag_a_id, tag_b_id,
@@ -1456,20 +1490,23 @@ class SynchronicityEngine:
                    semantic_strength, semiotic_forward, semiotic_reverse,
                    glyph_strength, inhibition_strength, parallelness
             FROM tag_relational_tensor
-            WHERE (tag_a_id IN ({placeholders}) OR tag_b_id IN ({placeholders}))
-              AND (cooccurrence_strength > 0
-                   OR synchronicity_strength > 0
-                   OR semantic_strength > 0
-                   OR semiotic_forward > 0
-                   OR semiotic_reverse > 0
-                   OR glyph_strength > 0
-                   OR inhibition_strength > 0)
+            WHERE tag_a_id IN ({placeholders})
+            UNION ALL
+            SELECT tag_a_id, tag_b_id,
+                   cooccurrence_strength, synchronicity_strength,
+                   semantic_strength, semiotic_forward, semiotic_reverse,
+                   glyph_strength, inhibition_strength, parallelness
+            FROM tag_relational_tensor
+            WHERE tag_b_id IN ({placeholders})
+              AND tag_a_id NOT IN ({placeholders})
             """,
-            (*tag_ids, *tag_ids),
+            (*tag_ids, *tag_ids, *tag_ids),
         ).fetchall()
+        _cp["tensor_query"] = _time.perf_counter() - _s
+        _cp["tensor_rows"] = len(rows)
 
         if not rows:
-            return []
+            return {}
 
         w_co = self._config.tensor_cooccurrence_weight
         w_sync = self._config.tensor_synchronicity_weight
@@ -1479,15 +1516,12 @@ class SynchronicityEngine:
         w_meta = self._config.tensor_meta_resonance_weight
         w_inhib = self._config.tensor_inhibition_weight
 
-        # Phase 1: aggregate combined strength per partner tag
         partner_scores: dict[int, float] = {}
         for row in rows:
             a_in_query = row["tag_a_id"] in query_tag_set
             b_in_query = row["tag_b_id"] in query_tag_set
 
-            # Direction-aware semiotic contribution
             if a_in_query and b_in_query:
-                # Both tags already in query — no new partner to surface
                 continue
             elif a_in_query:
                 semiotic = row["semiotic_forward"]
@@ -1507,44 +1541,88 @@ class SynchronicityEngine:
                 + w_glyph * glyph_val
             )
 
-            # Meta-resonance: cross-lattice interaction term
             if sync_val > 0 and glyph_val > 0:
                 excitatory += w_meta * sync_val * glyph_val
 
-            # Lateral inhibition: suppresses antiparallel partners
             inhib = row["inhibition_strength"]
             par = row["parallelness"]
             suppression = w_inhib * inhib * max(0.0, -par) if inhib > 0 and par < 0 else 0.0
 
             combined = excitatory - suppression
-
-            if combined > 0:
+            if combined >= self._config.resonance_min_tensor_score:
                 partner_scores[partner] = max(
                     partner_scores.get(partner, 0.0), combined,
                 )
 
+        _cp["n_partners_pre_gate"] = len(partner_scores)
         if not partner_scores:
-            return []
+            return {}
 
-        max_combined = max(partner_scores.values())
-        if max_combined <= 0:
-            return []
+        _s = _time.perf_counter()
+        associated = self._get_coretrieval_partners(tag_ids, set(partner_scores.keys()))
+        _cp["coretrieval_gate"] = _time.perf_counter() - _s
+        _cp["n_associated"] = len(associated) if associated else 0
+        if associated:
+            partner_scores = {p: s for p, s in partner_scores.items() if p in associated}
 
-        # Phase 2: resolve partner tags → memories via memory_tags index
-        partner_ids = list(partner_scores.keys())
-        p2 = ",".join("?" * len(partner_ids))
-        mem_rows = self._db.execute(
-            f"SELECT memory_id, tag_id FROM memory_tags WHERE tag_id IN ({p2})",
-            tuple(partner_ids),
+        _cp["n_partners_post_gate"] = len(partner_scores)
+        _cp["total"] = _time.perf_counter() - _cp0
+
+        import logging
+        logging.getLogger("chicory.centroid_path").info("centroid_path_timing: %s", _cp)
+
+        return partner_scores
+
+    def _episodic_path(self, seed_memory_ids: list[str]) -> dict[str, float]:
+        """Get episodic tensor neighbors of seed memories."""
+        ph = ",".join("?" * len(seed_memory_ids))
+        rows = self._db.execute(
+            f"""
+            SELECT memory_b_id AS neighbor,
+                   semantic_strength + tag_projected_strength
+                   + co_retrieval_strength + bridge_strength AS score
+            FROM memory_relational_tensor
+            WHERE memory_a_id IN ({ph}) AND edge_status != 'archived'
+            UNION ALL
+            SELECT memory_a_id AS neighbor,
+                   semantic_strength + tag_projected_strength
+                   + co_retrieval_strength + bridge_strength AS score
+            FROM memory_relational_tensor
+            WHERE memory_b_id IN ({ph}) AND edge_status != 'archived'
+            """,
+            (*seed_memory_ids, *seed_memory_ids),
         ).fetchall()
 
-        memory_scores: dict[str, float] = {}
-        for r in mem_rows:
-            normalized = partner_scores[r["tag_id"]] / max_combined
-            mid = r["memory_id"]
-            memory_scores[mid] = max(memory_scores.get(mid, 0.0), normalized)
+        seed_set = set(seed_memory_ids)
+        scores: dict[str, float] = {}
+        for r in rows:
+            mid = r["neighbor"]
+            if mid in seed_set:
+                continue
+            scores[mid] = max(scores.get(mid, 0.0), r["score"])
 
-        return sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)
+        return scores
+
+    def _get_coretrieval_partners(
+        self, context_ids: list[int], candidate_ids: set[int],
+    ) -> set[int]:
+        """Return candidates that have co-retrieval edges to any context tag."""
+        if not candidate_ids:
+            return set()
+        min_edge = self._config.resonance_min_edge_strength
+        ph = ",".join("?" * len(context_ids))
+        rows = self._db.execute(
+            f"""
+            SELECT DISTINCT tag_b_id AS partner FROM centroid_edges
+            WHERE tag_a_id IN ({ph}) AND edge_strength >= ?
+            UNION
+            SELECT DISTINCT tag_a_id AS partner FROM centroid_edges
+            WHERE tag_b_id IN ({ph}) AND edge_strength >= ?
+            """,
+            (*context_ids, min_edge, *context_ids, min_edge),
+        ).fetchall()
+        co_retrieved = {r["partner"] for r in rows}
+        return candidate_ids & co_retrieved
 
     # ── Glyph Ramsey Lattice ─────────────────────────────────────────
 
@@ -2327,10 +2405,16 @@ class SynchronicityEngine:
                    glyph_strength, cooccurrence_strength,
                    inhibition_strength, parallelness
             FROM tag_relational_tensor
-            WHERE (tag_a_id IN ({placeholders}) OR tag_b_id IN ({placeholders}))
-              AND glyph_strength > 0
+            WHERE tag_a_id IN ({placeholders}) AND glyph_strength > 0
+            UNION ALL
+            SELECT tag_a_id, tag_b_id,
+                   glyph_strength, cooccurrence_strength,
+                   inhibition_strength, parallelness
+            FROM tag_relational_tensor
+            WHERE tag_b_id IN ({placeholders}) AND glyph_strength > 0
+              AND tag_a_id NOT IN ({placeholders})
             """,
-            (*context_tag_ids, *context_tag_ids),
+            (*context_tag_ids, *context_tag_ids, *context_tag_ids),
         ).fetchall()
 
         if not rows:
@@ -2361,26 +2445,36 @@ class SynchronicityEngine:
         if not partner_scores:
             return []
 
-        # Phase 2: resolve partner tags → memories
-        partner_ids = list(partner_scores.keys())
-        p2 = ",".join("?" * len(partner_ids))
-        mem_rows = self._db.execute(
-            f"SELECT memory_id, tag_id FROM memory_tags WHERE tag_id IN ({p2})",
-            tuple(partner_ids),
-        ).fetchall()
+        # Gate: only keep partners with co-retrieval edges to context tags
+        associated = self._get_coretrieval_partners(
+            context_tag_ids, set(partner_scores.keys()),
+        )
+        if associated:
+            partner_scores = {p: s for p, s in partner_scores.items() if p in associated}
 
+        if not partner_scores:
+            return []
+
+        # Resolve associated partners → memories
+        partner_ids = list(partner_scores.keys())
         memory_scores: dict[str, float] = {}
-        for r in mem_rows:
-            mid = r["memory_id"]
-            memory_scores[mid] = max(
-                memory_scores.get(mid, 0.0),
-                partner_scores[r["tag_id"]],
-            )
+        for i in range(0, len(partner_ids), 500):
+            chunk = partner_ids[i:i + 500]
+            p2 = ",".join("?" * len(chunk))
+            mem_rows = self._db.execute(
+                f"SELECT memory_id, tag_id FROM memory_tags WHERE tag_id IN ({p2})",
+                tuple(chunk),
+            ).fetchall()
+            for r in mem_rows:
+                mid = r["memory_id"]
+                memory_scores[mid] = max(
+                    memory_scores.get(mid, 0.0),
+                    partner_scores[r["tag_id"]],
+                )
 
         if not memory_scores:
             return []
 
-        # Normalize to [0, 1]
         max_score = max(memory_scores.values())
         if max_score > 0:
             memory_scores = {

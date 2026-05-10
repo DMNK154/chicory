@@ -261,13 +261,23 @@ class CentroidSubgraph:
         if len(activated_tag_ids) < 2:
             return {}
 
+        import time as _time
+        _rt = {}
+        _rt0 = _time.perf_counter()
+
         tag_ids = sorted(set(activated_tag_ids))
+        _rt["n_input_tags"] = len(tag_ids)
+
+        _s = _time.perf_counter()
         centroids = self.get_centroids_batch(tag_ids)
         tag_ids = [t for t in tag_ids if t in centroids]
+        _rt["get_centroids"] = _time.perf_counter() - _s
         if len(tag_ids) < 2:
             return {}
 
-        # ── Compute incoming association strengths ──────────────────
+        _rt["n_tags_with_centroids"] = len(tag_ids)
+
+        _s = _time.perf_counter()
         tag_to_idx = {t: i for i, t in enumerate(tag_ids)}
         n = len(tag_ids)
         C = np.stack([centroids[t] for t in tag_ids])  # (n, d)
@@ -280,18 +290,17 @@ class CentroidSubgraph:
                 strength = float(sim_matrix[i, j]) * mean_relevance * scale
                 if strength > 0:
                     incoming[(tag_ids[i], tag_ids[j])] = strength
+        _rt["compute_incoming"] = _time.perf_counter() - _s
+        _rt["n_pairs"] = len(incoming)
 
         if not incoming:
             return {}
 
-        # ── Rank incoming and build inverted subtraction values ─────
+        _s = _time.perf_counter()
         ranked = sorted(incoming.items(), key=lambda x: x[1], reverse=True)
         values = [v for _, v in ranked]
         inverted_values = list(reversed(values))
 
-        # ── Compute direction vectors for each ranked pair ──────────
-        # Direction = normalize(centroid_a - centroid_b) — the "axis"
-        # of the association in embedding space.
         k = len(ranked)
         d = C.shape[1]
         D = np.zeros((k, d), dtype=np.float32)
@@ -301,28 +310,29 @@ class CentroidSubgraph:
             if norm > 0:
                 D[idx] = diff / norm
 
-        # Parallelness matrix: |D @ D.T| — absolute cosine between
-        # direction vectors.  Anti-parallel still means competing.
         P = np.abs(D @ D.T)  # (k, k)
 
-        # For each pair, parallelness = max |cos| with any stronger pair.
-        # Top-ranked pair has no reference → parallelness = 0 → zero subtraction.
-        # Orthogonal pairs get near-zero subtraction regardless of rank.
         parallelness = np.zeros(k, dtype=np.float32)
         for i in range(1, k):
             parallelness[i] = float(np.max(P[i, :i]))
 
-        # Map: pair → (add_amount, scaled_subtract_amount)
         deltas: dict[tuple[int, int], tuple[float, float]] = {}
         for idx, (pair, add_val) in enumerate(ranked):
             scaled_sub = inverted_values[idx] * float(parallelness[idx])
             deltas[pair] = (add_val, scaled_sub)
+        _rt["rank_and_parallel"] = _time.perf_counter() - _s
 
-        # ── Apply to tensor (direct tag-pair mapping) ──────────────
+        _s = _time.perf_counter()
         net_deltas = self._apply_deltas_to_tensor(deltas)
+        _rt["apply_tensor"] = _time.perf_counter() - _s
 
-        # ── Apply to resonances (event-pair mapping) ───────────────
+        _s = _time.perf_counter()
         self._apply_deltas_to_resonances(deltas)
+        _rt["apply_resonances"] = _time.perf_counter() - _s
+
+        _rt["total"] = _time.perf_counter() - _rt0
+        import logging
+        logging.getLogger("chicory.centroid").info("reweight_timing: %s", _rt)
 
         return net_deltas
 
@@ -330,17 +340,20 @@ class CentroidSubgraph:
         self,
         deltas: dict[tuple[int, int], tuple[float, float]],
     ) -> dict[tuple[int, int], float]:
-        """Add incoming and subtract inverted from tensor synchronicity_strength.
+        """EMA-update tensor synchronicity_strength toward incoming signal.
 
+        For each pair: new = alpha * signal + (1 - alpha) * old
+        where signal = add_val - sub_val (net incoming strength).
         Returns net delta per pair.
         """
         pairs = list(deltas.keys())
         if not pairs:
             return {}
 
-        # Load existing tensor values in chunks to stay within SQLite limits
+        alpha = self._config.centroid_edge_ema_alpha
+
         existing: dict[tuple[int, int], float] = {}
-        chunk_size = 400  # 2 params per pair → 800 params per chunk
+        chunk_size = 400
         for i in range(0, len(pairs), chunk_size):
             chunk = pairs[i : i + chunk_size]
             conds = " OR ".join(
@@ -363,10 +376,10 @@ class CentroidSubgraph:
             old = existing.get(pair)
             if old is None:
                 continue
-            net = add_val - sub_val
-            new_val = max(0.0, old + net)
+            signal = max(0.0, add_val - sub_val)
+            new_val = alpha * signal + (1.0 - alpha) * old
             updates.append((new_val, pair[0], pair[1]))
-            net_deltas[pair] = net
+            net_deltas[pair] = new_val - old
 
         if updates:
             self._db.executemany(
@@ -382,10 +395,11 @@ class CentroidSubgraph:
         self,
         deltas: dict[tuple[int, int], tuple[float, float]],
     ) -> None:
-        """Add incoming and subtract inverted from resonance_strength.
+        """EMA-update resonance_strength toward incoming signal.
 
-        For each resonance, sum the net deltas across all cross-event
-        tag pairs that overlap with the delta map.
+        For each resonance, compute the net signal from overlapping
+        tag pairs, then apply: new = alpha * signal + (1 - alpha) * old.
+        Uses sync_event_tags junction table for indexed lookup.
         """
         if not deltas:
             return
@@ -396,52 +410,71 @@ class CentroidSubgraph:
             all_tags.add(b)
         tag_list = sorted(all_tags)
 
-        # Query resonances in chunks to stay within SQLite expression limits.
-        # Each tag generates 2 LIKE clauses (sea + seb), so limit chunk size.
-        matched: dict[int, dict] = {}  # resonance id → row
-        chunk_size = 200
-        for i in range(0, len(tag_list), chunk_size):
-            chunk = tag_list[i : i + chunk_size]
-            like_clauses = " OR ".join(
-                "sea.involved_tags LIKE '%' || ? || '%'" for _ in chunk
-            )
-            sql = (
-                f"SELECT r.id, r.resonance_strength, "
-                f"  sea.involved_tags AS tags_a, seb.involved_tags AS tags_b "
-                f"FROM resonances r "
-                f"JOIN synchronicity_events sea ON sea.id = r.event_a_id "
-                f"JOIN synchronicity_events seb ON seb.id = r.event_b_id "
-                f"WHERE ({like_clauses}) "
-                f"   OR ({like_clauses.replace('sea.', 'seb.')}) "
-                f"ORDER BY r.resonance_strength DESC"
-            )
-            params = tuple(str(t) for t in chunk) * 2
-            for row in self._db.execute(sql, params).fetchall():
+        # Find resonances involving any of the activated tags via indexed junction
+        min_res = self._config.resonance_min_edge_strength
+        matched: dict[int, dict] = {}
+        for i in range(0, len(tag_list), 500):
+            chunk = tag_list[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            rows = self._db.execute(
+                f"""SELECT r.id, r.resonance_strength,
+                       r.event_a_id, r.event_b_id
+                    FROM resonances r
+                    JOIN sync_event_tags st ON st.event_id = r.event_a_id
+                    WHERE st.tag_id IN ({ph}) AND r.resonance_strength >= ?
+                    UNION ALL
+                    SELECT r.id, r.resonance_strength,
+                       r.event_a_id, r.event_b_id
+                    FROM resonances r
+                    JOIN sync_event_tags st ON st.event_id = r.event_b_id
+                    WHERE st.tag_id IN ({ph}) AND r.resonance_strength >= ?""",
+                (*chunk, min_res, *chunk, min_res),
+            ).fetchall()
+            for row in rows:
                 matched[row["id"]] = row
 
         if not matched:
             return
 
+        # Batch-load tags for matched events via junction table
+        event_ids: set[int] = set()
+        for row in matched.values():
+            event_ids.add(row["event_a_id"])
+            event_ids.add(row["event_b_id"])
+
+        event_tags: dict[int, set[int]] = {eid: set() for eid in event_ids}
+        eid_list = sorted(event_ids)
+        for i in range(0, len(eid_list), 500):
+            chunk = eid_list[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            rows = self._db.execute(
+                f"SELECT event_id, tag_id FROM sync_event_tags WHERE event_id IN ({ph})",
+                tuple(chunk),
+            ).fetchall()
+            for r in rows:
+                event_tags[r["event_id"]].add(r["tag_id"])
+
+        alpha = self._config.centroid_edge_ema_alpha
         updates: list[tuple] = []
         for row in matched.values():
-            try:
-                tags_a = set(json.loads(row["tags_a"]))
-                tags_b = set(json.loads(row["tags_b"]))
-            except (json.JSONDecodeError, TypeError):
-                continue
+            tags_a = event_tags.get(row["event_a_id"], set())
+            tags_b = event_tags.get(row["event_b_id"], set())
 
-            total_net = 0.0
+            signal = 0.0
             for ta in tags_a:
                 for tb in tags_b:
                     key = (min(ta, tb), max(ta, tb))
                     if key in deltas:
                         add_val, sub_val = deltas[key]
-                        total_net += add_val - sub_val
+                        signal += add_val - sub_val
 
-            if total_net == 0.0:
+            signal = max(0.0, signal)
+            old = row["resonance_strength"]
+            new_strength = alpha * signal + (1.0 - alpha) * old
+
+            if abs(new_strength - old) < 1e-6:
                 continue
 
-            new_strength = max(0.0, row["resonance_strength"] + total_net)
             updates.append((new_strength, row["id"]))
 
         if updates:

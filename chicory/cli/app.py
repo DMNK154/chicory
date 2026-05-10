@@ -7,6 +7,8 @@ from typing import Optional
 
 import typer
 
+_DEFAULT_DB = str(Path.home() / ".chicory" / "chicory.db")
+
 app = typer.Typer(
     name="chicory",
     help="Dual-tracking memory architecture for LLMs",
@@ -21,7 +23,7 @@ app.add_typer(commons_app)
 
 @app.command()
 def chat(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     model: Optional[str] = typer.Option(None, help="Override LLM model"),
 ) -> None:
     """Start an interactive chat session with memory."""
@@ -39,7 +41,7 @@ def chat(
 
 @app.command()
 def status(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
 ) -> None:
     """Show system status."""
     from chicory.cli.commands import _cmd_status
@@ -56,7 +58,7 @@ def status(
 
 @app.command()
 def reembed(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     model: Optional[str] = typer.Option(None, help="New embedding model name"),
 ) -> None:
     """Re-embed all memories (for model migration)."""
@@ -79,7 +81,7 @@ def reembed(
 
 @app.command()
 def migrate(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     new_model: Optional[str] = typer.Option(None, help="New LLM model name"),
     new_embedding: Optional[str] = typer.Option(None, help="New embedding model"),
 ) -> None:
@@ -94,7 +96,7 @@ def migrate(
 @app.command()
 def ingest(
     path: str = typer.Argument(help="File or directory to ingest"),
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     recursive: bool = typer.Option(True, help="Recurse into subdirectories"),
     chunk_size: int = typer.Option(2000, help="Max characters per chunk"),
     overlap: int = typer.Option(400, help="Character overlap between chunks"),
@@ -145,7 +147,7 @@ def ingest(
 @app.command()
 def watch(
     path: str = typer.Argument(help="Directory to watch"),
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     chunk_size: int = typer.Option(2000, help="Max characters per chunk"),
     overlap: int = typer.Option(400, help="Character overlap between chunks"),
 ) -> None:
@@ -166,7 +168,7 @@ def watch(
 
 @app.command()
 def sync(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
 ) -> None:
     """Run full network synchronization after a large ingest.
 
@@ -231,7 +233,7 @@ def sync(
 
 @app.command(name="backfill-letters")
 def backfill_letters(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
 ) -> None:
     """Backfill single-letter tags from existing word tags on all memories."""
     from rich.console import Console
@@ -289,7 +291,7 @@ def backfill_letters(
 
 @app.command()
 def squares(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     tag: Optional[str] = typer.Option(None, help="Restrict motifs to one tag"),
     limit: int = typer.Option(10, help="Maximum motifs to show"),
     max_edges: int = typer.Option(
@@ -1573,7 +1575,7 @@ def cross_hidden_ask(
 
 @app.command(name="chain-anisotropy")
 def chain_anisotropy(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     edge_limit: int = typer.Option(
         1500,
         "--edge-limit",
@@ -1723,7 +1725,7 @@ def chain_anisotropy(
 
 @app.command(name="zigzag")
 def zigzag(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     motif_limit: int = typer.Option(
         2000,
         "--limit",
@@ -1887,7 +1889,7 @@ def zigzag(
 
 @app.command(name="vertical-squares")
 def vertical_squares(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     mode: str = typer.Option(
         "tensor",
         help="Scan mode: tensor or incidence",
@@ -2111,7 +2113,7 @@ def vertical_squares(
 
 @app.command()
 def dashboard(
-    db: str = typer.Option("chicory.db", help="Path to the database file"),
+    db: str = typer.Option(_DEFAULT_DB, help="Path to the database file"),
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
     port: int = typer.Option(8050, help="Port to bind to"),
     debug: bool = typer.Option(False, help="Enable Dash debug mode"),

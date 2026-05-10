@@ -129,6 +129,15 @@ class Orchestrator:
         self._last_sync_check: datetime | None = datetime.utcnow()
         self._last_meta_check: datetime | None = datetime.utcnow()
 
+        # Diagnostics — activation trace + context log
+        self._last_trace = None
+        self._context_logger = None
+        if config.context_log_enabled:
+            from chicory.diagnostics.context_log import ContextLogger
+            self._context_logger = ContextLogger(
+                config.context_log_dir, log_full=config.context_log_full,
+            )
+
         # Commons signal emitter + auto-processor (optional)
         self._signal_emitter = None
         self._signal_processor = None
@@ -519,7 +528,27 @@ class Orchestrator:
             stats["canopy_grown_blocks"] = 0
         stats["canopy_seconds"] = round(time.time() - t0, 1)
 
-        # 12. Synchronicity detection (unrestricted — bypass rate limit)
+        # 12. Deduplicate sync events (before detection to prevent runaway multiplication)
+        _report("sync_dedup", "Deduplicating synchronicity events")
+        t0 = time.time()
+        dedup_cursor = self._db.execute(
+            """DELETE FROM synchronicity_events
+               WHERE id NOT IN (
+                   SELECT id FROM (
+                       SELECT id, ROW_NUMBER() OVER (
+                           PARTITION BY event_type, involved_tags, quadrant
+                           ORDER BY strength DESC, detected_at DESC
+                       ) AS rn
+                       FROM synchronicity_events
+                   ) WHERE rn = 1
+               )"""
+        )
+        stats["sync_dedup_removed"] = dedup_cursor.rowcount
+        if dedup_cursor.rowcount:
+            self._db.connection.commit()
+        stats["sync_dedup_seconds"] = round(time.time() - t0, 1)
+
+        # 13. Synchronicity detection (unrestricted — bypass rate limit)
         _report("sync_detection", "Running synchronicity detection")
         t0 = time.time()
         new_events = self._sync_detector.check_for_synchronicities()
@@ -528,7 +557,7 @@ class Orchestrator:
         stats["sync_events_detected"] = len(new_events) if new_events else 0
         stats["sync_detection_seconds"] = round(time.time() - t0, 1)
 
-        # 13. Meta-pattern analysis
+        # 14. Meta-pattern analysis
         _report("meta_analysis", "Running meta-pattern analysis")
         t0 = time.time()
         patterns = self._meta_analyzer.run_analysis()
@@ -537,7 +566,7 @@ class Orchestrator:
         stats["meta_patterns"] = len(patterns)
         stats["meta_analysis_seconds"] = round(time.time() - t0, 1)
 
-        # 14. Episode lifecycle
+        # 15. Episode lifecycle
         _report("episode_lifecycle", "Running episode lifecycle pass")
         t0 = time.time()
         if self._config.episode_enabled:
@@ -617,7 +646,7 @@ class Orchestrator:
             self._store_glyph_metadata(memory.id, glyph_analysis)
 
         if not defer_side_effects:
-            self._on_memory_stored(memory)
+            self._on_memory_stored(memory, glyph_analysis=glyph_analysis)
 
         return {
             "status": "stored",
@@ -639,6 +668,9 @@ class Orchestrator:
         top_k: int = 10,
     ) -> dict[str, Any]:
         """Retrieve memories, log the event, and fire side effects."""
+        import time as _time
+        _t0 = _time.time()
+
         if method == "semantic":
             results = self._memory_store.retrieve_semantic(query, top_k, tags)
         elif method == "tag" and tags:
@@ -646,6 +678,8 @@ class Orchestrator:
             results = [(m, 1.0) for m in tag_results[:top_k]]
         else:
             results = self._memory_store.retrieve_hybrid(query, tags, top_k)
+
+        _t_search = _time.time()
 
         # Log retrieval event
         result_tuples = [
@@ -659,10 +693,17 @@ class Orchestrator:
             model_version=self._config.llm_model,
         )
 
+        _t_log = _time.time()
+
         # Side effects (background thread)
         self._on_retrieval_completed(retrieval_id, results, query)
 
-        # Annotate results with live glyph scanning
+        _t_side = _time.time()
+
+        # Annotate results with live glyph scanning (batched metadata)
+        memory_ids_for_glyph = [mem.id for mem, _ in results]
+        glyph_meta_batch = self._get_glyph_metadata_batch(memory_ids_for_glyph)
+
         annotated = []
         for mem, score in results:
             entry: dict[str, Any] = {
@@ -674,13 +715,80 @@ class Orchestrator:
                 "relevance_score": round(score, 3),
                 "created_at": mem.created_at.isoformat(),
             }
-            self._annotate_glyph_definitions(entry, mem.id, mem.content)
+            self._annotate_glyph(entry, mem.content, glyph_meta_batch.get(mem.id))
             annotated.append(entry)
+
+        _t_annot = _time.time()
+
+        hybrid_timing = getattr(self._memory_store, "_last_hybrid_timing", None)
+        bk_breakdown = getattr(self, "_last_bookkeeping_breakdown", None)
+        bk_total = getattr(self, "_last_bookkeeping_time", None)
+
+        timing: dict[str, Any] = {
+            "search": round(_t_search - _t0, 3),
+            "log": round(_t_log - _t_search, 3),
+            "side_effects": round(_t_side - _t_log, 3),
+            "annotate": round(_t_annot - _t_side, 3),
+            "total": round(_t_annot - _t0, 3),
+        }
+        if hybrid_timing:
+            timing["hybrid_breakdown"] = {
+                k: round(v, 3) if isinstance(v, float) else v
+                for k, v in hybrid_timing.items()
+            }
+        if bk_breakdown:
+            timing["bookkeeping_breakdown"] = {
+                k: round(v, 3) if isinstance(v, float) else v
+                for k, v in bk_breakdown.items()
+            }
+        if bk_total is not None:
+            timing["bookkeeping_total"] = round(bk_total, 3)
+
+        # Build activation trace
+        from chicory.diagnostics.activation_trace import ActivationTrace, ScoreBreakdown
+
+        score_components = getattr(self._memory_store, "_last_score_components", {})
+        breakdowns = []
+        for mem, score in results:
+            comp = score_components.get(mem.id, {})
+            breakdowns.append(ScoreBreakdown(
+                memory_id=mem.id,
+                semantic=comp.get("semantic", 0.0),
+                tag=comp.get("tag", 0.0),
+                lattice=comp.get("lattice", 0.0),
+                glyph=comp.get("glyph", 0.0),
+                total=comp.get("total", score),
+            ))
+
+        tag_activations: dict[str, float] = {}
+        raw_partner_scores = getattr(self._sync_engine, "_last_partner_tag_scores", {})
+        if raw_partner_scores:
+            id_to_name = self._tag_manager.get_names_by_ids(list(raw_partner_scores.keys()))
+            tag_activations = {
+                id_to_name[tid]: strength
+                for tid, strength in raw_partner_scores.items()
+                if tid in id_to_name
+            }
+
+        trace = ActivationTrace(
+            query=query,
+            method=method,
+            tags_requested=tags or [],
+            tag_activations=tag_activations,
+            score_breakdowns=breakdowns,
+            timing=timing,
+            context_entries=annotated if self._config.context_log_full else None,
+        )
+        self._last_trace = trace
+
+        if self._context_logger:
+            self._context_logger.log(trace)
 
         return {
             "results": annotated,
             "count": len(results),
             "method": method,
+            "_timing": timing,
         }
 
     def handle_deep_retrieve(
@@ -788,6 +896,14 @@ class Orchestrator:
         # Sort all results by score descending
         all_results.sort(key=lambda x: x["relevance_score"], reverse=True)
 
+        # Batch glyph annotation (single DB query for all results)
+        all_mem_ids = [r["memory_id"] for r in all_results]
+        glyph_meta_batch = self._get_glyph_metadata_batch(all_mem_ids)
+        for entry in all_results:
+            self._annotate_glyph(
+                entry, entry["content"], glyph_meta_batch.get(entry["memory_id"]),
+            )
+
         # Fire side effects once for all retrieved memories
         if all_retrieval_results:
             combined_tuples = [
@@ -811,11 +927,10 @@ class Orchestrator:
             ),
         }
 
-    def _format_deep_result(
-        self, mem: Memory, score: float, depth: int,
-    ) -> dict[str, Any]:
+    @staticmethod
+    def _format_deep_result(mem: Memory, score: float, depth: int) -> dict[str, Any]:
         """Format a single deep retrieval result with depth annotation."""
-        entry: dict[str, Any] = {
+        return {
             "memory_id": mem.id,
             "content": mem.content,
             "summary": mem.summary,
@@ -825,8 +940,12 @@ class Orchestrator:
             "created_at": mem.created_at.isoformat(),
             "depth": depth,
         }
-        self._annotate_glyph_definitions(entry, mem.id, mem.content)
-        return entry
+
+    def handle_get_last_trace(self) -> dict[str, Any]:
+        """Return the activation trace from the most recent retrieval."""
+        if self._last_trace is None:
+            return {"error": "No retrieval trace available yet"}
+        return self._last_trace.to_dict(include_context=self._config.context_log_full)
 
     def _generate_expansion_queries(
         self, results: list[tuple[Memory, float]],
@@ -1632,19 +1751,15 @@ class Orchestrator:
         )
         self._db.connection.commit()
 
-    def _annotate_glyph_definitions(
-        self, entry: dict[str, Any], memory_id: str, content: str,
+    def _annotate_glyph(
+        self,
+        entry: dict[str, Any],
+        content: str,
+        glyph_meta: dict | None,
     ) -> None:
-        """Scan content for glyph concepts and merge with stored metadata.
-
-        Runs ``analyze_text`` on the raw content — pure string matching,
-        no model call — so every retrieval result carries the concept↔symbol
-        mappings the LLM needs to interpret glyphs.  Also includes any
-        pre-stored glyph metadata from ingestion time.
-        """
+        """Attach glyph concept↔symbol mappings so the LLM can read glyphs."""
         result = analyze_text(content)
 
-        # Live-scanned definitions
         if result["words"]:
             entry["glyph_definitions"] = {
                 w["word"]: w["glyph"] for w in result["words"]
@@ -1662,8 +1777,6 @@ class Orchestrator:
                     for p in result["pairs"]
                 ]
 
-        # Merge stored metadata (may have richer info from ingestion)
-        glyph_meta = self._get_glyph_metadata(memory_id)
         if glyph_meta:
             entry["glyph_concepts"] = glyph_meta.get("concepts", [])
             if not entry.get("glyph_line"):
@@ -1671,21 +1784,20 @@ class Orchestrator:
             if not entry.get("glyph_formula"):
                 entry["glyph_formula"] = glyph_meta.get("formula")
 
-    def _get_glyph_metadata(self, memory_id: str) -> dict | None:
-        """Load glyph analysis metadata for a memory, or None."""
-        import json as _json
-
-        row = self._db.execute(
-            "SELECT glyph_json FROM glyph_metadata WHERE memory_id = ?",
-            (memory_id,),
-        ).fetchone()
-        if row:
-            return _json.loads(row["glyph_json"])
-        return None
+    def _get_glyph_metadata_batch(self, memory_ids: list[str]) -> dict[str, dict]:
+        """Load glyph metadata for multiple memories in a single query."""
+        if not memory_ids:
+            return {}
+        ph = ",".join("?" * len(memory_ids))
+        rows = self._db.execute(
+            f"SELECT memory_id, glyph_json FROM glyph_metadata WHERE memory_id IN ({ph})",
+            memory_ids,
+        ).fetchall()
+        return {r["memory_id"]: json.loads(r["glyph_json"]) for r in rows}
 
     # ── Side-effect triggers ────────────────────────────────────────
 
-    def _on_memory_stored(self, memory: Memory) -> None:
+    def _on_memory_stored(self, memory: Memory, glyph_analysis: dict | None = None) -> None:
         """Fire after a memory is stored."""
         self._sync_engine.invalidate_pca_cache()
 
@@ -1745,7 +1857,10 @@ class Orchestrator:
 
         # Emit commons signal and auto-process
         if self._signal_emitter:
-            self._signal_emitter.emit_store(memory.tags)
+            glyphs = None
+            if glyph_analysis and glyph_analysis.get("words"):
+                glyphs = glyph_analysis["words"]
+            self._signal_emitter.emit_store(memory.tags, glyphs=glyphs)
         if self._signal_processor:
             threading.Thread(
                 target=self._commons_auto_process, daemon=True,
@@ -1758,6 +1873,9 @@ class Orchestrator:
             if tag:
                 store_tag_ids.append(tag.id)
 
+        if self._config.episode_enabled and store_tag_ids:
+            self._temporal_episodes.update_on_store(memory.id, store_tag_ids)
+
         if self._config.canopy_enabled and store_tag_ids:
             self._forest.update_on_store(memory.id, store_tag_ids)
             self._episodic_tensor.update_on_store(memory.id)
@@ -1766,9 +1884,6 @@ class Orchestrator:
                 source_id=memory.id,
                 memory_id=memory.id,
             )
-
-        if self._config.episode_enabled and store_tag_ids:
-            self._temporal_episodes.update_on_store(memory.id, store_tag_ids)
 
     def _on_retrieval_completed(
         self,
@@ -1785,12 +1900,15 @@ class Orchestrator:
              sync detection and meta-analysis — runs without blocking
              the retrieval response.
         """
+        import time as _time
+        _bk_start = _time.perf_counter()
         try:
             self._retrieval_bookkeeping(retrieval_id, results, query)
         except Exception:
             logging.getLogger(__name__).exception(
                 "Error in retrieval bookkeeping"
             )
+        self._last_bookkeeping_time = _time.perf_counter() - _bk_start
 
         # Fire-and-forget: don't block the response on sync detection
         thread = threading.Thread(
@@ -1800,7 +1918,13 @@ class Orchestrator:
         thread.start()
 
     def _sync_detection_background(self) -> None:
-        """Run sync detection and commons auto-processing in a background thread."""
+        """Run deferred retrieval work, sync detection, and commons in background."""
+        try:
+            self._run_deferred_retrieval_work()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Error in deferred retrieval work"
+            )
         try:
             self._maybe_run_sync_detection()
         except Exception:
@@ -1810,84 +1934,22 @@ class Orchestrator:
         if self._signal_processor:
             self._commons_auto_process()
 
-    def _retrieval_bookkeeping(
-        self,
-        retrieval_id: int,
-        results: list[tuple[Memory, float]],
-        query: str = "",
-    ) -> None:
-        """Phase 1: cheap per-retrieval bookkeeping (batch SQL writes).
-
-        Tags from retrieved memories are filtered by cosine similarity
-        to the query embedding — only tags whose centroid is above
-        ``similarity_threshold`` participate in downstream analysis.
-        """
-        if not results:
+    def _run_deferred_retrieval_work(self) -> None:
+        """Forest, canopy, episodic tensor, and episode updates from last retrieval."""
+        bg = getattr(self, "_pending_bg_retrieval", None)
+        if not bg:
             return
+        self._pending_bg_retrieval = None
 
-        memory_ids = [mem.id for mem, _ in results]
+        retrieval_id = bg["retrieval_id"]
+        memory_ids = bg["memory_ids"]
+        tag_ids_map = bg["tag_ids_map"]
 
-        # Batch update access salience
-        self._salience.update_on_access_batch(memory_ids)
-
-        # Batch get tag IDs for all result memories
-        tag_ids_map = self._tag_manager.get_tag_ids_for_memories(memory_ids)
-
-        # Gate: keep only tags whose centroid is relevant to the query
-        tag_ids_map = self._filter_relevant_tags(tag_ids_map, query)
-
-        # Build trend events and tag hits in bulk
-        trend_events: list[tuple[int, str, str | None, float]] = []
-        tag_hits: list[tuple[int, str]] = []
-        for mid in memory_ids:
-            for tid in tag_ids_map.get(mid, []):
-                trend_events.append((tid, "retrieval", mid, 1.0))
-                tag_hits.append((tid, "direct_match"))
-
-        self._trend_engine.record_events_batch(trend_events)
-
-        if tag_hits:
-            self._retrieval_tracker.log_tag_hits(retrieval_id, tag_hits)
-
-        # Reinforce synchronicity events — collect IDs then single batch UPDATE
-        events_map = self._sync_detector.get_events_for_memories(memory_ids)
-        reinforced_event_ids: set[int] = set()
-        for mid in memory_ids:
-            reinforced_event_ids.update(events_map.get(mid, []))
-        if reinforced_event_ids:
-            self._sync_detector.reinforce_events_batch(list(reinforced_event_ids))
-
-        # Record co-retrieval and apply centroid sub-graph reweighting
-        if self._config.centroid_inhibition_enabled:
-            all_tag_ids_flat: list[int] = []
-            for tids in tag_ids_map.values():
-                all_tag_ids_flat.extend(tids)
-            unique_tags = list(set(all_tag_ids_flat))
-            if len(unique_tags) >= 2:
-                mean_relevance = (
-                    sum(score for _, score in results) / len(results)
-                )
-                self._centroid_subgraph.record_co_retrieval(unique_tags)
-                self._centroid_subgraph.update_on_retrieval(
-                    unique_tags, mean_relevance,
-                )
-
-        # Emit commons retrieve signal with all result tag names
-        if self._signal_emitter:
-            all_tag_ids: set[int] = set()
-            for tids in tag_ids_map.values():
-                all_tag_ids.update(tids)
-            if all_tag_ids:
-                id_to_name = self._tag_manager.get_names_by_ids(list(all_tag_ids))
-                self._signal_emitter.emit_retrieve(list(id_to_name.values()))
-
-        # Activate episodic edges for co-retrieved memory pairs
         if self._config.canopy_enabled and len(memory_ids) >= 2:
             for i in range(len(memory_ids)):
                 for j in range(i + 1, len(memory_ids)):
                     self._episodic_tensor.activate_edge(memory_ids[i], memory_ids[j])
 
-        # Forest reorganization + canopy observation on retrieval
         if self._config.canopy_enabled:
             all_retrieval_tags: list[int] = []
             for tids in tag_ids_map.values():
@@ -1912,6 +1974,89 @@ class Orchestrator:
                 self._temporal_episodes.update_on_retrieval(
                     memory_ids, all_ep_tags,
                 )
+
+    def _retrieval_bookkeeping(
+        self,
+        retrieval_id: int,
+        results: list[tuple[Memory, float]],
+        query: str = "",
+    ) -> None:
+        """Phase 1: cheap per-retrieval bookkeeping (batch SQL writes).
+
+        Tags from retrieved memories are filtered by cosine similarity
+        to the query embedding — only tags whose centroid is above
+        ``similarity_threshold`` participate in downstream analysis.
+        """
+        import time as _time
+        _bt = {}
+        if not results:
+            return
+
+        memory_ids = [mem.id for mem, _ in results]
+
+        _s = _time.perf_counter()
+        self._salience.update_on_access_batch(memory_ids)
+        _bt["salience"] = _time.perf_counter() - _s
+
+        _s = _time.perf_counter()
+        tag_ids_map = self._tag_manager.get_tag_ids_for_memories(memory_ids)
+        _bt["tag_ids_lookup"] = _time.perf_counter() - _s
+
+        _s = _time.perf_counter()
+        trend_events: list[tuple[int, str, str | None, float]] = []
+        tag_hits: list[tuple[int, str]] = []
+        for mid in memory_ids:
+            for tid in tag_ids_map.get(mid, []):
+                trend_events.append((tid, "retrieval", mid, 1.0))
+                tag_hits.append((tid, "direct_match"))
+        self._trend_engine.record_events_batch(trend_events)
+        if tag_hits:
+            self._retrieval_tracker.log_tag_hits(retrieval_id, tag_hits)
+        _bt["trends_and_hits"] = _time.perf_counter() - _s
+
+        _s = _time.perf_counter()
+        events_map = self._sync_detector.get_events_for_memories(memory_ids)
+        reinforced_event_ids: set[int] = set()
+        for mid in memory_ids:
+            reinforced_event_ids.update(events_map.get(mid, []))
+        if reinforced_event_ids:
+            self._sync_detector.reinforce_events_batch(list(reinforced_event_ids))
+        _bt["sync_reinforce"] = _time.perf_counter() - _s
+
+        _s = _time.perf_counter()
+        if self._config.centroid_inhibition_enabled:
+            all_tag_ids_flat: list[int] = []
+            for tids in tag_ids_map.values():
+                all_tag_ids_flat.extend(tids)
+            unique_tags = list(set(all_tag_ids_flat))
+            if len(unique_tags) >= 2:
+                mean_relevance = (
+                    sum(score for _, score in results) / len(results)
+                )
+                self._centroid_subgraph.record_co_retrieval(unique_tags)
+                self._centroid_subgraph.update_on_retrieval(
+                    unique_tags, mean_relevance,
+                )
+        _bt["centroid_reweight"] = _time.perf_counter() - _s
+
+        _s = _time.perf_counter()
+        if self._signal_emitter:
+            all_tag_ids: set[int] = set()
+            for tids in tag_ids_map.values():
+                all_tag_ids.update(tids)
+            if all_tag_ids:
+                id_to_name = self._tag_manager.get_names_by_ids(list(all_tag_ids))
+                self._signal_emitter.emit_retrieve(list(id_to_name.values()))
+        _bt["commons_signal"] = _time.perf_counter() - _s
+
+        self._last_bookkeeping_breakdown = _bt
+        logging.getLogger(__name__).info("bookkeeping_timing: %s", _bt)
+
+        self._pending_bg_retrieval = {
+            "retrieval_id": retrieval_id,
+            "memory_ids": memory_ids,
+            "tag_ids_map": tag_ids_map,
+        }
 
     def _filter_relevant_tags(
         self,

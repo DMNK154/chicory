@@ -39,73 +39,79 @@ class MetaAnalyzer:
         if len(events) < self._config.meta_min_sync_events:
             return []
 
-        clusters = self._cluster_sync_events(events)
+        cluster_groups, subgraphs = self._cluster_sync_events(events)
         patterns = []
 
         total_events = len(events)
         total_tags = self._get_active_tag_count()
 
-        for cluster in clusters:
-            pattern = self._evaluate_cluster(cluster, total_events, total_tags)
+        for sg_id, cluster in cluster_groups.items():
+            sg_tags = subgraphs.get(sg_id, set())
+            pattern = self._evaluate_cluster(
+                cluster, total_events, total_tags, sg_tags,
+            )
             if pattern is not None:
                 self._record_pattern(pattern)
                 patterns.append(pattern)
 
         return patterns
 
-    _META_EVENT_CAP = 500
-
     def _get_analysis_events(self) -> list[SynchronicityEvent]:
         """Get deduplicated sync events for meta-pattern analysis.
 
-        Combines time-windowed recent events with lattice-resonant events
-        (wider window) using SQL UNION for server-side dedup.  Capped at
-        _META_EVENT_CAP strongest events to bound downstream work.
+        Fetches recent events via indexed detected_at scan, then expands
+        through lattice resonances using a JOIN-based subquery (avoids
+        SQLite parameter limits on large event sets).
         """
         window = self._config.meta_analysis_interval_hours * 7
         cutoff = (datetime.utcnow() - timedelta(hours=window)).isoformat()
-        cap = self._META_EVENT_CAP
+
+        rows = self._db.execute(
+            "SELECT * FROM synchronicity_events "
+            "WHERE detected_at > ? "
+            "ORDER BY strength DESC, detected_at DESC",
+            (cutoff,),
+        ).fetchall()
+
+        by_id = {r["id"]: r for r in rows}
 
         use_lattice = (
             self._sync_engine is not None
             and self._config.meta_use_lattice_resonances
+            and by_id
         )
 
         if use_lattice:
             lattice_cutoff = (
                 datetime.utcnow() - timedelta(hours=window * 4)
             ).isoformat()
-            rows = self._db.execute(
-                """
-                SELECT * FROM (
-                    SELECT * FROM synchronicity_events
-                    WHERE detected_at > ?
-                    UNION
-                    SELECT se.* FROM synchronicity_events se
-                    WHERE se.detected_at > ?
-                      AND se.id IN (
-                          SELECT event_a_id FROM resonances
-                          UNION ALL
-                          SELECT event_b_id FROM resonances
-                      )
-                )
-                ORDER BY strength DESC, detected_at DESC
-                LIMIT ?
-                """,
-                (cutoff, lattice_cutoff, cap),
-            ).fetchall()
-        else:
-            rows = self._db.execute(
-                """
-                SELECT * FROM synchronicity_events
-                WHERE detected_at > ?
-                ORDER BY strength DESC, detected_at DESC
-                LIMIT ?
-                """,
-                (cutoff, cap),
+            partner_rows = self._db.execute(
+                """SELECT DISTINCT r.event_b_id AS pid
+                   FROM resonances r
+                   JOIN synchronicity_events se ON r.event_a_id = se.id
+                   WHERE se.detected_at > ?
+                   UNION
+                   SELECT DISTINCT r.event_a_id AS pid
+                   FROM resonances r
+                   JOIN synchronicity_events se ON r.event_b_id = se.id
+                   WHERE se.detected_at > ?""",
+                (cutoff, cutoff),
             ).fetchall()
 
-        return [self._row_to_event(r) for r in rows]
+            missing = [r["pid"] for r in partner_rows if r["pid"] not in by_id]
+            if missing:
+                for i in range(0, len(missing), 500):
+                    chunk = missing[i:i + 500]
+                    ph = ",".join("?" * len(chunk))
+                    extra = self._db.execute(
+                        f"SELECT * FROM synchronicity_events "
+                        f"WHERE id IN ({ph}) AND detected_at > ?",
+                        chunk + [lattice_cutoff],
+                    ).fetchall()
+                    for r in extra:
+                        by_id[r["id"]] = r
+
+        return [self._row_to_event(r) for r in by_id.values()]
 
     @staticmethod
     def _row_to_event(r) -> SynchronicityEvent:
@@ -125,30 +131,73 @@ class MetaAnalyzer:
         )
 
     def _cluster_sync_events(
-        self, events: list[SynchronicityEvent]
-    ) -> list[list[SynchronicityEvent]]:
-        """Cluster synchronicity events by tag overlap using sparse union-find.
+        self, events: list[SynchronicityEvent],
+    ) -> tuple[dict[int, list[SynchronicityEvent]], dict[int, set[int]]]:
+        """Cluster sync events by tag-tensor subgraph connectivity.
 
-        Uses an inverted index (tag → event indices) to find candidate pairs
-        that share at least one tag, then merges pairs whose Jaccard similarity
-        meets the threshold.  Memory is O(n), not O(n²).
+        Extracts all tags involved in the events, pulls their edges from
+        the tag relational tensor, finds connected subgraphs via
+        union-find on tags, then maps each event to the subgraph that
+        contains its tags.  Events spanning multiple subgraphs go to
+        whichever subgraph has the most tag overlap.
+
+        Returns (cluster_groups, subgraph_tags) so callers don't need
+        to re-derive subgraph membership.
         """
-        if len(events) < 2:
-            return [events] if events else []
-
         tag_sets = [set(json.loads(e.involved_tags)) for e in events]
-        n = len(events)
-        sim_threshold = 1.0 - self._config.clustering_jaccard_threshold
+        all_tags = sorted({t for ts in tag_sets for t in ts})
 
-        # Inverted index: tag → list of event indices that contain it
-        tag_to_events: dict[int, list[int]] = defaultdict(list)
-        for i, ts in enumerate(tag_sets):
-            for tag in ts:
-                tag_to_events[tag].append(i)
+        if not all_tags:
+            return {0: events}, {0: set()}
 
-        # Union-Find with path compression + union by rank
-        parent = list(range(n))
-        uf_rank = [0] * n
+        tag_subgraphs = self._find_tensor_subgraphs(all_tags)
+
+        tag_to_sg: dict[int, int] = {}
+        sg_tags: dict[int, set[int]] = {}
+        for sg_id, members in enumerate(tag_subgraphs):
+            sg_tags[sg_id] = members
+            for t in members:
+                tag_to_sg[t] = sg_id
+
+        clusters: dict[int, list[SynchronicityEvent]] = defaultdict(list)
+        for i, event in enumerate(events):
+            sg_votes: dict[int, int] = defaultdict(int)
+            for t in tag_sets[i]:
+                if t in tag_to_sg:
+                    sg_votes[tag_to_sg[t]] += 1
+            if sg_votes:
+                best = max(sg_votes, key=sg_votes.get)
+                clusters[best].append(event)
+            else:
+                clusters[-1].append(event)
+
+        return dict(clusters), sg_tags
+
+    def _find_tensor_subgraphs(self, tag_ids: list[int]) -> list[set[int]]:
+        """Find connected subgraphs in the tag relational tensor.
+
+        Queries all tensor edges among the given tags with meaningful
+        composite strength and clusters via union-find.
+        """
+        ph = ",".join("?" * len(tag_ids))
+        rows = self._db.execute(
+            f"""
+            SELECT tag_a_id, tag_b_id,
+                   cooccurrence_strength + synchronicity_strength
+                   + semantic_strength + glyph_strength
+                   - inhibition_strength AS composite
+            FROM tag_relational_tensor
+            WHERE tag_a_id IN ({ph})
+              AND tag_b_id IN ({ph})
+              AND (cooccurrence_strength + synchronicity_strength
+                   + semantic_strength + glyph_strength
+                   - inhibition_strength) > 0.05
+            """,
+            (*tag_ids, *tag_ids),
+        ).fetchall()
+
+        parent: dict[int, int] = {t: t for t in tag_ids}
+        rank: dict[int, int] = {t: 0 for t in tag_ids}
 
         def find(x: int) -> int:
             while parent[x] != x:
@@ -156,48 +205,37 @@ class MetaAnalyzer:
                 x = parent[x]
             return x
 
-        def union(a: int, b: int) -> None:
+        def merge(a: int, b: int) -> None:
             a, b = find(a), find(b)
             if a == b:
                 return
-            if uf_rank[a] < uf_rank[b]:
+            if rank[a] < rank[b]:
                 a, b = b, a
             parent[b] = a
-            if uf_rank[a] == uf_rank[b]:
-                uf_rank[a] += 1
+            if rank[a] == rank[b]:
+                rank[a] += 1
 
-        for indices in tag_to_events.values():
-            if len(indices) > 50:
-                indices = indices[:50]
-            for a in range(len(indices)):
-                i = indices[a]
-                for b in range(a + 1, len(indices)):
-                    j = indices[b]
-                    if find(i) == find(j):
-                        continue
-                    intersection = len(tag_sets[i] & tag_sets[j])
-                    union_size = len(tag_sets[i] | tag_sets[j])
-                    if intersection / max(union_size, 1) >= sim_threshold:
-                        union(i, j)
+        for r in rows:
+            merge(r["tag_a_id"], r["tag_b_id"])
 
-        clusters: dict[int, list[SynchronicityEvent]] = defaultdict(list)
-        for i in range(n):
-            clusters[find(i)].append(events[i])
+        components: dict[int, set[int]] = defaultdict(set)
+        for t in tag_ids:
+            components[find(t)].add(t)
 
-        return list(clusters.values())
+        return list(components.values())
 
     def _evaluate_cluster(
         self,
         cluster: list[SynchronicityEvent],
         total_events: int,
         total_tags: int,
+        subgraph_tags: set[int],
     ) -> MetaPattern | None:
         """Evaluate whether a cluster constitutes a meta-pattern."""
         n = len(cluster)
         if n < self._config.meta_min_sync_events:
             return None
 
-        # Compute the cluster's tag share
         all_cluster_tags: set[int] = set()
         for e in cluster:
             all_cluster_tags.update(json.loads(e.involved_tags))
@@ -206,8 +244,6 @@ class MetaAnalyzer:
             return None
 
         tag_share = len(all_cluster_tags) / total_tags
-
-        # Expected count under uniform distribution
         expected = max(total_events * tag_share, 0.01)
         ratio = n / expected
 
@@ -215,22 +251,24 @@ class MetaAnalyzer:
         if ratio < threshold:
             return None
 
-        # Cross-domain validation
-        tag_clusters = self._get_tag_clusters(all_cluster_tags)
-        is_cross_domain = len(tag_clusters) >= self._config.meta_cross_domain_min_clusters
+        # Cross-domain: check if the subgraph itself spans multiple
+        # disconnected tensor neighborhoods (use centroid_edges as
+        # a finer-grained view within the subgraph).
+        inner_clusters = self._get_tag_clusters(subgraph_tags)
+        is_cross_domain = len(inner_clusters) >= self._config.meta_cross_domain_min_clusters
 
         if is_cross_domain:
             pattern_type = "cross_domain_theme"
             confidence = min(1.0, ratio / (threshold * 2))
         else:
             pattern_type = "recurring_sync"
-            confidence = min(1.0, ratio / (threshold * 3))  # Require stronger signal
+            confidence = min(1.0, ratio / (threshold * 3))
 
         sync_ids = [e.id for e in cluster if e.id is not None]
-        tag_cluster_list = [list(tc) for tc in tag_clusters]
+        tag_cluster_list = [list(tc) for tc in inner_clusters]
 
         return MetaPattern(
-            description=self._describe_pattern(cluster, tag_clusters, ratio),
+            description=self._describe_pattern(cluster, inner_clusters, ratio),
             pattern_type=pattern_type,
             confidence=confidence,
             involved_sync_ids=json.dumps(sync_ids),
@@ -256,7 +294,7 @@ class MetaAnalyzer:
             SELECT tag_a_id, tag_b_id FROM centroid_edges
             WHERE tag_a_id IN ({placeholders})
               AND tag_b_id IN ({placeholders})
-              AND strength > 0.05
+              AND edge_strength > 0.05
             """,
             (*tag_list, *tag_list),
         ).fetchall()

@@ -152,6 +152,7 @@ class MemoryStore:
         query: str,
         top_k: int | None = None,
         tag_filter: list[str] | None = None,
+        query_vec=None,
     ) -> list[tuple[Memory, float]]:
         """Retrieve memories by semantic similarity.
 
@@ -161,7 +162,8 @@ class MemoryStore:
         post-filtered with oversampling to compensate.
         """
         k = top_k or self._config.max_retrieval_results
-        query_vec = self._embedding.embed(query)
+        if query_vec is None:
+            query_vec = self._embedding.embed(query)
 
         # Tag-filtered path: over-fetch then post-filter
         if tag_filter:
@@ -236,56 +238,108 @@ class MemoryStore:
         top_k: int | None = None,
     ) -> list[tuple[Memory, float]]:
         """Hybrid retrieval combining semantic similarity and tag matching."""
+        import time as _time
+        _t = {}
+        _t0 = _time.perf_counter()
+
         k = top_k or self._config.max_retrieval_results
         w_sem = self._config.hybrid_semantic_weight
         w_tag = self._config.hybrid_tag_weight
 
-        # Semantic scores
-        semantic_results = self.retrieve_semantic(query, top_k=k * 3)
+        query_vec = self._embedding.embed(query)
+        _t["embed"] = _time.perf_counter() - _t0
+
+        _s = _time.perf_counter()
+        semantic_results = self.retrieve_semantic(query, top_k=k * 3, query_vec=query_vec)
+        _t["semantic_search"] = _time.perf_counter() - _s
         scores: dict[str, float] = {}
+        components: dict[str, dict[str, float]] = {}
         for mem, sim in semantic_results:
-            scores[mem.id] = w_sem * sim
+            sem_val = w_sem * sim
+            scores[mem.id] = sem_val
+            components[mem.id] = {"semantic": sem_val, "tag": 0.0, "lattice": 0.0, "glyph": 0.0}
 
-        # Tag scores (if tags provided): semantic search filtered to tagged
-        # memories so tag matches are re-ranked by relevance, not flat 1.0.
         if tags:
-            tag_semantic = self.retrieve_semantic(query, top_k=k, tag_filter=tags)
+            _s = _time.perf_counter()
+            tag_semantic = self.retrieve_semantic(query, top_k=k, tag_filter=tags, query_vec=query_vec)
+            _t["tag_search"] = _time.perf_counter() - _s
             for mem, sim in tag_semantic:
-                scores[mem.id] = scores.get(mem.id, 0.0) + w_tag * sim
+                tag_val = w_tag * sim
+                scores[mem.id] = scores.get(mem.id, 0.0) + tag_val
+                if mem.id not in components:
+                    components[mem.id] = {"semantic": 0.0, "tag": 0.0, "lattice": 0.0, "glyph": 0.0}
+                components[mem.id]["tag"] = tag_val
 
-        # Lattice resonance boost for structurally connected dormant memories
         if self._sync_engine and self._config.lattice_retrieval_boost_enabled:
             top5_ids = [mem.id for mem, _ in semantic_results[:5]]
-            tag_ids_map = self._tags.get_tag_ids_for_memories(top5_ids)
+            candidate_ids = [mem.id for mem, _ in semantic_results]
+
+            _s = _time.perf_counter()
+            # Context tags from top 5 (for tensor lookup)
+            ctx_tag_map = self._tags.get_tag_ids_for_memories(top5_ids)
             context_tag_ids: set[int] = set()
-            for tids in tag_ids_map.values():
+            for tids in ctx_tag_map.values():
                 context_tag_ids.update(tids)
+            # All candidate tags (for scoring against partner tags)
+            candidate_tag_map = self._tags.get_tag_ids_for_memories(candidate_ids)
+            _t["tag_id_lookup"] = _time.perf_counter() - _s
 
             if context_tag_ids:
                 ctx_list = list(context_tag_ids)
+
+                _s = _time.perf_counter()
                 resonant = self._sync_engine.get_resonant_memory_ids_fast(
                     ctx_list,
+                    candidate_memory_ids=candidate_ids,
+                    candidate_tag_ids_map=candidate_tag_map,
+                    seed_memory_ids=top5_ids,
                 )
+                _t["resonant_lookup"] = _time.perf_counter() - _s
+                _t["resonant_count"] = len(resonant)
+                _t["context_tag_count"] = len(ctx_list)
+
                 w_lattice = self._config.lattice_retrieval_boost_weight
                 for mid, strength in resonant:
                     scores[mid] = scores.get(mid, 0.0) + w_lattice * strength
+                    if mid in components:
+                        components[mid]["lattice"] = w_lattice * strength
 
-                # Glyph association boost: traverse glyph tensor edges
                 w_glyph_ret = self._config.glyph_retrieval_boost_weight
                 if w_glyph_ret > 0:
+                    _s = _time.perf_counter()
                     glyph_assoc = self._sync_engine.get_glyph_association_scores(
                         ctx_list,
                     )
+                    _t["glyph_assoc"] = _time.perf_counter() - _s
+                    _t["glyph_assoc_count"] = len(glyph_assoc)
                     for mid, strength in glyph_assoc:
                         scores[mid] = scores.get(mid, 0.0) + w_glyph_ret * strength
+                        if mid in components:
+                            components[mid]["glyph"] = w_glyph_ret * strength
 
-        # Sort and return top-k, batch-load memories
+        _s = _time.perf_counter()
         sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
         if not sorted_ids:
+            _t["total"] = _time.perf_counter() - _t0
+            import logging
+            logging.getLogger("chicory.hybrid").info("hybrid_timing: %s", _t)
+            self._last_hybrid_timing = _t
+            self._last_score_components = {}
             return []
         top_ids = [mid for mid, _ in sorted_ids]
         score_map = dict(sorted_ids)
         memories = self._get_by_ids(top_ids)
+        _t["load_memories"] = _time.perf_counter() - _s
+        _t["total"] = _time.perf_counter() - _t0
+
+        import logging
+        logging.getLogger("chicory.hybrid").info("hybrid_timing: %s", _t)
+        self._last_hybrid_timing = _t
+        self._last_score_components = {
+            mid: {**components.get(mid, {}), "total": score_map[mid]}
+            for mid in top_ids if mid in memories
+        }
+
         return [(memories[mid], score_map[mid]) for mid in top_ids if mid in memories]
 
     def list_recent(self, limit: int = 20) -> list[Memory]:

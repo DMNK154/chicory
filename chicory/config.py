@@ -148,6 +148,10 @@ class ChicoryConfig(BaseModel):
     # Context tag limit — how many tags to include in the system prompt
     context_tag_limit: int = Field(default=30)
 
+    # Resonance retrieval — minimum association strengths
+    resonance_min_tensor_score: float = Field(default=0.3)
+    resonance_min_edge_strength: float = Field(default=0.3)
+
     # Centroid sub-graph — retrieval-driven reweighting
     centroid_ema_alpha: float = Field(default=0.1)
     centroid_edge_ema_alpha: float = Field(default=0.15)
@@ -221,6 +225,13 @@ class ChicoryConfig(BaseModel):
     commons_project_id: str = Field(default="")
     commons_signal_buffer_size: int = Field(default=10)
     commons_flush_interval_seconds: float = Field(default=5.0)
+
+    # Diagnostics — activation trace + context logging
+    context_log_enabled: bool = Field(default=True)
+    context_log_dir: Path = Field(
+        default_factory=lambda: Path.home() / ".chicory" / "logs"
+    )
+    context_log_full: bool = Field(default=False)
 
 
 def load_config(**overrides) -> ChicoryConfig:

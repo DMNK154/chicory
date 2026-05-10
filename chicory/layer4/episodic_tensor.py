@@ -1,4 +1,4 @@
-"""Episodic relational tensor: sparse, forest-scoped, lazy-cached memory edges.
+"""Episodic relational tensor: episode-scoped, tag-variance-driven memory edges.
 
 The tag tensor is global because tags are few and abstract.
 The episodic tensor is local and episodic because memories are many and concrete.
@@ -6,20 +6,16 @@ The episodic tensor is local and episodic because memories are many and concrete
 Tag tensor:  "How do concepts relate globally?"
 Episodic tensor: "Why did these two specific memories become meaningfully adjacent?"
 
-Gateway creation rules — a pair is materialized only when:
-  1. semantic_similarity(A, B) >= similarity_threshold
-  2. co_retrieved(A, B)
-  3. same_forest_block(A, B)
-  4. tag_projected_affinity(A, B) >= episodic_tag_affinity_threshold
-
-Cheap fields are computed eagerly at creation.
-Expensive fields (supersession, contradiction, narrative) are filled lazily.
+Candidate discovery is scoped by temporal episodes: within each episode,
+pairwise semantic similarity (matrix multiply) identifies the top-K
+neighbors per memory.  Tag tensor projection scores the edges across
+all channels (semantic, synchronicity, co-occurrence, glyph, inhibition).
+Co-retrieval strength accumulates incrementally via activate_edge.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -41,14 +37,16 @@ class EpisodicTensor:
     # Bulk bootstrap: build the tensor from existing data
     # ------------------------------------------------------------------
 
+    _NEIGHBORS_K = 48
+
     def bootstrap(self, batch_size: int = 500) -> int:
         """Build the episodic tensor from existing memories.
 
-        Gateways:
-          1. FAISS top-K semantic neighbors
-          2. Co-retrieval pairs
-          3. Same forest block membership
-          4. High tag-projected affinity
+        Scopes candidate discovery by temporal episode: within each
+        episode, computes pairwise semantic similarity via matrix
+        multiply and keeps the top-K neighbors per memory.  Tag tensor
+        projection scores the edges.  Co-retrieval strength accumulates
+        incrementally via activate_edge on retrieval.
 
         Returns total edges created.
         """
@@ -60,128 +58,103 @@ class EpisodicTensor:
 
         log.info("Episodic tensor: %d memories with embeddings", len(mem_ids))
 
-        candidates: set[tuple[str, str]] = set()
-
-        # Gateway 1: FAISS semantic neighbors above similarity_threshold
-        log.info("Gateway 1: FAISS semantic (threshold=%.2f)...", self._cfg.similarity_threshold)
-        sem_pairs = self._gateway_semantic(mem_ids, vectors)
-        candidates.update(sem_pairs)
-        log.info("  %d pairs from semantic threshold", len(sem_pairs))
-
-        # Gateway 2: Co-retrieval pairs
-        log.info("Gateway 2: co-retrieval pairs...")
-        coret_pairs = self._gateway_co_retrieval()
-        candidates.update(coret_pairs)
-        log.info("  %d pairs from co-retrieval", len(coret_pairs))
-
-        # Gateway 3: Same forest block
-        log.info("Gateway 3: same forest block...")
-        block_pairs = self._gateway_same_block()
-        candidates.update(block_pairs)
-        log.info("  %d pairs from forest blocks", len(block_pairs))
-
-        # Tag tensor data contributes to edge scores via tag_projected_strength
-        # in _compute_eager_fields — no separate candidate gateway needed.
-
-        log.info("Total unique candidate pairs: %d", len(candidates))
-
-        # Build lookup structures for eager field computation
         id_to_idx = {mid: i for i, mid in enumerate(mem_ids)}
         mem_tags = self._load_all_memory_tags()
         tag_tensor = self._load_tag_tensor_cache(mem_tags)
         mem_times = self._load_memory_timestamps()
         mem_sources = self._load_memory_sources()
-        coret_counts = self._load_co_retrieval_counts()
 
-        # Compute eager fields and insert in batches
+        episodes = self._load_episode_members()
+        if not episodes:
+            log.info("No episode assignments — using global top-K fallback")
+            episodes = {0: mem_ids}
+
+        total_edges = 0
+        for ep_idx, (ep_id, member_ids) in enumerate(episodes.items()):
+            ep_members = [m for m in member_ids if m in id_to_idx]
+            if len(ep_members) < 2:
+                continue
+
+            edges = self._process_episode(
+                ep_members, id_to_idx, vectors, mem_tags, tag_tensor,
+                mem_times, mem_sources, batch_size,
+            )
+            total_edges += edges
+
+            if (ep_idx + 1) % 20 == 0:
+                log.info("  processed %d / %d episodes (%d edges)",
+                         ep_idx + 1, len(episodes), total_edges)
+
+        self.prune()
+
+        final = self._db.execute(
+            "SELECT COUNT(*) as c FROM memory_relational_tensor "
+            "WHERE edge_status != 'archived'"
+        ).fetchone()["c"]
+        log.info("Episodic tensor bootstrap: %d active edges", final)
+        return final
+
+    def _load_episode_members(self) -> dict[int, list[str]]:
+        rows = self._db.execute(
+            "SELECT memory_id, episode_id FROM memory_episode_assignments"
+        ).fetchall()
+        episodes: dict[int, list[str]] = {}
+        for r in rows:
+            episodes.setdefault(r["episode_id"], []).append(r["memory_id"])
+        return episodes
+
+    def _process_episode(
+        self,
+        ep_members: list[str],
+        id_to_idx: dict[str, int],
+        vectors: np.ndarray,
+        mem_tags: dict[str, list[int]],
+        tag_tensor: dict[tuple[int, int], dict],
+        mem_times: dict[str, str],
+        mem_sources: dict[str, str],
+        batch_size: int,
+    ) -> int:
+        """Discover and score candidate edges within one episode."""
+        indices = np.array([id_to_idx[m] for m in ep_members])
+        ep_vectors = vectors[indices]
+        n = len(ep_members)
+        k = min(self._NEIGHBORS_K, n - 1)
+        threshold = self._cfg.similarity_threshold
+
+        sim_matrix = ep_vectors @ ep_vectors.T
+        np.fill_diagonal(sim_matrix, -1.0)
+
+        candidates: set[tuple[str, str]] = set()
+        for i in range(n):
+            row = sim_matrix[i]
+            top_k = np.argpartition(row, -k)[-k:]
+            for j in top_k:
+                if row[int(j)] < threshold:
+                    continue
+                a = min(ep_members[i], ep_members[int(j)])
+                b = max(ep_members[i], ep_members[int(j)])
+                candidates.add((a, b))
+
         rows: list[tuple] = []
+        edge_count = 0
         for a, b in candidates:
             edge = self._compute_eager_fields(
                 a, b, id_to_idx, vectors, mem_tags, tag_tensor,
-                mem_times, mem_sources, coret_counts,
+                mem_times, mem_sources,
             )
             if edge is not None:
                 rows.append(edge)
 
             if len(rows) >= batch_size:
                 self._batch_insert(rows)
+                edge_count += len(rows)
                 rows.clear()
 
         if rows:
             self._batch_insert(rows)
+            edge_count += len(rows)
 
-        prune_stats = self.prune()
-
-        total = self._db.execute(
-            "SELECT COUNT(*) as c FROM memory_relational_tensor WHERE edge_status != 'archived'"
-        ).fetchone()["c"]
-        log.info(
-            "Episodic tensor bootstrap complete: %d active edges (pruned %d weak)",
-            total, prune_stats["weak_pruned"],
-        )
-        return total
-
-    # ------------------------------------------------------------------
-    # Gateway methods
-    # ------------------------------------------------------------------
-
-    def _gateway_semantic(
-        self, mem_ids: list[str], vectors: np.ndarray,
-    ) -> set[tuple[str, str]]:
-        """Find semantic neighbors above similarity_threshold via FAISS."""
-        import faiss
-
-        threshold = self._cfg.similarity_threshold
-        n, dim = vectors.shape
-
-        if n < 78:
-            index = faiss.IndexFlatIP(dim)
-        else:
-            nlist = max(1, int(math.sqrt(n)))
-            quantizer = faiss.IndexFlatIP(dim)
-            index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
-            index.train(vectors)
-            index.nprobe = min(8, nlist)
-
-        index.add(vectors)
-
-        lims, D, I = index.range_search(vectors, threshold)
-
-        pairs: set[tuple[str, str]] = set()
-        for i in range(n):
-            for pos in range(lims[i], lims[i + 1]):
-                j = int(I[pos])
-                if j == i:
-                    continue
-                a, b = mem_ids[i], mem_ids[j]
-                pairs.add((min(a, b), max(a, b)))
-
-        return pairs
-
-    def _gateway_co_retrieval(self) -> set[tuple[str, str]]:
-        rows = self._db.execute(
-            """SELECT r1.memory_id as a, r2.memory_id as b
-               FROM retrieval_results r1
-               JOIN retrieval_results r2
-                 ON r1.retrieval_id = r2.retrieval_id
-                AND r1.memory_id < r2.memory_id
-               GROUP BY r1.memory_id, r2.memory_id
-               HAVING COUNT(*) >= 1"""
-        ).fetchall()
-        return {(r["a"], r["b"]) for r in rows}
-
-    def _gateway_same_block(self) -> set[tuple[str, str]]:
-        rows = self._db.execute(
-            """SELECT bm1.target_id as a, bm2.target_id as b
-               FROM block_memberships bm1
-               JOIN block_memberships bm2
-                 ON bm1.block_id = bm2.block_id
-                AND bm1.target_type = 'memory'
-                AND bm2.target_type = 'memory'
-                AND bm1.target_id < bm2.target_id
-               GROUP BY bm1.target_id, bm2.target_id"""
-        ).fetchall()
-        return {(r["a"], r["b"]) for r in rows}
+        return edge_count
 
 
     # ------------------------------------------------------------------
@@ -198,9 +171,7 @@ class EpisodicTensor:
         tag_tensor: dict[tuple[int, int], dict],
         mem_times: dict[str, str],
         mem_sources: dict[str, str],
-        coret_counts: dict[tuple[str, str], int],
     ) -> tuple | None:
-        # Semantic strength (cosine similarity from embeddings)
         idx_a = id_to_idx.get(a)
         idx_b = id_to_idx.get(b)
         if idx_a is not None and idx_b is not None:
@@ -208,7 +179,6 @@ class EpisodicTensor:
         else:
             semantic = 0.0
 
-        # Tag-projected strengths (multiplex projection from tag tensor)
         tags_a = set(mem_tags.get(a, []))
         tags_b = set(mem_tags.get(b, []))
 
@@ -236,38 +206,29 @@ class EpisodicTensor:
 
         tag_projected = tag_sem + tag_sync + tag_cooc + tag_glyph - tag_inhib
 
-        # Temporal proximity (exponential decay)
         time_a = mem_times.get(a, "")
         time_b = mem_times.get(b, "")
         temporal = self._temporal_proximity(time_a, time_b)
 
-        # Source proximity (same source_model = 1.0)
         src_a = mem_sources.get(a, "")
         src_b = mem_sources.get(b, "")
         source_prox = 1.0 if src_a and src_b and src_a == src_b else 0.0
 
-        # Co-retrieval strength
-        coret = coret_counts.get((a, b), 0)
-        co_retrieval = min(1.0, coret / 5.0) if coret > 0 else 0.0
-
-        # Bridge strength: connected but spanning different tag domains
         if tags_a and tags_b:
             jaccard = len(tags_a & tags_b) / len(tags_a | tags_b)
         else:
             jaccard = 0.0
         tag_distance = 1.0 - jaccard
-        connection = max(semantic, co_retrieval)
-        bridge = connection * tag_distance
+        bridge = semantic * tag_distance
 
-        composite = semantic + tag_projected + co_retrieval + bridge
+        composite = semantic + tag_projected + bridge
         if composite < self._cfg.episodic_min_edge_strength:
             return None
 
         return (
             a, b,
-            semantic, tag_projected, co_retrieval, temporal, source_prox,
+            semantic, tag_projected, 0.0, temporal, source_prox,
             tag_sem, tag_sync, tag_cooc, tag_inhib, tag_glyph,
-            # lazy fields
             0.0, 0.0, 0.0, 0, 0.0, bridge,
             0, "candidate",
         )
@@ -281,7 +242,7 @@ class EpisodicTensor:
             tb = datetime.fromisoformat(time_b.replace("Z", "+00:00"))
             hours_apart = abs((ta - tb).total_seconds()) / 3600.0
             halflife = self._cfg.episodic_temporal_halflife_hours
-            return math.exp(-0.693 * hours_apart / halflife)
+            return float(np.exp(-0.693 * hours_apart / halflife))
         except (ValueError, TypeError):
             return 0.0
 
@@ -385,26 +346,20 @@ class EpisodicTensor:
         ).fetchall()
         return {r["id"]: r["source_model"] for r in rows}
 
-    def _load_co_retrieval_counts(self) -> dict[tuple[str, str], int]:
-        rows = self._db.execute(
-            """SELECT r1.memory_id as a, r2.memory_id as b, COUNT(*) as cnt
-               FROM retrieval_results r1
-               JOIN retrieval_results r2
-                 ON r1.retrieval_id = r2.retrieval_id
-                AND r1.memory_id < r2.memory_id
-               GROUP BY r1.memory_id, r2.memory_id"""
-        ).fetchall()
-        return {(r["a"], r["b"]): r["cnt"] for r in rows}
 
     # ------------------------------------------------------------------
     # Incremental update (for orchestrator integration)
     # ------------------------------------------------------------------
 
     def update_on_store(self, memory_id: str) -> int:
-        """Create candidate edges for a newly stored memory."""
+        """Create candidate edges for a newly stored memory.
+
+        Scoped to the memory's temporal episode — only compares against
+        episode-mates rather than the entire database.
+        """
         row = self._db.execute(
-            """SELECT embedding, dimension FROM embeddings
-               WHERE memory_id = ? AND chunk_index = 0""",
+            "SELECT embedding, dimension FROM embeddings "
+            "WHERE memory_id = ? AND chunk_index = 0",
             (memory_id,),
         ).fetchone()
         if not row:
@@ -414,31 +369,89 @@ class EpisodicTensor:
         norm = np.linalg.norm(vec)
         if norm > 0:
             vec /= norm
+        dim = row["dimension"]
 
-        mem_ids, vectors = self._load_all_embeddings()
-        if len(mem_ids) == 0:
+        ep_row = self._db.execute(
+            "SELECT episode_id FROM memory_episode_assignments "
+            "WHERE memory_id = ? ORDER BY assigned_at DESC LIMIT 1",
+            (memory_id,),
+        ).fetchone()
+        if not ep_row:
             return 0
 
-        scores = vectors @ vec
-        threshold = self._cfg.similarity_threshold
-        above = np.where(scores >= threshold)[0]
+        mates = self._db.execute(
+            "SELECT memory_id FROM memory_episode_assignments "
+            "WHERE episode_id = ? AND memory_id != ?",
+            (ep_row["episode_id"], memory_id),
+        ).fetchall()
+        mate_ids = [r["memory_id"] for r in mates]
+        if not mate_ids:
+            return 0
 
-        id_to_idx = {mid: i for i, mid in enumerate(mem_ids)}
-        mem_tags = self._load_all_memory_tags()
+        ph = ",".join("?" * len(mate_ids))
+        emb_rows = self._db.execute(
+            f"SELECT memory_id, embedding FROM embeddings "
+            f"WHERE memory_id IN ({ph}) AND chunk_index = 0",
+            mate_ids,
+        ).fetchall()
+        if not emb_rows:
+            return 0
+
+        mate_mem_ids = [r["memory_id"] for r in emb_rows]
+        mate_vectors = np.vstack([
+            np.frombuffer(r["embedding"], dtype=np.float32).reshape(1, -1)
+            for r in emb_rows
+        ])
+        norms = np.linalg.norm(mate_vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        mate_vectors /= norms
+
+        scores = (mate_vectors @ vec).ravel()
+        threshold = self._cfg.similarity_threshold
+        k = min(self._NEIGHBORS_K, len(scores))
+        top_k = np.argpartition(scores, -k)[-k:]
+        above = [int(i) for i in top_k if scores[int(i)] >= threshold]
+
+        if not above:
+            return 0
+
+        all_ids = [memory_id] + [mate_mem_ids[i] for i in above]
+        all_vecs = np.vstack([vec.reshape(1, -1)] + [
+            mate_vectors[i].reshape(1, -1) for i in above
+        ])
+        id_to_idx = {mid: i for i, mid in enumerate(all_ids)}
+
+        scope_ph = ",".join("?" * len(all_ids))
+        tag_rows = self._db.execute(
+            f"SELECT memory_id, tag_id FROM memory_tags "
+            f"WHERE memory_id IN ({scope_ph})",
+            all_ids,
+        ).fetchall()
+        mem_tags: dict[str, list[int]] = {}
+        for r in tag_rows:
+            mem_tags.setdefault(r["memory_id"], []).append(r["tag_id"])
+
         tag_tensor = self._load_tag_tensor_cache(mem_tags)
-        mem_times = self._load_memory_timestamps()
-        mem_sources = self._load_memory_sources()
-        coret_counts = self._load_co_retrieval_counts()
+
+        time_rows = self._db.execute(
+            f"SELECT id, created_at FROM memories WHERE id IN ({scope_ph})",
+            all_ids,
+        ).fetchall()
+        mem_times = {r["id"]: r["created_at"] for r in time_rows}
+
+        src_rows = self._db.execute(
+            f"SELECT id, source_model FROM memories WHERE id IN ({scope_ph})",
+            all_ids,
+        ).fetchall()
+        mem_sources = {r["id"]: r["source_model"] for r in src_rows}
 
         rows: list[tuple] = []
         for idx in above:
-            other = mem_ids[int(idx)]
-            if other == memory_id:
-                continue
+            other = mate_mem_ids[idx]
             a, b = min(memory_id, other), max(memory_id, other)
             edge = self._compute_eager_fields(
-                a, b, id_to_idx, vectors, mem_tags, tag_tensor,
-                mem_times, mem_sources, coret_counts,
+                a, b, id_to_idx, all_vecs, mem_tags, tag_tensor,
+                mem_times, mem_sources,
             )
             if edge is not None:
                 rows.append(edge)

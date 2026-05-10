@@ -177,4 +177,16 @@ CHICORY_TOOLS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "get_last_trace",
+        "description": (
+            "Get the activation trace from the most recent retrieval. "
+            "Shows top tag activations with strengths, per-memory score "
+            "breakdowns (semantic, tag, lattice, glyph), and timing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
