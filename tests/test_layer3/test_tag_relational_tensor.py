@@ -567,6 +567,13 @@ class TestSemioticLayer:
         for i in range(8):
             _create_memory(db, emb, f"mb{i}", f"common content {i}", [tag_b.id])
 
+        a, b = min(tag_a.id, tag_b.id), max(tag_a.id, tag_b.id)
+        db.execute(
+            "INSERT OR IGNORE INTO glyph_resonances (tag_a_id, tag_b_id, shared_primes, resonance_strength) "
+            "VALUES (?, ?, 3, 1.0)", (a, b),
+        )
+        db.connection.commit()
+
         count = engine.update_semiotic_tensor()
         assert count > 0
 
@@ -604,6 +611,17 @@ class TestSemioticLayer:
         _create_memory(db, emb, "m1", "content one", [tag_a.id, tag_b.id])
         _create_memory(db, emb, "m2", "content two", [tag_a.id, tag_b.id])
 
+        a, b = min(tag_a.id, tag_b.id), max(tag_a.id, tag_b.id)
+        db.execute(
+            "INSERT OR IGNORE INTO glyph_resonances (tag_a_id, tag_b_id, shared_primes, resonance_strength) "
+            "VALUES (?, ?, 3, 1.0)", (a, b),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO centroid_edges (tag_a_id, tag_b_id, edge_strength, co_retrieval_count) "
+            "VALUES (?, ?, 1.0, 1)", (a, b),
+        )
+        db.connection.commit()
+
         # Populate only semiotic (set other weights to 0)
         engine.update_semiotic_tensor()
 
@@ -617,7 +635,16 @@ class TestSemioticLayer:
         config.tensor_semantic_weight = 0.0
         config.tensor_semiotic_weight = 1.0
 
-        results = engine.get_resonant_memory_ids_fast([tag_a.id])
+        candidate_ids = ["m1", "m2"]
+        candidate_tag_map = {
+            "m1": [tag_a.id, tag_b.id],
+            "m2": [tag_a.id, tag_b.id],
+        }
+        results = engine.get_resonant_memory_ids_fast(
+            [tag_a.id],
+            candidate_memory_ids=candidate_ids,
+            candidate_tag_ids_map=candidate_tag_map,
+        )
         # Should find memories through semiotic linkage
         if _get_tensor_rows(db):
             assert len(results) > 0
@@ -642,6 +669,17 @@ class TestSemioticLayer:
         for i in range(8):
             _create_memory(db, emb, f"mc{i}", f"common only {i}", [tag_b.id])
 
+        a, b = min(tag_a.id, tag_b.id), max(tag_a.id, tag_b.id)
+        db.execute(
+            "INSERT OR IGNORE INTO glyph_resonances (tag_a_id, tag_b_id, shared_primes, resonance_strength) "
+            "VALUES (?, ?, 3, 1.0)", (a, b),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO centroid_edges (tag_a_id, tag_b_id, edge_strength, co_retrieval_count) "
+            "VALUES (?, ?, 1.0, 1)", (a, b),
+        )
+        db.connection.commit()
+
         engine.update_semiotic_tensor()
 
         # Use semiotic-only weighting
@@ -650,8 +688,19 @@ class TestSemioticLayer:
         config.tensor_semantic_weight = 0.0
         config.tensor_semiotic_weight = 1.0
 
-        results_from_a = engine.get_resonant_memory_ids_fast([tag_a.id])
-        results_from_b = engine.get_resonant_memory_ids_fast([tag_b.id])
+        all_mem_ids = ["m1", "m2"] + [f"mc{i}" for i in range(8)]
+        candidate_tag_map = {"m1": [tag_a.id, tag_b.id], "m2": [tag_a.id, tag_b.id]}
+        for i in range(8):
+            candidate_tag_map[f"mc{i}"] = [tag_b.id]
+
+        results_from_a = engine.get_resonant_memory_ids_fast(
+            [tag_a.id], candidate_memory_ids=all_mem_ids,
+            candidate_tag_ids_map=candidate_tag_map,
+        )
+        results_from_b = engine.get_resonant_memory_ids_fast(
+            [tag_b.id], candidate_memory_ids=all_mem_ids,
+            candidate_tag_ids_map=candidate_tag_map,
+        )
 
         # Both should return results, but scores will differ because
         # P(B|A) = 1.0 but P(A|B) = 0.2
@@ -702,6 +751,13 @@ class TestSemioticLayer:
         _create_memory(db, emb, "m2", "content two", [tag_mid.id, tag_high.id])
         for i in range(3):
             _create_memory(db, emb, f"mh{i}", f"high only {i}", [tag_high.id])
+
+        a, b = min(tag_mid.id, tag_high.id), max(tag_mid.id, tag_high.id)
+        db.execute(
+            "INSERT OR IGNORE INTO glyph_resonances (tag_a_id, tag_b_id, shared_primes, resonance_strength) "
+            "VALUES (?, ?, 3, 1.0)", (a, b),
+        )
+        db.connection.commit()
 
         engine.update_semiotic_tensor()
 
