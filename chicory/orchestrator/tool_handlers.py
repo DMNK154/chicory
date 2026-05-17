@@ -28,6 +28,7 @@ def dispatch_tool_call(
         "get_canopy": _handle_get_canopy,
         "sync_network": _handle_sync_network,
         "get_last_trace": _handle_get_last_trace,
+        "compare_traces": _handle_compare_traces,
     }
 
     handler = handlers.get(tool_name)
@@ -120,3 +121,7 @@ def _handle_sync_network(o: "Orchestrator", inp: dict) -> dict:
 
 def _handle_get_last_trace(o: "Orchestrator", inp: dict) -> dict:
     return o.handle_get_last_trace()
+
+
+def _handle_compare_traces(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_compare_traces()

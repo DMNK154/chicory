@@ -31,33 +31,35 @@ class BridgeOptimizer:
 
         touched_blocks = []
         for key in touched_block_keys:
-            row = self._db.execute(
+            row = self._db.query_one(
                 "SELECT id, block_key, internal_density FROM forest_blocks WHERE block_key=?",
                 (key,),
-            ).fetchone()
+            )
             if row:
                 touched_blocks.append(row)
 
         if not touched_blocks:
             return 0
 
-        all_blocks = self._db.execute(
+        all_blocks = self._db.query(
             "SELECT id, block_key, internal_density FROM forest_blocks"
-        ).fetchall()
+        )
 
         block_members: dict[int, set[str]] = {}
         for block in all_blocks:
-            rows = self._db.execute(
+            rows = self._db.query(
                 "SELECT target_type, target_id FROM block_memberships WHERE block_id=? AND target_type='tag'",
                 (block["id"],),
-            ).fetchall()
-            block_members[block["id"]] = {r["target_id"] for r in rows}
+            )
+            block_members[block["id"]] = {r["target_id"] for r in rows if r["target_id"]}
 
         block_degree: dict[int, int] = {}
         for block in all_blocks:
             block_degree[block["id"]] = len(block_members.get(block["id"], set()))
 
         median_degree = sorted(block_degree.values())[len(block_degree) // 2] if block_degree else 1
+
+        directional_scores = self._load_directional_scores()
 
         upserted = 0
         max_per_block = self._cfg.canopy_bridge_max_per_block
@@ -86,10 +88,14 @@ class BridgeOptimizer:
                 cluster_dist = self._cluster_distance(t_members, o_members)
                 rarity = self._rarity_bonus(t_members, o_members)
 
+                t_dir = directional_scores.get(tid, (0.0, 0.0))
+                o_dir = directional_scores.get(oid, (0.0, 0.0))
                 hub_pen = self._hub_penalty(
                     block_degree.get(tid, 0),
                     block_degree.get(oid, 0),
                     median_degree,
+                    inflow_a=t_dir[0], inflow_b=o_dir[0],
+                    outflow_a=t_dir[1], outflow_b=o_dir[1],
                 )
 
                 bridge = conn * cluster_dist * rarity * hub_pen
@@ -170,8 +176,6 @@ class BridgeOptimizer:
 
     def _connection_strength(self, members_a: set[str], members_b: set[str]) -> float:
         """Retrieval co-activation and shared tag overlap."""
-        members_a = {m for m in members_a if m is not None}
-        members_b = {m for m in members_b if m is not None}
         shared = members_a & members_b
         union = members_a | members_b
         if not union:
@@ -209,7 +213,7 @@ class BridgeOptimizer:
 
     def _rarity_bonus(self, members_a: set[str], members_b: set[str]) -> float:
         """Reward non-generic crossings. Inverse of average tag frequency."""
-        all_tags = list(members_a | members_b)
+        all_tags = [t for t in members_a | members_b if t]
         if not all_tags:
             return 1.0
 
@@ -228,12 +232,40 @@ class BridgeOptimizer:
         avg_freq = sum(freqs) / len(freqs) if freqs else 0.5
         return 1.0 / (1.0 + avg_freq * 10)
 
-    def _hub_penalty(self, degree_a: int, degree_b: int, median_degree: int) -> float:
-        """Penalize generic hub nodes. Penalty increases with degree above median."""
+    def _load_directional_scores(self) -> dict[int, tuple[float, float]]:
+        """Load per-block (inflow_score, outflow_score) from directional canopy."""
+        rows = self._db.query(
+            "SELECT block_id, inflow_score, outflow_score "
+            "FROM directional_block_scores"
+        )
+        return {r["block_id"]: (r["inflow_score"], r["outflow_score"]) for r in rows}
+
+    def _hub_penalty(
+        self,
+        degree_a: int,
+        degree_b: int,
+        median_degree: int,
+        inflow_a: float = 0.0,
+        inflow_b: float = 0.0,
+        outflow_a: float = 0.0,
+        outflow_b: float = 0.0,
+    ) -> float:
+        """Penalize generic hub nodes, rescue genuine attractors/distributors.
+
+        Degree-based penalty is partially rescued by directional canopy
+        scores: high-inflow blocks are convergence attractors, high-outflow
+        blocks are distributors bridging distant regions.
+        """
         if median_degree <= 0:
             median_degree = 1
         max_degree = max(degree_a, degree_b)
         if max_degree <= median_degree:
-            return 1.0
-        excess = (max_degree - median_degree) / median_degree
-        return 1.0 / (1.0 + self._cfg.canopy_bridge_hub_penalty * excess)
+            degree_penalty = 1.0
+        else:
+            excess = (max_degree - median_degree) / median_degree
+            degree_penalty = 1.0 / (1.0 + self._cfg.canopy_bridge_hub_penalty * excess)
+
+        inflow_rescue = 1.0 + self._cfg.canopy_directional_inflow_rescue_weight * max(inflow_a, inflow_b)
+        outflow_rescue = 1.0 + self._cfg.canopy_directional_outflow_rescue_weight * max(outflow_a, outflow_b)
+
+        return degree_penalty * inflow_rescue * outflow_rescue

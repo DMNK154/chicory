@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -37,6 +38,88 @@ from chicory.bench.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Question classification & document drill-down ──────────────────
+
+_DETAIL_PATTERNS = [
+    re.compile(r"\bwhat (?:is|are|was|were) the (?:default|exact|specific|target|recommended)\b", re.I),
+    re.compile(r"\bwhat (?:is|are|was|were) the (?:name|metric|threshold|limit|percentage|duration|period|value|score|count|number|size|rate|cost|price|fee|credit)\b", re.I),
+    re.compile(r"\bhow (?:long|many|much|often)\b", re.I),
+    re.compile(r"\bwhat (?:percentage|ratio|fraction|proportion)\b", re.I),
+    re.compile(r"\bwhat (?:device|mode|version|firmware|configuration|setting)\b", re.I),
+    re.compile(r"\bwhat (?:metric|counter|gauge|alert)\b", re.I),
+    re.compile(r"\b(?:percentage|percent|latency|threshold|timeout|limit|credit|fee|price|cost|budget|cap)\w*\b.*\b(?:propos|specif|set|target|report|observ|measur)", re.I),
+    re.compile(r"\b(?:root cause|misconfiguration|bug|error|failure mode)\b", re.I),
+]
+
+_STOPWORDS = frozenset(
+    "a an the is are was were what which how does did do will would could "
+    "should can may might have has had been being for of in on at to by with "
+    "from and or but not this that these those it its they their them he she "
+    "his her about after before between into through during when where who "
+    "whom whose why new recent specific default current proposed recommended "
+    "according describe".split()
+)
+
+_TERM_SPLIT = re.compile(r"[^a-zA-Z0-9_.\-/]+")
+
+
+def classify_question(question: str) -> tuple[str, list[str]]:
+    """Classify a question as 'detail' or 'broad' and extract search terms.
+
+    Returns (category, terms) where terms are lowercased keywords
+    useful for paragraph-level matching inside retrieved documents.
+    """
+    is_detail = any(p.search(question) for p in _DETAIL_PATTERNS)
+
+    raw_tokens = _TERM_SPLIT.split(question)
+    terms = [
+        t.lower() for t in raw_tokens
+        if len(t) > 2 and t.lower() not in _STOPWORDS
+    ]
+
+    # Preserve multi-word quoted phrases or hyphenated compounds
+    for match in re.finditer(r'"([^"]+)"', question):
+        terms.append(match.group(1).lower())
+
+    return ("detail" if is_detail else "broad"), terms
+
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?;])\s+|\n")
+
+
+def extract_relevant_sections(
+    content: str,
+    terms: list[str],
+    context_lines: int = 0,
+) -> str:
+    """Extract only sentences containing search terms.
+
+    Splits content into sentences, keeps only those with at least one
+    term hit, plus up to `context_lines` neighboring sentences on each
+    side for readability. Returns them in original order.
+    """
+    sentences = [s.strip() for s in _SENTENCE_SPLIT.split(content) if s.strip()]
+    if not sentences or not terms:
+        return content
+
+    hit_indices: set[int] = set()
+    for idx, sent in enumerate(sentences):
+        lower = sent.lower()
+        if any(t in lower for t in terms):
+            hit_indices.add(idx)
+
+    if not hit_indices:
+        return content
+
+    keep: set[int] = set()
+    for idx in hit_indices:
+        for offset in range(-context_lines, context_lines + 1):
+            neighbor = idx + offset
+            if 0 <= neighbor < len(sentences):
+                keep.add(neighbor)
+
+    return " ".join(sentences[i] for i in sorted(keep))
 
 ANSWER_GEN_PROMPT = """\
 You are a helpful and precise assistant that generates answers based on the \
@@ -90,8 +173,14 @@ def format_retrieved_context(
     doc_uuids: list[str],
     uuid_to_memories: dict[str, list[str]],
     db,
+    question_category: str = "broad",
+    search_terms: list[str] | None = None,
 ) -> str:
-    """Load memory content and format as the benchmark's context string."""
+    """Load memory content and format as the benchmark's context string.
+
+    For 'detail' questions, drills down into each document and extracts
+    only the paragraphs most relevant to the search terms.
+    """
     parts: list[str] = []
 
     for i, uuid in enumerate(doc_uuids, 1):
@@ -112,6 +201,10 @@ def format_retrieved_context(
                 content_parts.append(row["content"])
 
         content = "\n\n".join(content_parts)
+
+        if question_category == "detail" and search_terms:
+            content = extract_relevant_sections(content, search_terms)
+
         parts.append(
             f"--- Document {i} (ID: {uuid}) ---\n"
             f"Title: {title}\n\n"
@@ -164,12 +257,16 @@ def process_question(
     qid = question["question_id"]
     query = question["question"]
 
+    category, terms = classify_question(query)
+
     doc_uuids = retrieve_for_question(
         orchestrator, query, memory_to_uuid, top_k=top_k, method=method,
     )
 
     context = format_retrieved_context(
         doc_uuids, uuid_to_memories, orchestrator._db,
+        question_category=category,
+        search_terms=terms,
     )
 
     answer = generate_answer(orchestrator, context, query)
@@ -178,6 +275,7 @@ def process_question(
         "question_id": qid,
         "answer": answer,
         "document_ids": doc_uuids,
+        "question_category": category,
     }
 
     if "question_type" in question:

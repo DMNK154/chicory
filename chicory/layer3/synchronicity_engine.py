@@ -18,6 +18,7 @@ from chicory.db.engine import DatabaseEngine
 from chicory.layer1.embedding_engine import EmbeddingEngine
 from chicory.layer1.tag_manager import TagManager
 from chicory.layer3.poincare import PoincareProjection
+from chicory.layer3.semiotic_graph import SemioticDirectedGraph
 from chicory.models.lattice import GlyphPosition, LatticePosition, Resonance, VoidProfile
 from chicory.models.synchronicity import SynchronicityEvent
 
@@ -51,6 +52,13 @@ class SynchronicityEngine:
             curvature=config.poincare_curvature,
             max_radius=config.poincare_max_radius,
         )
+        self._semiotic_graph = SemioticDirectedGraph(
+            db.connection, min_strength=config.semiotic_directed_min_strength
+        )
+
+    @property
+    def semiotic_graph(self) -> SemioticDirectedGraph:
+        return self._semiotic_graph
 
     # ── Lattice gate ───────────────────────────────────────────────
 
@@ -1511,7 +1519,6 @@ class SynchronicityEngine:
         w_co = self._config.tensor_cooccurrence_weight
         w_sync = self._config.tensor_synchronicity_weight
         w_sem = self._config.tensor_semantic_weight
-        w_semio = self._config.tensor_semiotic_weight
         w_glyph = self._config.tensor_glyph_weight
         w_meta = self._config.tensor_meta_resonance_weight
         w_inhib = self._config.tensor_inhibition_weight
@@ -1524,10 +1531,8 @@ class SynchronicityEngine:
             if a_in_query and b_in_query:
                 continue
             elif a_in_query:
-                semiotic = row["semiotic_forward"]
                 partner = row["tag_b_id"]
             else:
-                semiotic = row["semiotic_reverse"]
                 partner = row["tag_a_id"]
 
             sync_val = row["synchronicity_strength"]
@@ -1537,7 +1542,6 @@ class SynchronicityEngine:
                 w_co * row["cooccurrence_strength"]
                 + w_sync * sync_val
                 + w_sem * row["semantic_strength"]
-                + w_semio * semiotic
                 + w_glyph * glyph_val
             )
 
@@ -1555,6 +1559,19 @@ class SynchronicityEngine:
                 )
 
         _cp["n_partners_pre_gate"] = len(partner_scores)
+
+        # ── IN→OUT lateral discovery: sibling tags via shared signifiers ──
+        _s = _time.perf_counter()
+        directed_discoveries = self._semiotic_graph.expand_in_through_out(tag_ids)
+        w_directed = self._config.semiotic_directed_weight
+        for tag_id, entry in directed_discoveries.items():
+            directed_score = entry.score * w_directed
+            partner_scores[tag_id] = max(
+                partner_scores.get(tag_id, 0.0), directed_score
+            )
+        _cp["directed_in_out"] = _time.perf_counter() - _s
+        _cp["n_directed_discoveries"] = len(directed_discoveries)
+
         if not partner_scores:
             return {}
 
@@ -2604,8 +2621,9 @@ class SynchronicityEngine:
             vecs = np.array(list(all_cached.values()))
             centered = vecs - vecs.mean(axis=0)
             try:
-                _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-                self._pca_basis = Vt[:2]  # shape (2, d)
+                cov = centered.T @ centered  # (d, d) — bounded by embedding dim
+                eigenvalues, eigenvectors = np.linalg.eigh(cov)
+                self._pca_basis = eigenvectors[:, -2:][:, ::-1].T  # top 2
                 return
             except np.linalg.LinAlgError:
                 pass  # Fall through to random scaffold

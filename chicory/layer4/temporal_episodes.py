@@ -73,11 +73,7 @@ class TemporalEpisodeTracker:
         if len(centroids) < max(1, len(tag_ids) // 2):
             return None
         vecs = list(centroids.values())
-        centroid = np.mean(vecs, axis=0).astype(np.float32)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid /= norm
-        return centroid
+        return np.mean(vecs, axis=0).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Adaptive threshold (Welford online variance)
@@ -90,15 +86,14 @@ class TemporalEpisodeTracker:
             (episode_id,),
         ).fetchone()
         if not row:
-            return 0.3 + self._cfg.episode_drift_sigma * math.sqrt(0.01)
+            return self._cfg.episode_drift_base_threshold
 
         n = row["distance_samples"]
         if n < self._cfg.episode_min_samples_for_adaptive:
-            mean = 0.3
-            var = 0.01
-        else:
-            mean = row["mean_distance"]
-            var = row["variance_sum"] / (n - 1) if n > 1 else 0.01
+            return self._cfg.episode_drift_base_threshold
+
+        mean = row["mean_distance"]
+        var = row["variance_sum"] / (n - 1) if n > 1 else 0.01
 
         return mean + self._cfg.episode_drift_sigma * math.sqrt(max(var, 1e-8))
 
@@ -156,10 +151,7 @@ class TemporalEpisodeTracker:
 
         old_centroid = _blob_to_array(row["centroid"])
         alpha = self._cfg.episode_ema_alpha
-        new_centroid = alpha * op_centroid + (1 - alpha) * old_centroid
-        norm = np.linalg.norm(new_centroid)
-        if norm > 0:
-            new_centroid /= norm
+        new_centroid = (alpha * op_centroid + (1 - alpha) * old_centroid).astype(np.float32)
 
         old_tags = set(json.loads(row["tag_ids"]))
         merged_tags = sorted(old_tags | set(tag_ids))
@@ -184,10 +176,7 @@ class TemporalEpisodeTracker:
 
         old_centroid = _blob_to_array(row["centroid"])
         alpha = self._cfg.episode_ema_alpha
-        new_centroid = alpha * op_centroid + (1 - alpha) * old_centroid
-        norm = np.linalg.norm(new_centroid)
-        if norm > 0:
-            new_centroid /= norm
+        new_centroid = (alpha * op_centroid + (1 - alpha) * old_centroid).astype(np.float32)
 
         old_tags = set(json.loads(row["tag_ids"]))
         merged_tags = sorted(old_tags | set(tag_ids))
@@ -246,7 +235,7 @@ class TemporalEpisodeTracker:
 
         for r in rows:
             c = _blob_to_array(r["centroid"])
-            dist = 1.0 - float(np.dot(op_centroid, c))
+            dist = float(np.linalg.norm(op_centroid - c))
             if dist < best_dist:
                 best_dist = dist
                 best_id = r["id"]
@@ -287,7 +276,7 @@ class TemporalEpisodeTracker:
                 return ep_id
 
             current_centroid = _blob_to_array(row["centroid"])
-            distance = 1.0 - float(np.dot(op_centroid, current_centroid))
+            distance = float(np.linalg.norm(op_centroid - current_centroid))
             threshold = self._get_adaptive_threshold(self._current_episode_id)
 
             if distance < threshold:

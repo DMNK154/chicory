@@ -50,8 +50,19 @@ class EpisodicTensor:
 
         Returns total edges created.
         """
-        log.info("Episodic tensor: loading embeddings...")
-        mem_ids, vectors = self._load_all_embeddings()
+        episodes = self._load_episode_members()
+
+        if episodes:
+            assigned_ids = set()
+            for mids in episodes.values():
+                assigned_ids.update(mids)
+            log.info("Episodic tensor: loading embeddings for %d assigned memories...", len(assigned_ids))
+            mem_ids, vectors = self._load_embeddings_for(assigned_ids)
+        else:
+            log.info("No episode assignments — loading all embeddings for global fallback")
+            mem_ids, vectors = self._load_all_embeddings()
+            episodes = {0: mem_ids}
+
         if len(mem_ids) == 0:
             log.warning("No embeddings found — skipping episodic tensor bootstrap")
             return 0
@@ -63,11 +74,6 @@ class EpisodicTensor:
         tag_tensor = self._load_tag_tensor_cache(mem_tags)
         mem_times = self._load_memory_timestamps()
         mem_sources = self._load_memory_sources()
-
-        episodes = self._load_episode_members()
-        if not episodes:
-            log.info("No episode assignments — using global top-K fallback")
-            episodes = {0: mem_ids}
 
         total_edges = 0
         for ep_idx, (ep_id, member_ids) in enumerate(episodes.items()):
@@ -291,6 +297,38 @@ class EpisodicTensor:
         dim = rows[0]["dimension"]
         mem_ids = [r["memory_id"] for r in rows]
         all_bytes = b"".join(r["embedding"] for r in rows)
+        vectors = np.frombuffer(all_bytes, dtype=np.float32).reshape(-1, dim).copy()
+
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        vectors /= norms
+
+        return mem_ids, vectors
+
+    def _load_embeddings_for(self, memory_ids: set[str]) -> tuple[list[str], np.ndarray]:
+        if not memory_ids:
+            return [], np.array([])
+
+        BATCH = 20_000
+        id_list = list(memory_ids)
+        all_rows = []
+        for start in range(0, len(id_list), BATCH):
+            chunk = id_list[start:start + BATCH]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._db.execute(
+                f"""SELECT memory_id, embedding, dimension FROM embeddings
+                   WHERE chunk_index = 0 AND memory_id IN ({placeholders})
+                   ORDER BY memory_id""",
+                tuple(chunk),
+            ).fetchall()
+            all_rows.extend(rows)
+
+        if not all_rows:
+            return [], np.array([])
+
+        dim = all_rows[0]["dimension"]
+        mem_ids = [r["memory_id"] for r in all_rows]
+        all_bytes = b"".join(r["embedding"] for r in all_rows)
         vectors = np.frombuffer(all_bytes, dtype=np.float32).reshape(-1, dim).copy()
 
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)

@@ -305,6 +305,18 @@ def get_last_trace(ctx: Context) -> str:
 
 
 @mcp_server.tool()
+def compare_traces(ctx: Context) -> str:
+    """Compare the last two retrieval traces.
+
+    Shows what changed between consecutive retrievals: tag activation
+    deltas (sorted by largest divergence), memories that appeared or
+    disappeared, per-component score deltas for shared memories, and
+    rank changes.
+    """
+    return _call(ctx, "compare_traces", {})
+
+
+@mcp_server.tool()
 def ingest_codebase(
     ctx: Context,
     path: str,

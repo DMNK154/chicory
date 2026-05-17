@@ -69,7 +69,7 @@ class CooccurrenceOptimizer:
                 (left_type, str(left_id), right_type, str(right_id), scope_type),
             ).fetchone()
 
-            new_count = (row["raw_count"] if row else 0.0) + 1.0
+            new_count = ((row["raw_count"] or 0.0) if row else 0.0) + 1.0
             n = max(total_scopes, 1)
             p_ab = new_count / n
             p_a = max(left_count, 1) / n

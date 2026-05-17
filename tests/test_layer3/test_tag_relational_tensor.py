@@ -600,117 +600,89 @@ class TestSemioticLayer:
         # Asymmetry: P(B|A) != P(A|B)
         assert p_b_given_a != p_a_given_b
 
-    def test_semiotic_in_weighted_recall(self, stack):
-        """Semiotic contribution should affect get_resonant_memory_ids_fast output."""
+    def test_semiotic_directed_in_out_expansion(self, stack):
+        """IN→OUT directed expansion discovers sibling tags through shared signifiers."""
         db, emb, tags, engine = stack["db"], stack["emb"], stack["tags"], stack["engine"]
-        config = stack["config"]
 
-        tag_a = tags.get_or_create("alpha")
-        tag_b = tags.get_or_create("beta")
+        tag_q = tags.get_or_create("query-concept")
+        tag_inter = tags.get_or_create("shared-signifier")
+        tag_sibling = tags.get_or_create("sibling-concept")
 
-        _create_memory(db, emb, "m1", "content one", [tag_a.id, tag_b.id])
-        _create_memory(db, emb, "m2", "content two", [tag_a.id, tag_b.id])
-
-        a, b = min(tag_a.id, tag_b.id), max(tag_a.id, tag_b.id)
-        db.execute(
-            "INSERT OR IGNORE INTO glyph_resonances (tag_a_id, tag_b_id, shared_primes, resonance_strength) "
-            "VALUES (?, ?, 3, 1.0)", (a, b),
-        )
-        db.execute(
-            "INSERT OR IGNORE INTO centroid_edges (tag_a_id, tag_b_id, edge_strength, co_retrieval_count) "
-            "VALUES (?, ?, 1.0, 1)", (a, b),
-        )
+        # Build directed semiotic edges:
+        #   tag_inter →signifies→ tag_q      (inter is a signifier of query)
+        #   tag_inter →signifies→ tag_sibling (inter also signifies sibling)
+        # So querying from tag_q should discover tag_sibling via IN→OUT:
+        #   tag_q ←IN← tag_inter →OUT→ tag_sibling
+        pairs = [
+            (min(tag_q.id, tag_inter.id), max(tag_q.id, tag_inter.id)),
+            (min(tag_inter.id, tag_sibling.id), max(tag_inter.id, tag_sibling.id)),
+        ]
+        for a, b in pairs:
+            # Determine semiotic direction: "inter signifies q" and "inter signifies sibling"
+            if a == tag_inter.id:
+                fwd, rev = 1.5, 0.0  # A=inter → B
+            else:
+                fwd, rev = 0.0, 1.5  # B=inter → A (reverse = inter signifies A)
+            db.execute(
+                "INSERT OR REPLACE INTO tag_relational_tensor "
+                "(tag_a_id, tag_b_id, cooccurrence_strength, synchronicity_strength, "
+                "semantic_strength, semiotic_forward, semiotic_reverse, glyph_strength, "
+                "inhibition_strength, parallelness, memory_ids) "
+                "VALUES (?, ?, 0, 0, 0, ?, ?, 0, 0, 0, '[]')",
+                (a, b, fwd, rev),
+            )
         db.connection.commit()
 
-        # Populate only semiotic (set other weights to 0)
-        engine.update_semiotic_tensor()
+        graph = engine.semiotic_graph
+        discovered = graph.expand_in_through_out([tag_q.id])
 
-        original_co = config.tensor_cooccurrence_weight
-        original_sync = config.tensor_synchronicity_weight
-        original_sem = config.tensor_semantic_weight
-        original_semio = config.tensor_semiotic_weight
+        assert tag_sibling.id in discovered
+        entry = discovered[tag_sibling.id]
+        assert entry.max_strength > 0
+        assert entry.convergence >= 1
 
-        config.tensor_cooccurrence_weight = 0.0
-        config.tensor_synchronicity_weight = 0.0
-        config.tensor_semantic_weight = 0.0
-        config.tensor_semiotic_weight = 1.0
-
-        candidate_ids = ["m1", "m2"]
-        candidate_tag_map = {
-            "m1": [tag_a.id, tag_b.id],
-            "m2": [tag_a.id, tag_b.id],
-        }
-        results = engine.get_resonant_memory_ids_fast(
-            [tag_a.id],
-            candidate_memory_ids=candidate_ids,
-            candidate_tag_ids_map=candidate_tag_map,
-        )
-        # Should find memories through semiotic linkage
-        if _get_tensor_rows(db):
-            assert len(results) > 0
-
-        # Restore
-        config.tensor_cooccurrence_weight = original_co
-        config.tensor_synchronicity_weight = original_sync
-        config.tensor_semantic_weight = original_sem
-        config.tensor_semiotic_weight = original_semio
-
-    def test_semiotic_direction_in_recall(self, stack):
-        """Querying from tag_a vs tag_b should use different semiotic strengths."""
+    def test_semiotic_directed_convergence(self, stack):
+        """OUT→IN convergence detects when multiple query signifieds point at a candidate."""
         db, emb, tags, engine = stack["db"], stack["emb"], stack["tags"], stack["engine"]
-        config = stack["config"]
 
-        tag_a = tags.get_or_create("rare-query")
-        tag_b = tags.get_or_create("common-query")
+        tag_q = tags.get_or_create("query-tag")
+        tag_decomp1 = tags.get_or_create("decomp-one")
+        tag_decomp2 = tags.get_or_create("decomp-two")
+        tag_candidate = tags.get_or_create("candidate-tag")
 
-        # tag_a on 2 memories, tag_b on 10, overlap on 2
-        _create_memory(db, emb, "m1", "shared content one", [tag_a.id, tag_b.id])
-        _create_memory(db, emb, "m2", "shared content two", [tag_a.id, tag_b.id])
-        for i in range(8):
-            _create_memory(db, emb, f"mc{i}", f"common only {i}", [tag_b.id])
-
-        a, b = min(tag_a.id, tag_b.id), max(tag_a.id, tag_b.id)
-        db.execute(
-            "INSERT OR IGNORE INTO glyph_resonances (tag_a_id, tag_b_id, shared_primes, resonance_strength) "
-            "VALUES (?, ?, 3, 1.0)", (a, b),
-        )
-        db.execute(
-            "INSERT OR IGNORE INTO centroid_edges (tag_a_id, tag_b_id, edge_strength, co_retrieval_count) "
-            "VALUES (?, ?, 1.0, 1)", (a, b),
-        )
+        # Build edges:
+        #   tag_q →signifies→ tag_decomp1   (query decomposes into decomp1)
+        #   tag_q →signifies→ tag_decomp2   (query decomposes into decomp2)
+        #   tag_decomp1 →signifies→ tag_candidate  (decomp1 also signifies candidate)
+        #   tag_decomp2 →signifies→ tag_candidate  (decomp2 also signifies candidate)
+        # Convergence: two independent query-signifieds both point at candidate
+        edges = [
+            (tag_q.id, tag_decomp1.id, "out"),
+            (tag_q.id, tag_decomp2.id, "out"),
+            (tag_decomp1.id, tag_candidate.id, "out"),
+            (tag_decomp2.id, tag_candidate.id, "out"),
+        ]
+        for src, dst, direction in edges:
+            a, b = min(src, dst), max(src, dst)
+            if src == a:
+                fwd, rev = 1.5, 0.0
+            else:
+                fwd, rev = 0.0, 1.5
+            db.execute(
+                "INSERT OR REPLACE INTO tag_relational_tensor "
+                "(tag_a_id, tag_b_id, cooccurrence_strength, synchronicity_strength, "
+                "semantic_strength, semiotic_forward, semiotic_reverse, glyph_strength, "
+                "inhibition_strength, parallelness, memory_ids) "
+                "VALUES (?, ?, 0, 0, 0, ?, ?, 0, 0, 0, '[]')",
+                (a, b, fwd, rev),
+            )
         db.connection.commit()
 
-        engine.update_semiotic_tensor()
+        graph = engine.semiotic_graph
+        score = graph.convergence_score([tag_q.id], [tag_candidate.id])
 
-        # Use semiotic-only weighting
-        config.tensor_cooccurrence_weight = 0.0
-        config.tensor_synchronicity_weight = 0.0
-        config.tensor_semantic_weight = 0.0
-        config.tensor_semiotic_weight = 1.0
-
-        all_mem_ids = ["m1", "m2"] + [f"mc{i}" for i in range(8)]
-        candidate_tag_map = {"m1": [tag_a.id, tag_b.id], "m2": [tag_a.id, tag_b.id]}
-        for i in range(8):
-            candidate_tag_map[f"mc{i}"] = [tag_b.id]
-
-        results_from_a = engine.get_resonant_memory_ids_fast(
-            [tag_a.id], candidate_memory_ids=all_mem_ids,
-            candidate_tag_ids_map=candidate_tag_map,
-        )
-        results_from_b = engine.get_resonant_memory_ids_fast(
-            [tag_b.id], candidate_memory_ids=all_mem_ids,
-            candidate_tag_ids_map=candidate_tag_map,
-        )
-
-        # Both should return results, but scores will differ because
-        # P(B|A) = 1.0 but P(A|B) = 0.2
-        assert len(results_from_a) > 0 or len(results_from_b) > 0
-
-        # Restore
-        config.tensor_cooccurrence_weight = 0.5
-        config.tensor_synchronicity_weight = 0.3
-        config.tensor_semantic_weight = 0.2
-        config.tensor_semiotic_weight = 0.15
+        # Both decomp1 and decomp2 are signifieds of query AND signifiers of candidate
+        assert score >= 2.0
 
     def test_semiotic_populated_by_rebuild(self, stack):
         """rebuild_tensor() should populate semiotic columns."""

@@ -51,6 +51,39 @@ class TagManager:
         ).fetchone()
         return self._row_to_tag(row)
 
+    def get_or_create_batch(
+        self,
+        names: list[str],
+        created_by: str = "system",
+    ) -> list[Tag]:
+        """Get or create multiple tags in batch. Single SELECT + batch INSERT + single commit."""
+        if not names:
+            return []
+        normalized = [_normalize_tag(n) for n in names]
+        unique = list(dict.fromkeys(normalized))
+
+        placeholders = ",".join("?" for _ in unique)
+        rows = self._db.execute(
+            f"SELECT * FROM tags WHERE name IN ({placeholders})", tuple(unique)
+        ).fetchall()
+        existing = {row["name"]: self._row_to_tag(row) for row in rows}
+
+        missing = [n for n in unique if n not in existing]
+        if missing:
+            self._db.executemany(
+                "INSERT OR IGNORE INTO tags (name, created_by) VALUES (?, ?)",
+                [(n, created_by) for n in missing],
+            )
+            self._db.connection.commit()
+            new_rows = self._db.execute(
+                f"SELECT * FROM tags WHERE name IN ({','.join('?' for _ in missing)})",
+                tuple(missing),
+            ).fetchall()
+            for row in new_rows:
+                existing[row["name"]] = self._row_to_tag(row)
+
+        return [existing[n] for n in normalized if n in existing]
+
     def get_by_name(self, name: str) -> Tag | None:
         """Get a tag by name, or None."""
         normalized = _normalize_tag(name)
@@ -70,7 +103,7 @@ class TagManager:
 
     def validate_tags(self, tag_names: list[str]) -> list[Tag]:
         """Get or create tags for a list of names. Returns Tag objects."""
-        return [self.get_or_create(name, created_by="llm") for name in tag_names]
+        return self.get_or_create_batch(tag_names, created_by="llm")
 
     def merge_tags(self, source_id: int, target_id: int) -> None:
         """Merge source tag into target. Reassigns all memory_tags."""
@@ -265,36 +298,27 @@ class TagManager:
 
         Does NOT commit — caller is responsible for commit/transaction.
         """
-        tags = []
-        for letter, count in letter_counts.items():
-            tag = self._ensure_letter_tag(letter)
-            self._db.execute(
+        if not letter_counts:
+            return []
+        letters = list(letter_counts.keys())
+        tags = self.get_or_create_batch(letters, created_by="system")
+        tag_by_name = {t.name: t for t in tags}
+        params = [
+            (memory_id, tag_by_name[letter].id, float(count))
+            for letter, count in letter_counts.items()
+            if letter in tag_by_name
+        ]
+        if params:
+            self._db.executemany(
                 """
                 INSERT INTO memory_tags (memory_id, tag_id, assigned_by, confidence)
                 VALUES (?, ?, 'system', ?)
                 ON CONFLICT(memory_id, tag_id)
                 DO UPDATE SET confidence = excluded.confidence
                 """,
-                (memory_id, tag.id, float(count)),
+                params,
             )
-            tags.append(tag)
         return tags
-
-    def _ensure_letter_tag(self, letter: str) -> Tag:
-        """Get or create a single-letter tag without committing."""
-        row = self._db.execute(
-            "SELECT * FROM tags WHERE name = ?", (letter,)
-        ).fetchone()
-        if row:
-            return self._row_to_tag(row)
-        self._db.execute(
-            "INSERT OR IGNORE INTO tags (name, created_by) VALUES (?, 'system')",
-            (letter,),
-        )
-        row = self._db.execute(
-            "SELECT * FROM tags WHERE name = ?", (letter,)
-        ).fetchone()
-        return self._row_to_tag(row)
 
     def _consolidate_tensor_on_merge(
         self, source_id: int, target_id: int,

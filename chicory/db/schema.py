@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 28
 
 TABLES = [
     # -- Schema version tracking --
@@ -42,6 +42,7 @@ TABLES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash) WHERE content_hash IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_source_path ON memories(source_path) WHERE source_path IS NOT NULL",
 
     """
     CREATE TABLE IF NOT EXISTS embeddings (
@@ -671,6 +672,97 @@ TABLES = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_mem_episode_memory ON memory_episode_assignments(memory_id)",
     "CREATE INDEX IF NOT EXISTS idx_mem_episode_episode ON memory_episode_assignments(episode_id)",
+
+    # -- Directional canopy: inflow/outflow tracking --
+    """
+    CREATE TABLE IF NOT EXISTS directional_retrieval_context (
+        retrieval_id    INTEGER PRIMARY KEY REFERENCES retrieval_events(id) ON DELETE CASCADE,
+        query_tag_ids   TEXT NOT NULL DEFAULT '[]',
+        result_tag_ids  TEXT NOT NULL DEFAULT '[]',
+        result_memory_ids TEXT NOT NULL DEFAULT '[]',
+        query_tag_hash  TEXT NOT NULL,
+        created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_drc_query_hash ON directional_retrieval_context(query_tag_hash)",
+
+    """
+    CREATE TABLE IF NOT EXISTS inflow_canopy_blocks (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        block_key            TEXT NOT NULL UNIQUE,
+        memory_ids           TEXT NOT NULL DEFAULT '[]',
+        representative_tags  TEXT NOT NULL DEFAULT '[]',
+        inflow_diversity     REAL NOT NULL DEFAULT 0.0,
+        inflow_strength      REAL NOT NULL DEFAULT 0.0,
+        unique_query_contexts INTEGER NOT NULL DEFAULT 0,
+        total_activations    INTEGER NOT NULL DEFAULT 0,
+        evidence_count       INTEGER NOT NULL DEFAULT 0,
+        created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_observed_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_inflow_blocks_strength ON inflow_canopy_blocks(inflow_strength DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_inflow_blocks_diversity ON inflow_canopy_blocks(inflow_diversity DESC)",
+
+    """
+    CREATE TABLE IF NOT EXISTS inflow_canopy_observations (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        block_key         TEXT NOT NULL,
+        retrieval_id      INTEGER NOT NULL,
+        query_tag_hash    TEXT NOT NULL,
+        query_tag_ids     TEXT NOT NULL DEFAULT '[]',
+        result_memory_ids TEXT NOT NULL DEFAULT '[]',
+        inflow_diversity  REAL NOT NULL DEFAULT 0.0,
+        inflow_strength   REAL NOT NULL DEFAULT 0.0,
+        observed_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_inflow_obs_key_time ON inflow_canopy_observations(block_key, observed_at DESC)",
+
+    """
+    CREATE TABLE IF NOT EXISTS outflow_canopy_blocks (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        block_key             TEXT NOT NULL UNIQUE,
+        query_tag_ids         TEXT NOT NULL DEFAULT '[]',
+        query_tag_hash        TEXT NOT NULL,
+        outflow_diversity     REAL NOT NULL DEFAULT 0.0,
+        outflow_reach         REAL NOT NULL DEFAULT 0.0,
+        outflow_strength      REAL NOT NULL DEFAULT 0.0,
+        unique_result_clusters INTEGER NOT NULL DEFAULT 0,
+        total_activations     INTEGER NOT NULL DEFAULT 0,
+        evidence_count        INTEGER NOT NULL DEFAULT 0,
+        created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_observed_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_outflow_blocks_strength ON outflow_canopy_blocks(outflow_strength DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_outflow_blocks_hash ON outflow_canopy_blocks(query_tag_hash)",
+
+    """
+    CREATE TABLE IF NOT EXISTS outflow_canopy_observations (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        block_key         TEXT NOT NULL,
+        retrieval_id      INTEGER NOT NULL,
+        result_memory_ids TEXT NOT NULL DEFAULT '[]',
+        result_cluster_key TEXT NOT NULL,
+        outflow_diversity REAL NOT NULL DEFAULT 0.0,
+        outflow_reach     REAL NOT NULL DEFAULT 0.0,
+        outflow_strength  REAL NOT NULL DEFAULT 0.0,
+        observed_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_outflow_obs_key_time ON outflow_canopy_observations(block_key, observed_at DESC)",
+
+    """
+    CREATE TABLE IF NOT EXISTS directional_block_scores (
+        block_id               INTEGER PRIMARY KEY REFERENCES forest_blocks(id) ON DELETE CASCADE,
+        inflow_score           REAL NOT NULL DEFAULT 0.0,
+        outflow_score          REAL NOT NULL DEFAULT 0.0,
+        directional_hub_penalty REAL NOT NULL DEFAULT 1.0,
+        evidence_count         INTEGER NOT NULL DEFAULT 0,
+        updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
 ]
 
 
@@ -736,6 +828,10 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v24_to_v25(db)
             if current_version <= 25:
                 _migrate_v25_to_v26(db)
+            if current_version <= 26:
+                _migrate_v26_to_v27(db)
+            if current_version <= 27:
+                _migrate_v27_to_v28(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -749,7 +845,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Temporal tag episodes"),
+                (SCHEMA_VERSION, "Directional canopy: inflow/outflow layers"),
             )
 
 
@@ -1255,3 +1351,17 @@ def _migrate_v25_to_v26(db: DatabaseEngine) -> None:
             )
             db.connection.commit()
             lo += BATCH
+
+
+def _migrate_v26_to_v27(db: DatabaseEngine) -> None:
+    """Reset episode distance stats for Euclidean metric switch."""
+    db.execute(
+        "UPDATE temporal_episodes SET mean_distance = 0, variance_sum = 0, "
+        "distance_samples = 0"
+    )
+    db.connection.commit()
+
+
+def _migrate_v27_to_v28(db: DatabaseEngine) -> None:
+    """Directional canopy tables — all CREATE IF NOT EXISTS, no data migration."""
+    pass

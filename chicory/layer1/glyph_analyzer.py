@@ -101,17 +101,10 @@ def analyze_text(text: str) -> dict[str, Any]:
                     "is_known_pair": pair_concepts is not None,
                 })
 
-    # Phase 4: Build glyph-annotated line
+    # Phase 4: Build compact word:glyph mapping
     glyph_line = None
     if words:
-        gl = text
-        # Replace longest matches first
-        for w in sorted(words, key=lambda x: len(x["word"]), reverse=True):
-            pattern = r"\b" + re.escape(w["word"]) + r"\b"
-            replacement = f'{w["word"]}({w["glyph"]})'
-            gl = re.sub(pattern, replacement, gl, flags=re.IGNORECASE)
-        if gl != text:
-            glyph_line = gl
+        glyph_line = " ".join(f'{w["word"]}:{w["glyph"]}' for w in words)
 
     # Phase 5: Compact formula
     formula = None

@@ -109,6 +109,15 @@ def ingest_corpus(
         "elapsed_seconds": 0.0,
     }
 
+    # Load all already-ingested source_paths upfront (single query)
+    existing_source_paths: set[str] = set()
+    rows = orchestrator._db.execute(
+        "SELECT source_path FROM memories WHERE source_path IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        existing_source_paths.add(row["source_path"])
+    logger.info("Found %d already-ingested source paths", len(existing_source_paths))
+
     t0 = time.time()
     pending_batch: list[dict[str, Any]] = []
 
@@ -123,17 +132,13 @@ def ingest_corpus(
             stats["skipped_parse"] += 1
             continue
 
+        if dataset_doc_uuid in existing_source_paths:
+            stats["skipped_duplicate"] += 1
+            continue
+
         title, content = extract_document_content(doc)
         if not content.strip():
             stats["skipped_empty"] += 1
-            continue
-
-        existing = orchestrator._db.execute(
-            "SELECT id FROM memories WHERE source_path = ?",
-            (dataset_doc_uuid,),
-        ).fetchone()
-        if existing:
-            stats["skipped_duplicate"] += 1
             continue
 
         full_text = f"{title}\n\n{content}" if title else content

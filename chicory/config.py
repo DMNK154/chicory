@@ -45,6 +45,18 @@ class ChicoryConfig(BaseModel):
     salience_recency_longterm_weight: float = Field(default=0.4)
     max_retrieval_results: int = Field(default=10)
     similarity_threshold: float = Field(default=0.3)
+    # Minimum hybrid relevance score required for a memory to be surfaced
+    # to the LLM. Applied after all scoring (semantic + tag + lattice + glyph)
+    # but BEFORE bookkeeping, so low-relevance noise doesn't reinforce itself.
+    # 0.0 = no filtering (back-compat).
+    #
+    # Adaptive: the cap on possible scores differs depending on whether the
+    # caller passed a `tags` argument, because the tag channel contributes
+    # up to 0.3 to the total.  Without tags: theoretical max ~0.95.
+    # With tags: theoretical max ~1.25.  Apply a stricter floor when tags
+    # were passed (the signal is stronger) and a looser floor when not.
+    retrieval_min_relevance_score_tagged: float = Field(default=0.5)
+    retrieval_min_relevance_score_untagged: float = Field(default=0.25)
 
     # Layer 2 — Trends
     trend_window_hours: float = Field(default=168.0)  # 1 week
@@ -152,6 +164,11 @@ class ChicoryConfig(BaseModel):
     resonance_min_tensor_score: float = Field(default=0.3)
     resonance_min_edge_strength: float = Field(default=0.3)
 
+    # Semiotic directed graph — IN→OUT / OUT→IN traversal
+    semiotic_directed_min_strength: float = Field(default=0.05)
+    semiotic_directed_weight: float = Field(default=0.3)
+    semiotic_convergence_weight: float = Field(default=0.12)
+
     # Centroid sub-graph — retrieval-driven reweighting
     centroid_ema_alpha: float = Field(default=0.1)
     centroid_edge_ema_alpha: float = Field(default=0.15)
@@ -177,10 +194,21 @@ class ChicoryConfig(BaseModel):
     # Ramsey adjacency filter (glyph lattice)
     canopy_ramsey_min_shared_primes: int = Field(default=7)
 
+    # Directional canopy — inflow/outflow tracking via retrieval causality
+    canopy_directional_enabled: bool = Field(default=True)
+    canopy_directional_inflow_diversity_weight: float = Field(default=0.7)
+    canopy_directional_inflow_frequency_weight: float = Field(default=0.3)
+    canopy_directional_outflow_diversity_weight: float = Field(default=0.6)
+    canopy_directional_outflow_reach_weight: float = Field(default=0.4)
+    canopy_directional_inflow_rescue_weight: float = Field(default=0.3)
+    canopy_directional_outflow_rescue_weight: float = Field(default=0.3)
+    canopy_directional_query_tag_similarity_threshold: float = Field(default=0.3)
+
     # Temporal tag episodes — drift-detected, revisitable tag-space clusters
     episode_enabled: bool = Field(default=True)
     episode_ema_alpha: float = Field(default=0.2)
     episode_drift_sigma: float = Field(default=2.0)
+    episode_drift_base_threshold: float = Field(default=0.5)
     episode_revisit_max_candidates: int = Field(default=50)
     episode_sync_boundary_strength: float = Field(default=0.7)
     episode_min_samples_for_adaptive: int = Field(default=10)

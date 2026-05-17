@@ -116,3 +116,22 @@ class CanopyShape(BaseModel):
     source: str
     source_id: Optional[str] = None
     source_event_types: list[str]
+
+
+class InflowScore(BaseModel):
+    """Convergence attractor score for an inflow canopy block."""
+
+    inflow_diversity: float = 0.0
+    unique_query_contexts: int = 0
+    total_activations: int = 0
+    inflow_strength: float = 0.0
+
+
+class OutflowScore(BaseModel):
+    """Distributor score for an outflow canopy block."""
+
+    outflow_diversity: float = 0.0
+    outflow_reach: float = 0.0
+    unique_result_clusters: int = 0
+    total_activations: int = 0
+    outflow_strength: float = 0.0

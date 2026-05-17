@@ -75,26 +75,12 @@ class MemoryStore:
 
             # Assign word tags
             tag_objects = self._tags.validate_tags(tags)
-            for tag in tag_objects:
-                self._db.execute(
-                    """
-                    INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by)
-                    VALUES (?, ?, 'llm')
-                    """,
-                    (memory_id, tag.id),
-                )
 
             # Split compound tags into constituent words
             split_words = self._tags.split_compound_tags(tags)
-            if split_words:
-                split_tag_objects = self._tags.validate_tags(split_words)
-                for tag in split_tag_objects:
-                    self._db.execute(
-                        "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) VALUES (?, ?, 'system')",
-                        (memory_id, tag.id),
-                    )
+            split_tag_objects = self._tags.validate_tags(split_words) if split_words else []
 
-            # Assign temporal date-period tags
+            # Temporal date-period tags
             now_dt = datetime.utcnow()
             temporal_names = [
                 f"month-{now_dt.strftime('%Y-%m')}",
@@ -102,10 +88,19 @@ class MemoryStore:
                 f"minute-{now_dt.strftime('%Y-%m-%dt%H-%M')}",
             ]
             temporal_tags = self._tags.validate_tags(temporal_names)
+
+            # Batch insert all memory_tags in one executemany
+            mt_params: list[tuple[str, int, str]] = []
+            for tag in tag_objects:
+                mt_params.append((memory_id, tag.id, "llm"))
+            for tag in split_tag_objects:
+                mt_params.append((memory_id, tag.id, "system"))
             for tag in temporal_tags:
-                self._db.execute(
-                    "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) VALUES (?, ?, 'system')",
-                    (memory_id, tag.id),
+                mt_params.append((memory_id, tag.id, "system"))
+            if mt_params:
+                self._db.executemany(
+                    "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) VALUES (?, ?, ?)",
+                    mt_params,
                 )
 
             # Derive and assign single-letter tags from word tags + split words
@@ -275,13 +270,14 @@ class MemoryStore:
             candidate_ids = [mem.id for mem, _ in semantic_results]
 
             _s = _time.perf_counter()
-            # Context tags from top 5 (for tensor lookup)
-            ctx_tag_map = self._tags.get_tag_ids_for_memories(top5_ids)
-            context_tag_ids: set[int] = set()
-            for tids in ctx_tag_map.values():
-                context_tag_ids.update(tids)
-            # All candidate tags (for scoring against partner tags)
+            # Single batch lookup: top5_ids ⊂ candidate_ids, so one query
+            # gives us both maps. Old code paid the IN-clause cost twice.
             candidate_tag_map = self._tags.get_tag_ids_for_memories(candidate_ids)
+            top5_set = set(top5_ids)
+            context_tag_ids: set[int] = set()
+            for mid, tids in candidate_tag_map.items():
+                if mid in top5_set:
+                    context_tag_ids.update(tids)
             _t["tag_id_lookup"] = _time.perf_counter() - _s
 
             if context_tag_ids:
@@ -316,6 +312,25 @@ class MemoryStore:
                         scores[mid] = scores.get(mid, 0.0) + w_glyph_ret * strength
                         if mid in components:
                             components[mid]["glyph"] = w_glyph_ret * strength
+
+                # ── High-level OUT→IN convergence re-ranking ──
+                w_conv = self._config.semiotic_convergence_weight
+                if w_conv > 0 and candidate_tag_map:
+                    _s = _time.perf_counter()
+                    conv_scores = (
+                        self._sync_engine.semiotic_graph
+                        .convergence_scores_batch(ctx_list, candidate_tag_map)
+                    )
+                    _t["semiotic_convergence"] = _time.perf_counter() - _s
+                    _t["semiotic_convergence_count"] = len(conv_scores)
+                    if conv_scores:
+                        max_conv = max(conv_scores.values())
+                        if max_conv > 0:
+                            for mid, raw in conv_scores.items():
+                                norm = raw / max_conv
+                                scores[mid] = scores.get(mid, 0.0) + w_conv * norm
+                                if mid in components:
+                                    components[mid]["convergence"] = w_conv * norm
 
         _s = _time.perf_counter()
         sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]

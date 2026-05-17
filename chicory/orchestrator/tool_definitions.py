@@ -189,4 +189,16 @@ CHICORY_TOOLS = [
             "properties": {},
         },
     },
+    {
+        "name": "compare_traces",
+        "description": (
+            "Compare the last two retrieval traces. Shows tag activation "
+            "deltas, memories that appeared or disappeared, per-component "
+            "score deltas for shared memories, and rank changes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]

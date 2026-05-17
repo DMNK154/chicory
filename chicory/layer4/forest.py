@@ -113,9 +113,9 @@ class ForestReorganizer:
         tag_ids: list[int],
         block_keys: list[str],
     ) -> None:
-        co_count = self._db.execute("SELECT COUNT(*) as c FROM cooccurrence_edges").fetchone()["c"]
-        bridge_count = self._db.execute("SELECT COUNT(*) as c FROM bridge_edges").fetchone()["c"]
-        block_count = self._db.execute("SELECT COUNT(*) as c FROM forest_blocks").fetchone()["c"]
+        co_count = self._db.query_one("SELECT COUNT(*) as c FROM cooccurrence_edges")["c"]
+        bridge_count = self._db.query_one("SELECT COUNT(*) as c FROM bridge_edges")["c"]
+        block_count = self._db.query_one("SELECT COUNT(*) as c FROM forest_blocks")["c"]
 
         block_ids = []
         for key in block_keys:

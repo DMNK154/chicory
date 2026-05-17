@@ -41,8 +41,8 @@ class TestAnalyzeText:
     def test_glyph_line(self):
         result = analyze_text("Memory guides the way home")
         assert result["glyph_line"] is not None
-        assert "☍" in result["glyph_line"]
-        assert "⌂" in result["glyph_line"]
+        assert "Memory:☍" in result["glyph_line"]
+        assert "Home:⌂" in result["glyph_line"]
 
     def test_formula(self):
         result = analyze_text("Hope and Joy")
