@@ -1,6 +1,6 @@
 # Chicory
 
-A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with optional lateral inhibition and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. Temporal tag episodes track drift in tag-space and detect when conversation returns to a previous topic region — episodes form a revisitable graph, not a timeline. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps.
+A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with optional lateral inhibition and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. A directional canopy tracks retrieval causality — inflow canopy identifies convergence attractors in memory-space, outflow canopy identifies distributor neighborhoods in tag-space — and feeds back into bridge hub penalties. Temporal tag episodes track drift in tag-space and detect when conversation returns to a previous topic region — episodes form a revisitable graph, not a timeline. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps.
 
 ## Install
 
@@ -291,6 +291,24 @@ Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other f
                   +-------------------------------------------+
                                       |
                                       v
+           +------------------------+   +------------------------+
+  Layer 4.5|   Inflow Canopy       |   |   Outflow Canopy       |
+  (direct.)|  convergence attractors|   |  distributor tag hoods |
+           |  in memory-space       |   |  in tag-space          |
+           |  diversity of incoming |   |  diversity + reach of  |
+           |  query contexts        |   |  result clusters       |
+           +------------------------+   +------------------------+
+                        \                       /
+                         \   directional_block_scores
+                          \       |       /
+                           v      v      v
+                  +-------------------------------------------+
+  Layer 4.5       |  Bridge Hub Penalty (directional rescue)  |
+                  |  degree penalty * inflow rescue            |
+                  |                 * outflow rescue           |
+                  +-------------------------------------------+
+                                      |
+                                      v
                   +-------------------------------------------+
   Layer 4         |  Meta-Analysis & Adaptive Thresholds      |
                   |  threshold EMA, burn-in, pattern clusters  |
@@ -391,9 +409,9 @@ Lattice positions are optionally projected into the Poincaré disk model of hype
 - Geodesic distance (arccosh metric) gives a natural measure of relatedness that respects the hierarchy
 - Einstein midpoint computes weighted hyperbolic centroids for cluster analysis
 
-## Four-Tier Architecture: Tag Tensor → Episodic Tensor → Temporal Episodes → Canopy
+## Five-Tier Architecture: Tag Tensor → Episodic Tensor → Temporal Episodes → Canopy → Directional Canopy
 
-The system maintains four tiers of relational structure at different granularities:
+The system maintains five tiers of relational structure at different granularities:
 
 **Tag Tensor** (global, abstract) — The four-network tensor described above. Operates on tag pairs — there are relatively few tags (~thousands), so the tensor can track all resonant pairs. Answers: "How do concepts relate globally?"
 
@@ -426,6 +444,12 @@ No arbitrary K or per-memory caps. Edge discovery, lifecycle promotion, and prun
 - **Forest** (base layer): The co-occurrence optimizer compresses local neighborhoods — memories that share many tags cluster into blocks. The bridge optimizer preserves global traversability by maintaining edges between blocks that would otherwise be isolated. Raw memories stay fixed; the forest reorganizes maps, not terrain.
 
 - **Canopy** (growth layer): Discovers emergent memory clusters from episodic tensor co-activation and bridge edges. When memories are repeatedly retrieved together, the canopy observes connected components in the episodic graph, scores them by co-activation strength minus tag-overlap inhibition, and records growth. The canopy never decays, prunes, or deletes — it only grows. Tag-overlap inhibition ensures the canopy surfaces structure that tags alone don't predict.
+
+- **Directional Canopy** (inflow + outflow): Tracks retrieval causality — query tags are SOURCE, result memories are DESTINATION. Two independent layers:
+  - **Inflow canopy** (memory-space): Clusters of result memories that are convergence attractors — they get pulled in by diverse, unrelated queries. Scored by the diversity of incoming query contexts: `inflow_diversity = 1 - mean_pairwise_jaccard(query_tag_sets)`.
+  - **Outflow canopy** (tag-space): Query tag neighborhoods that are distributors — they trigger retrievals reaching diverse, distant result clusters. Scored by diversity and reach of result neighborhoods.
+  
+  Both layers feed per-forest-block scores into the bridge optimizer's hub penalty. Genuine attractors (high inflow) and genuine distributors (high outflow) get partial rescue from degree-based penalization. Generic hubs with high degree but no directional signal get full penalty.
 
 The canopy's Ramsey adjacency filter (`canopy_ramsey_min_shared_primes`) gates tag-pair shape generation via glyph lattice prime-slot overlap, connecting the emergent graph structure back to the number-theoretic lattice.
 
@@ -495,7 +519,7 @@ chicory/
     display.py                  Rich terminal formatting
   db/
     engine.py                   SQLite with WAL mode, thread-safe RLock
-    schema.py                   Schema v23, versioned migrations with idempotency
+    schema.py                   Schema v28, versioned migrations with idempotency
   ingest/
     parsers.py                  40+ file types (PDF, docx, code, markdown...)
     chunker.py                  Section/paragraph/sentence splitting
@@ -523,6 +547,7 @@ chicory/
     synchronicity_engine.py     Prime Ramsey lattice, tensor, resonance computation
     centroid_subgraph.py        Retrieval-driven active reweighting (EMA centroids + edges)
     chain_anisotropy.py         Directional chain analysis in the tensor graph
+    semiotic_graph.py           Semiotic convergence graph for tag-pair analysis
     cross_project_alignment.py  Cross-project signal alignment
     poincare.py                 Poincaré disk projection (exponential map, geodesics, Einstein midpoint)
     square_finder.py            Ramsey square detection in the tensor
@@ -533,6 +558,7 @@ chicory/
     cooccurrence_optimizer.py   Local neighborhood compression into blocks
     bridge_optimizer.py         Global traversability preservation between blocks
     canopy.py                   Emergent memory cluster growth from co-activation
+    directional_canopy.py       Inflow (convergence attractor) + outflow (distributor) canopy layers
     adaptive_thresholds.py      EMA-based threshold tuning with burn-in
     meta_analyzer.py            Higher-order pattern detection across synchronicity events
     feedback.py                 User feedback integration
@@ -552,7 +578,7 @@ chicory/
     phase.py                    PhaseQuadrant
     meta_pattern.py             MetaPattern
     retrieval.py                RetrievalResult
-    canopy.py                   CanopyShape, ScoreBundle
+    canopy.py                   CanopyShape, ScoreBundle, InflowScore, OutflowScore
   orchestrator/                 Central coordinator
     orchestrator.py             Ties all layers together, background detection thread
     tool_handlers.py            Tool dispatch for MCP and CLI
@@ -602,6 +628,12 @@ User sends message
         -> activate episodic edges for co-retrieved memory pairs
         -> temporal episode: drift/revisit check, assign retrieved memories
         -> forest reorganization + canopy observation
+        -> directional canopy observation:
+           -> compute query-side tags (centroid similarity to query embedding)
+           -> record directional_retrieval_context (query_tag_hash)
+           -> inflow observer: score result cluster convergence diversity
+           -> outflow observer: score query tag set distribution reach
+           -> update directional_block_scores for bridge optimizer
         -> [background thread]:
            -> update salience on access
            -> record trend events (filtered)
@@ -656,6 +688,10 @@ Key parameters in `ChicoryConfig` (70+ total, all overridable via environment va
 | `episode_drift_sigma` | `2.0` | Welford k: threshold = mean + k*sqrt(variance) |
 | `episode_sync_boundary_strength` | `0.7` | Min effective strength for sync-forced boundary |
 | `episode_revisit_max_candidates` | `50` | Max dormant episodes checked for revisitation |
+| `canopy_directional_enabled` | `true` | Enable directional inflow/outflow canopy layers |
+| `canopy_directional_inflow_rescue_weight` | `0.3` | How much inflow rescues bridge hub penalty |
+| `canopy_directional_outflow_rescue_weight` | `0.3` | How much outflow rescues bridge hub penalty |
+| `canopy_directional_query_tag_similarity_threshold` | `0.3` | Centroid cosine threshold for query-side tag detection |
 | `commons_enabled` | `false` | Enable cross-project signal federation |
 
 ## Tests
@@ -680,7 +716,7 @@ pytest tests/test_glyph_analyzer.py -v              # Glyph analysis tests
 
 ## Database
 
-SQLite with WAL mode. Schema v23, versioned migrations with idempotency checks. Thread-safe via `threading.RLock` on all execute/executemany calls.
+SQLite with WAL mode. Schema v28, versioned migrations with idempotency checks. Thread-safe via `threading.RLock` on all execute/executemany calls.
 
 ```bash
 chicory status          # Show memory count, tag count, tensor state
