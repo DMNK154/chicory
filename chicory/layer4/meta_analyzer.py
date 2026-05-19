@@ -85,20 +85,23 @@ class MetaAnalyzer:
             lattice_cutoff = (
                 datetime.utcnow() - timedelta(hours=window * 4)
             ).isoformat()
-            partner_rows = self._db.execute(
-                """SELECT DISTINCT r.event_b_id AS pid
+            rows_a = self._db.execute(
+                """SELECT r.event_b_id AS pid
                    FROM resonances r
                    JOIN synchronicity_events se ON r.event_a_id = se.id
-                   WHERE se.detected_at > ?
-                   UNION
-                   SELECT DISTINCT r.event_a_id AS pid
+                   WHERE se.detected_at > ?""",
+                (cutoff,),
+            ).fetchall()
+            rows_b = self._db.execute(
+                """SELECT r.event_a_id AS pid
                    FROM resonances r
                    JOIN synchronicity_events se ON r.event_b_id = se.id
                    WHERE se.detected_at > ?""",
-                (cutoff, cutoff),
+                (cutoff,),
             ).fetchall()
+            partner_pids = {r["pid"] for r in rows_a} | {r["pid"] for r in rows_b}
 
-            missing = [r["pid"] for r in partner_rows if r["pid"] not in by_id]
+            missing = [pid for pid in partner_pids if pid not in by_id]
             if missing:
                 for i in range(0, len(missing), 500):
                     chunk = missing[i:i + 500]

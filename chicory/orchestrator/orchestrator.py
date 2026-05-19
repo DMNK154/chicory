@@ -21,9 +21,11 @@ from chicory.layer3.phase_space import PhaseSpace
 from chicory.layer3.synchronicity_detector import SynchronicityDetector
 from chicory.layer3.centroid_subgraph import CentroidSubgraph
 from chicory.layer3.synchronicity_engine import SynchronicityEngine
+from chicory.layer3.tag_space import TagSpace
+from chicory.layer3.tensor_cache import TensorCache
 from chicory.layer4.adaptive_thresholds import AdaptiveThresholds
 from chicory.layer4.canopy import CanopyObserver
-from chicory.layer4.directional_canopy import DirectionalCanopy
+from chicory.layer3.directional_flow import InflowObserver, OutflowObserver
 from chicory.layer4.episodic_tensor import EpisodicTensor
 from chicory.layer4.temporal_episodes import TemporalEpisodeTracker
 from chicory.layer4.feedback import FeedbackEngine
@@ -48,6 +50,7 @@ class Orchestrator:
         # avoided without blocking user-facing calls indefinitely.
         # RLock so any future nested foreground call doesn't deadlock.
         self._foreground_db_lock = threading.RLock()
+        self._foreground_waiting = threading.Event()
 
         # Database
         self._db = DatabaseEngine(config)
@@ -88,9 +91,12 @@ class Orchestrator:
             from chicory.layer1.glyph_encoder import GlyphEncoder
             self._glyph_encoder = GlyphEncoder(config, self._db)
 
+        self._tensor_cache = TensorCache(self._db)
+
         self._sync_engine = SynchronicityEngine(
             config, self._db, self._embedding_engine, self._tag_manager,
             glyph_encoder=self._glyph_encoder,
+            tensor_cache=self._tensor_cache,
         )
 
         # Centroid sub-graph for retrieval-driven inhibition
@@ -110,11 +116,16 @@ class Orchestrator:
         # Seed centroid sub-graph if empty
         self._maybe_seed_centroid_subgraph()
 
+        # Tag Space — independent tag-graph retrieval path
+        self._tag_space = TagSpace(config, self._db, self._tag_manager,
+                                   tensor_cache=self._tensor_cache)
+
         # Layer 1 (complete — now has access to Layer 3 for lattice-aware retrieval)
         self._memory_store = MemoryStore(
             config, self._db, self._embedding_engine,
             self._tag_manager, self._salience,
             sync_engine=self._sync_engine,
+            tag_space=self._tag_space,
         )
 
         # Layer 4
@@ -128,7 +139,8 @@ class Orchestrator:
         # Layer 4.5 — Forest + Canopy + Episodic Tensor
         self._forest = ForestReorganizer(self._db, config)
         self._canopy = CanopyObserver(self._db, config, self._forest)
-        self._directional_canopy = DirectionalCanopy(self._db, config)
+        self._inflow_observer = InflowObserver(self._db, config)
+        self._outflow_observer = OutflowObserver(self._db, config)
         self._episodic_tensor = EpisodicTensor(self._db, config)
         self._temporal_episodes = TemporalEpisodeTracker(
             self._db, config, self._centroid_subgraph,
@@ -594,6 +606,7 @@ class Orchestrator:
 
         # Commit all changes
         self._db.connection.commit()
+        self._tensor_cache.invalidate()
 
         _report("done", f"Sync complete in {stats['total_seconds']:.1f}s")
         return stats
@@ -630,50 +643,61 @@ class Orchestrator:
         lattice placement, canopy, etc). Callers must handle side effects
         themselves — used by bulk ingestion to avoid O(n) expensive work.
         """
-        # Hold the foreground lock so the background sync thread can't
-        # collide with our DB writes on the shared SQLite connection.
-        with self._foreground_db_lock:
-            salience = importance if importance is not None else 0.5
+        salience = importance if importance is not None else 0.5
 
-            # Glyph content analysis: extract concept-derived tags from content
-            glyph_analysis = analyze_text(content)
-            glyph_derived_tags = extract_glyph_tags(content)
+        # CPU-bound work outside the lock so retrievals aren't blocked
+        glyph_analysis = analyze_text(content)
+        glyph_derived_tags = extract_glyph_tags(content)
 
-            # Merge glyph-derived tags into the tag list (no duplicates)
-            merged_tags = list(tags)
-            for gt in glyph_derived_tags:
-                if gt not in merged_tags:
-                    merged_tags.append(gt)
+        merged_tags = list(tags)
+        for gt in glyph_derived_tags:
+            if gt not in merged_tags:
+                merged_tags.append(gt)
 
-            memory = self._memory_store.store(
-                content=content,
-                tags=merged_tags,
-                salience_model=salience,
-                summary=summary,
-                skip_embedding=skip_embedding,
-                content_hash=content_hash,
-                source_path=source_path,
-                ingestion_tier=ingestion_tier,
-            )
+        # Pre-compute embedding outside the lock (model forward pass is CPU-bound)
+        precomputed: list[np.ndarray] | None = None
+        if not skip_embedding:
+            from chicory.ingest.chunker import chunk_text_for_embedding
+            chunks = chunk_text_for_embedding(content)
+            if len(chunks) <= 1:
+                precomputed = [self._embedding_engine.embed(content)]
+            else:
+                precomputed = list(self._embedding_engine.embed_batch(chunks))
 
-            # Persist glyph analysis metadata on the memory row
-            if glyph_analysis["words"]:
-                self._store_glyph_metadata(memory.id, glyph_analysis)
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                memory = self._memory_store.store(
+                    content=content,
+                    tags=merged_tags,
+                    salience_model=salience,
+                    summary=summary,
+                    skip_embedding=True,
+                    content_hash=content_hash,
+                    source_path=source_path,
+                    ingestion_tier=ingestion_tier,
+                    precomputed_embeddings=precomputed,
+                )
 
-            if not defer_side_effects:
-                self._on_memory_stored(memory, glyph_analysis=glyph_analysis)
+                if glyph_analysis["words"]:
+                    self._store_glyph_metadata(memory.id, glyph_analysis)
 
-            return {
-                "status": "stored",
-                "memory_id": memory.id,
-                "tags": memory.tags,
-                "glyph_concepts": [
-                    {"concept": w["word"], "glyph": w["glyph"]}
-                    for w in glyph_analysis["words"]
-                ],
-                "glyph_pairs": glyph_analysis["pairs"],
-                "salience": memory.salience_composite,
-            }
+                if not defer_side_effects:
+                    self._on_memory_stored(memory, glyph_analysis=glyph_analysis)
+
+                return {
+                    "status": "stored",
+                    "memory_id": memory.id,
+                    "tags": memory.tags,
+                    "glyph_concepts": [
+                        {"concept": w["word"], "glyph": w["glyph"]}
+                        for w in glyph_analysis["words"]
+                    ],
+                    "glyph_pairs": glyph_analysis["pairs"],
+                    "salience": memory.salience_composite,
+                }
+        finally:
+            self._foreground_waiting.clear()
 
     def handle_retrieve_memories(
         self,
@@ -683,10 +707,15 @@ class Orchestrator:
         top_k: int = 10,
     ) -> dict[str, Any]:
         """Retrieve memories, log the event, and fire side effects."""
-        # Hold the foreground lock so the background sync thread can't
-        # write to the shared SQLite connection while we're mid-retrieval.
-        with self._foreground_db_lock:
-            return self._handle_retrieve_memories_locked(query, tags, method, top_k)
+        # Signal background thread that foreground needs the lock,
+        # then acquire it.  The background thread checks the event
+        # and yields if foreground is waiting.
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                return self._handle_retrieve_memories_locked(query, tags, method, top_k)
+        finally:
+            self._foreground_waiting.clear()
 
     def _handle_retrieve_memories_locked(
         self,
@@ -847,12 +876,14 @@ class Orchestrator:
         retrieve excluding already-seen IDs, apply time-depth scoring that
         progressively favors older memories at deeper recursion levels.
         """
-        # Hold the foreground lock so the background sync thread can't
-        # write to the shared SQLite connection while we're mid-retrieval.
-        with self._foreground_db_lock:
-            return self._handle_deep_retrieve_locked(
-                query, tags, max_depth, per_level_k,
-            )
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                return self._handle_deep_retrieve_locked(
+                    query, tags, max_depth, per_level_k,
+                )
+        finally:
+            self._foreground_waiting.clear()
 
     def _handle_deep_retrieve_locked(
         self,
@@ -1184,26 +1215,18 @@ class Orchestrator:
         else:
             allowed_suffixes = CODE_EXTENSIONS
 
-        # Directories to always skip
-        skip_dirs = {
-            ".git", ".venv", "venv", "node_modules", "__pycache__",
-            ".env", ".tox", ".mypy_cache", ".pytest_cache", "dist",
-            "build", ".eggs", "*.egg-info",
-        }
+        # Load .chicoryignore + defaults + caller exclusions
+        from chicory.ingest.ignore import is_ignored, load_ignore_patterns
+        patterns = load_ignore_patterns(directory)
         if exclude_patterns:
-            skip_dirs.update(exclude_patterns)
+            patterns.update(exclude_patterns)
 
         # Collect files
         all_files: list[Path] = []
         for f in directory.rglob("*"):
             if not f.is_file():
                 continue
-            # Skip hidden and excluded directories
-            parts = f.relative_to(directory).parts
-            if any(
-                part.startswith(".") or part in skip_dirs
-                for part in parts[:-1]
-            ):
+            if is_ignored(f, directory, patterns):
                 continue
             # Check extension / pattern match
             if file_patterns:
@@ -1313,6 +1336,7 @@ class Orchestrator:
 
             # Update co-occurrence, semantic, and semiotic tensor networks
             self._sync_engine.seed_tensor_from_associations()
+            self._tensor_cache.invalidate()
 
         return stats
 
@@ -1353,23 +1377,16 @@ class Orchestrator:
             base_dir = target.parent
         elif target.is_dir():
             base_dir = target
-            skip_dirs = {
-                ".git", ".venv", "venv", "node_modules", "__pycache__",
-                ".env", ".tox", ".mypy_cache", ".pytest_cache", "dist",
-                "build", ".eggs",
-            }
+            from chicory.ingest.ignore import is_ignored, load_ignore_patterns
+            patterns = load_ignore_patterns(target)
             if exclude_patterns:
-                skip_dirs.update(exclude_patterns)
+                patterns.update(exclude_patterns)
 
             files = []
             for f in target.rglob("*"):
                 if not f.is_file():
                     continue
-                parts = f.relative_to(target).parts
-                if any(
-                    part.startswith(".") or part in skip_dirs
-                    for part in parts[:-1]
-                ):
+                if is_ignored(f, target, patterns):
                     continue
                 if file_patterns:
                     rel_str = str(f.relative_to(target))
@@ -1544,17 +1561,18 @@ class Orchestrator:
         # Single batch embed call — one model load, one forward pass
         all_vecs = self._embedding_engine.embed_batch(all_texts)
 
-        # Distribute vectors back to their memories
-        vec_idx = 0
-        for memory_id, chunks in embed_tasks:
-            n_chunks = len(chunks)
-            vecs = [all_vecs[vec_idx + i] for i in range(n_chunks)]
-            vec_idx += n_chunks
+        # Distribute vectors back to their memories (single cache invalidation)
+        with self._embedding_engine.batch_write():
+            vec_idx = 0
+            for memory_id, chunks in embed_tasks:
+                n_chunks = len(chunks)
+                vecs = [all_vecs[vec_idx + i] for i in range(n_chunks)]
+                vec_idx += n_chunks
 
-            if n_chunks == 1:
-                self._embedding_engine.store_cached(memory_id, vecs[0])
-            else:
-                self._embedding_engine.store_chunks(memory_id, vecs)
+                if n_chunks == 1:
+                    self._embedding_engine.store_cached(memory_id, vecs[0])
+                else:
+                    self._embedding_engine.store_chunks(memory_id, vecs)
 
     def _finalize_ingested_memories(self, memory_ids: list[str]) -> None:
         """Batch side effects for memories stored with defer_side_effects=True.
@@ -1604,6 +1622,7 @@ class Orchestrator:
 
         # Tensor network seeding
         self._sync_engine.seed_tensor_from_associations()
+        self._tensor_cache.invalidate()
 
     def _generate_project_overview(
         self,
@@ -1839,6 +1858,9 @@ class Orchestrator:
         )
         self._db.connection.commit()
 
+    _formula_to_text = None
+    _formula_to_text_checked = False
+
     def _annotate_glyph(
         self,
         entry: dict[str, Any],
@@ -1856,11 +1878,20 @@ class Orchestrator:
         if not formula:
             return
 
-        # Try GPT-GU's formula_to_text for a prose reading
-        try:
-            from app.guardrails import formula_to_text
-            entry["glyph_reading"] = formula_to_text(formula)
-        except (ImportError, Exception):
+        if not Orchestrator._formula_to_text_checked:
+            Orchestrator._formula_to_text_checked = True
+            try:
+                from app.guardrails import formula_to_text
+                Orchestrator._formula_to_text = formula_to_text
+            except ImportError:
+                pass
+
+        if Orchestrator._formula_to_text is not None:
+            try:
+                entry["glyph_reading"] = Orchestrator._formula_to_text(formula)
+            except Exception:
+                entry["glyph_reading"] = result["glyph_line"] or formula
+        else:
             entry["glyph_reading"] = result["glyph_line"] or formula
 
     def _get_glyph_metadata_batch(self, memory_ids: list[str]) -> dict[str, dict]:
@@ -1926,6 +1957,9 @@ class Orchestrator:
                     self._centroid_subgraph.update_centroid_on_store(
                         tag.id, embedding,
                     )
+                self._centroid_cache = None
+                self._tag_space.invalidate_caches()
+                self._tensor_cache.invalidate()
 
         # Place word tags on the glyph Ramsey lattice
         word_tags = [t for t in memory.tags if t]
@@ -2002,37 +2036,38 @@ class Orchestrator:
         work inside (sync detection / commons processing) is rate-limited
         internally so it'll catch up when the system goes idle.
         """
-        # 10s gives foreground plenty of headroom for a normal retrieval
-        # (which typically completes in <200ms) while still bounding how
-        # long this thread sits parked.
-        acquired = self._foreground_db_lock.acquire(timeout=10.0)
-        if not acquired:
-            logging.getLogger(__name__).info(
-                "background sync skipped: foreground busy >10s"
-            )
-            return
-        try:
+        # Run each phase under a short-lived lock acquisition so the
+        # foreground can preempt between phases.  Each phase re-acquires
+        # the lock independently — if a foreground retrieval arrives, it
+        # gets served between phases instead of waiting for the entire
+        # background pass to finish.
+        phases = [
+            ("deferred retrieval work", self._run_deferred_retrieval_work),
+            ("sync detection", self._maybe_run_sync_detection),
+        ]
+        if self._signal_processor:
+            phases.append(("commons auto-process", self._commons_auto_process))
+
+        for name, fn in phases:
+            if self._foreground_waiting.is_set():
+                logging.getLogger(__name__).debug(
+                    "background %s deferred: foreground waiting", name
+                )
+                return
+            acquired = self._foreground_db_lock.acquire(timeout=10.0)
+            if not acquired:
+                logging.getLogger(__name__).info(
+                    "background %s skipped: foreground busy >10s", name
+                )
+                return
             try:
-                self._run_deferred_retrieval_work()
+                fn()
             except Exception:
                 logging.getLogger(__name__).exception(
-                    "Error in deferred retrieval work"
+                    "Error in background %s", name
                 )
-            try:
-                self._maybe_run_sync_detection()
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "Error in background sync detection"
-                )
-            if self._signal_processor:
-                try:
-                    self._commons_auto_process()
-                except Exception:
-                    logging.getLogger(__name__).exception(
-                        "Error in commons auto-process"
-                    )
-        finally:
-            self._foreground_db_lock.release()
+            finally:
+                self._foreground_db_lock.release()
 
     def _run_deferred_retrieval_work(self) -> None:
         """Forest, canopy, episodic tensor, and episode updates from last retrieval."""
@@ -2045,10 +2080,42 @@ class Orchestrator:
         memory_ids = bg["memory_ids"]
         tag_ids_map = bg["tag_ids_map"]
 
+        query_tag_ids = bg.get("query_tag_ids", [])
+        outflow_boost = 0.0
+        if self._config.canopy_directional_enabled and query_tag_ids:
+            from chicory.layer3.directional_flow import _hash_sorted_ids as _hsi
+            q_hash = _hsi(query_tag_ids)
+            outflow_score = self._outflow_observer.observe(
+                retrieval_id=retrieval_id,
+                query_tag_ids=query_tag_ids,
+                query_tag_hash=q_hash,
+                result_memory_ids=memory_ids,
+            )
+            outflow_boost = outflow_score.outflow_strength
+
         if self._config.canopy_enabled and len(memory_ids) >= 2:
             for i in range(len(memory_ids)):
                 for j in range(i + 1, len(memory_ids)):
-                    self._episodic_tensor.activate_edge(memory_ids[i], memory_ids[j])
+                    self._episodic_tensor.activate_edge(
+                        memory_ids[i], memory_ids[j],
+                        outflow_strength=outflow_boost,
+                    )
+
+        inflow_canopy_boost = 0.0
+        inflow_score_bg = bg.get("inflow_score")
+        if inflow_score_bg and inflow_score_bg.unique_query_contexts > 0:
+            import math
+            max_row = self._db.execute(
+                "SELECT MAX(unique_query_contexts) as mx FROM inflow_canopy_blocks"
+            ).fetchone()
+            max_contexts = max(
+                (max_row["mx"] or 1) if max_row else 1,
+                inflow_score_bg.unique_query_contexts,
+            )
+            inflow_canopy_boost = (
+                math.log(1.0 + inflow_score_bg.unique_query_contexts)
+                / math.log(1.0 + max_contexts)
+            )
 
         if self._config.canopy_enabled:
             all_retrieval_tags: list[int] = []
@@ -2064,18 +2131,9 @@ class Orchestrator:
                     source="retrieval",
                     source_id=str(retrieval_id),
                     memory_ids=memory_ids,
+                    outflow_boost=outflow_boost,
+                    inflow_boost=inflow_canopy_boost,
                 )
-
-        query_tag_ids = bg.get("query_tag_ids", [])
-        if self._config.canopy_directional_enabled and len(memory_ids) >= 2:
-            self._directional_canopy.observe(
-                retrieval_id=retrieval_id,
-                query_tag_ids=query_tag_ids,
-                result_memory_ids=memory_ids,
-                result_tag_ids=list(set(
-                    tid for tids in tag_ids_map.values() for tid in tids
-                )),
-            )
 
         if self._config.episode_enabled:
             all_ep_tags = list(set(
@@ -2135,22 +2193,6 @@ class Orchestrator:
         _bt["sync_reinforce"] = _time.perf_counter() - _s
 
         _s = _time.perf_counter()
-        if self._config.centroid_inhibition_enabled:
-            all_tag_ids_flat: list[int] = []
-            for tids in tag_ids_map.values():
-                all_tag_ids_flat.extend(tids)
-            unique_tags = list(set(all_tag_ids_flat))
-            if len(unique_tags) >= 2:
-                mean_relevance = (
-                    sum(score for _, score in results) / len(results)
-                )
-                self._centroid_subgraph.record_co_retrieval(unique_tags)
-                self._centroid_subgraph.update_on_retrieval(
-                    unique_tags, mean_relevance,
-                )
-        _bt["centroid_reweight"] = _time.perf_counter() - _s
-
-        _s = _time.perf_counter()
         if self._signal_emitter:
             all_tag_ids: set[int] = set()
             for tids in tag_ids_map.values():
@@ -2189,6 +2231,75 @@ class Orchestrator:
                 ),
             )
 
+        _s = _time.perf_counter()
+        from chicory.models.canopy import InflowScore
+        inflow_score = InflowScore()
+        if self._config.canopy_directional_enabled and len(memory_ids) >= 2:
+            all_result_tag_ids_for_inflow = list(set(
+                tid for tids in tag_ids_map.values() for tid in tids
+            ))
+            from chicory.layer3.directional_flow import _hash_sorted_ids as _hsi
+            q_hash_inflow = _hsi(query_tag_ids) if query_tag_ids else "empty"
+            inflow_score = self._inflow_observer.observe(
+                retrieval_id=retrieval_id,
+                query_tag_ids=query_tag_ids,
+                query_tag_hash=q_hash_inflow,
+                result_memory_ids=memory_ids,
+                result_tag_ids=all_result_tag_ids_for_inflow,
+            )
+        _bt["inflow_canopy"] = _time.perf_counter() - _s
+
+        _s = _time.perf_counter()
+        if self._config.centroid_inhibition_enabled:
+            all_tag_ids_flat: list[int] = []
+            for tids in tag_ids_map.values():
+                all_tag_ids_flat.extend(tids)
+            all_unique = set(all_tag_ids_flat)
+
+            # Filter to query-relevant tags via centroid similarity
+            query_vec = getattr(self._memory_store, "_last_query_vec", None)
+            if query_vec is not None:
+                relevant = self._tag_space.centroid_match(query_vec)
+                unique_tags = sorted(all_unique & relevant)
+            else:
+                unique_tags = sorted(all_unique)
+
+            if len(unique_tags) >= 2:
+                mean_relevance = (
+                    sum(score for _, score in results) / len(results)
+                )
+
+                pair_diversity: dict[tuple[int, int], float] | None = None
+                if (self._config.canopy_directional_enabled
+                        and inflow_score.block_key):
+                    import itertools
+                    sorted_tags = sorted(set(unique_tags))
+                    tag_pairs = list(itertools.combinations(sorted_tags, 2))
+                    if tag_pairs:
+                        raw_diversity = self._inflow_observer.compute_pair_diversity(
+                            inflow_score.block_key, tag_pairs,
+                        )
+                        gate_threshold = self._config.canopy_directional_inflow_context_gate_threshold
+                        ctx_count = inflow_score.unique_query_contexts
+                        if gate_threshold > 1:
+                            context_gate = min(1.0, max(0.0,
+                                (ctx_count - 1) / (gate_threshold - 1),
+                            ))
+                        else:
+                            context_gate = 1.0 if ctx_count >= 1 else 0.0
+                        boost_w = self._config.canopy_directional_inflow_centroid_boost
+                        pair_diversity = {
+                            pair: div * context_gate * boost_w
+                            for pair, div in raw_diversity.items()
+                        }
+
+                self._centroid_subgraph.record_co_retrieval(unique_tags)
+                self._centroid_subgraph.update_on_retrieval(
+                    unique_tags, mean_relevance,
+                    pair_diversity=pair_diversity,
+                )
+        _bt["centroid_reweight"] = _time.perf_counter() - _s
+
         self._last_bookkeeping_breakdown = _bt
         logging.getLogger(__name__).info("bookkeeping_timing: %s", _bt)
 
@@ -2197,104 +2308,44 @@ class Orchestrator:
             "memory_ids": memory_ids,
             "tag_ids_map": tag_ids_map,
             "query_tag_ids": query_tag_ids,
+            "inflow_score": inflow_score,
         }
-
-    def _filter_relevant_tags(
-        self,
-        tag_ids_map: dict[str, list[int]],
-        query: str,
-    ) -> dict[str, list[int]]:
-        """Keep only tags whose centroid is similar to the query embedding."""
-        import numpy as np
-
-        if not query:
-            return tag_ids_map
-
-        all_tag_ids: set[int] = set()
-        for tids in tag_ids_map.values():
-            all_tag_ids.update(tids)
-        if not all_tag_ids:
-            return tag_ids_map
-
-        try:
-            query_vec = self._embedding_engine.embed(query)
-        except Exception:
-            return tag_ids_map
-
-        placeholders = ",".join("?" * len(all_tag_ids))
-        rows = self._db.execute(
-            f"SELECT tag_id, centroid FROM tag_centroids "
-            f"WHERE tag_id IN ({placeholders})",
-            list(all_tag_ids),
-        ).fetchall()
-
-        if not rows:
-            return tag_ids_map
-
-        row_tag_ids = [r["tag_id"] for r in rows]
-        centroid_matrix = np.stack([
-            np.frombuffer(r["centroid"], dtype=np.float32) for r in rows
-        ])
-        similarities = centroid_matrix @ query_vec
-
-        threshold = self._config.similarity_threshold
-        relevant_ids = {
-            row_tag_ids[i]
-            for i in range(len(row_tag_ids))
-            if similarities[i] >= threshold
-        }
-
-        # Tags without centroids pass through (new tags not yet embedded)
-        tags_with_centroids = set(row_tag_ids)
-        filtered: dict[str, list[int]] = {}
-        for mid, tids in tag_ids_map.items():
-            kept = [
-                t for t in tids
-                if t in relevant_ids or t not in tags_with_centroids
-            ]
-            if kept:
-                filtered[mid] = kept
-
-        return filtered
 
     def _compute_query_side_tags(self, query: str) -> list[int]:
         """Find all tags whose centroids are similar to the query embedding."""
-        import numpy as np
+        query_vec = getattr(self._memory_store, "_last_query_vec", None)
+        if query_vec is None:
+            try:
+                query_vec = self._embedding_engine.embed(query)
+            except Exception:
+                return []
 
-        try:
-            query_vec = self._embedding_engine.embed(query)
-        except Exception:
-            return []
-
-        rows = self._db.execute(
-            "SELECT tag_id, centroid FROM tag_centroids"
-        ).fetchall()
-        if not rows:
-            return []
-
-        tag_ids = [r["tag_id"] for r in rows]
-        centroid_matrix = np.stack([
-            np.frombuffer(r["centroid"], dtype=np.float32) for r in rows
-        ])
-        similarities = centroid_matrix @ query_vec
-
-        threshold = self._config.canopy_directional_query_tag_similarity_threshold
-        return [
-            tag_ids[i]
-            for i in range(len(tag_ids))
-            if similarities[i] >= threshold
-        ]
+        return list(self._tag_space.centroid_match(query_vec))
 
     def _maybe_run_sync_detection(self) -> None:
-        """Run synchronicity detection if enough time has passed."""
+        """Run synchronicity detection if enough time has passed.
+
+        Releases the foreground lock during the expensive detection
+        pass so user-facing queries aren't blocked.  Re-acquires to
+        write results.
+        """
         now = datetime.utcnow()
         if self._last_sync_check and (now - self._last_sync_check).total_seconds() < 60:
             return  # At most once per minute
 
         self._last_sync_check = now
-        new_events = self._sync_detector.check_for_synchronicities()
 
-        # Place new events on the prime Ramsey lattice
+        # Release lock during the expensive computation so foreground
+        # queries aren't blocked.  check_for_synchronicities does DB
+        # reads + record_event writes, but those are small row inserts
+        # that don't conflict with foreground WAL reads.
+        self._foreground_db_lock.release()
+        try:
+            new_events = self._sync_detector.check_for_synchronicities()
+        finally:
+            self._foreground_db_lock.acquire()
+
+        # Place new events on the prime Ramsey lattice (under lock)
         if new_events:
             self._sync_engine.place_events_batch(new_events)
 

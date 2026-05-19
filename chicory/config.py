@@ -200,9 +200,12 @@ class ChicoryConfig(BaseModel):
     canopy_directional_inflow_frequency_weight: float = Field(default=0.3)
     canopy_directional_outflow_diversity_weight: float = Field(default=0.6)
     canopy_directional_outflow_reach_weight: float = Field(default=0.4)
-    canopy_directional_inflow_rescue_weight: float = Field(default=0.3)
-    canopy_directional_outflow_rescue_weight: float = Field(default=0.3)
+    canopy_directional_inflow_centroid_boost: float = Field(default=0.3)
+    canopy_directional_outflow_pressure_weight: float = Field(default=0.5)
+    canopy_directional_ema_alpha: float = Field(default=0.25)
     canopy_directional_query_tag_similarity_threshold: float = Field(default=0.3)
+    canopy_directional_inflow_context_gate_threshold: int = Field(default=5)
+    canopy_directional_inflow_pressure_weight: float = Field(default=0.4)
 
     # Temporal tag episodes — drift-detected, revisitable tag-space clusters
     episode_enabled: bool = Field(default=True)
@@ -220,6 +223,7 @@ class ChicoryConfig(BaseModel):
     episodic_temporal_halflife_hours: float = Field(default=720.0)
     episodic_decay_inactive_hours: float = Field(default=2160.0)  # ~90 days
     episodic_min_edge_strength: float = Field(default=0.05)
+    episodic_co_retrieval_ema_alpha: float = Field(default=0.2)
 
     # Migration
     burn_in_hours: float = Field(default=48.0)
@@ -228,6 +232,15 @@ class ChicoryConfig(BaseModel):
     # Retrieval
     hybrid_semantic_weight: float = Field(default=0.7)
     hybrid_tag_weight: float = Field(default=0.3)
+
+    # Tag Space — independent tag-graph retrieval path
+    tag_space_enabled: bool = Field(default=True)
+    tag_space_weight: float = Field(default=0.15)
+    tag_space_fan_depth: int = Field(default=1)
+    tag_space_lexical_min_tag_length: int = Field(default=3)
+    tag_space_min_inward_ratio: float = Field(default=0.01)
+    tag_space_centroid_similarity_threshold: float = Field(default=0.4)
+    tag_space_max_context_seed_edges: int = Field(default=25)
 
     # Deep Retrieve
     deep_retrieve_max_depth: int = Field(default=3)

@@ -121,6 +121,7 @@ class CanopyShape(BaseModel):
 class InflowScore(BaseModel):
     """Convergence attractor score for an inflow canopy block."""
 
+    block_key: str = ""
     inflow_diversity: float = 0.0
     unique_query_contexts: int = 0
     total_activations: int = 0

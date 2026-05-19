@@ -18,6 +18,7 @@ from chicory.db.engine import DatabaseEngine
 from chicory.layer1.embedding_engine import EmbeddingEngine
 from chicory.layer1.tag_manager import TagManager
 from chicory.layer3.poincare import PoincareProjection
+from chicory.layer3.tensor_cache import TensorCache
 from chicory.layer3.semiotic_graph import SemioticDirectedGraph
 from chicory.models.lattice import GlyphPosition, LatticePosition, Resonance, VoidProfile
 from chicory.models.synchronicity import SynchronicityEvent
@@ -41,6 +42,7 @@ class SynchronicityEngine:
         embedding_engine: EmbeddingEngine,
         tag_manager: TagManager,
         glyph_encoder: object | None = None,
+        tensor_cache: TensorCache | None = None,
     ) -> None:
         self._config = config
         self._db = db
@@ -48,12 +50,15 @@ class SynchronicityEngine:
         self._tags = tag_manager
         self._pca_basis: Optional[np.ndarray] = None
         self._glyph_encoder = glyph_encoder  # GlyphEncoder or None
+        self._tensor_cache = tensor_cache
         self._poincare = PoincareProjection(
             curvature=config.poincare_curvature,
             max_radius=config.poincare_max_radius,
         )
         self._semiotic_graph = SemioticDirectedGraph(
-            db.connection, min_strength=config.semiotic_directed_min_strength
+            db.connection,
+            min_strength=config.semiotic_directed_min_strength,
+            tensor_cache=tensor_cache,
         )
 
     @property
@@ -1488,28 +1493,26 @@ class SynchronicityEngine:
         _cp0 = _time.perf_counter()
 
         query_tag_set = set(tag_ids)
-        placeholders = ",".join("?" * len(tag_ids))
 
         _s = _time.perf_counter()
-        rows = self._db.execute(
-            f"""
-            SELECT tag_a_id, tag_b_id,
-                   cooccurrence_strength, synchronicity_strength,
-                   semantic_strength, semiotic_forward, semiotic_reverse,
-                   glyph_strength, inhibition_strength, parallelness
-            FROM tag_relational_tensor
-            WHERE tag_a_id IN ({placeholders})
-            UNION ALL
-            SELECT tag_a_id, tag_b_id,
-                   cooccurrence_strength, synchronicity_strength,
-                   semantic_strength, semiotic_forward, semiotic_reverse,
-                   glyph_strength, inhibition_strength, parallelness
-            FROM tag_relational_tensor
-            WHERE tag_b_id IN ({placeholders})
-              AND tag_a_id NOT IN ({placeholders})
-            """,
-            (*tag_ids, *tag_ids, *tag_ids),
-        ).fetchall()
+        if self._tensor_cache:
+            rows = self._tensor_cache.rows_touching(tag_ids)
+        else:
+            placeholders = ",".join("?" * len(tag_ids))
+            _cols = ("tag_a_id, tag_b_id, cooccurrence_strength, synchronicity_strength,"
+                     " semantic_strength, semiotic_forward, semiotic_reverse,"
+                     " glyph_strength, inhibition_strength, parallelness")
+            _params = tuple(tag_ids)
+            rows_a = self._db.execute(
+                f"SELECT {_cols} FROM tag_relational_tensor WHERE tag_a_id IN ({placeholders})",
+                _params,
+            ).fetchall()
+            rows_b = self._db.execute(
+                f"SELECT {_cols} FROM tag_relational_tensor WHERE tag_b_id IN ({placeholders})",
+                _params,
+            ).fetchall()
+            seen = {(r["tag_a_id"], r["tag_b_id"]) for r in rows_a}
+            rows = list(rows_a) + [r for r in rows_b if (r["tag_a_id"], r["tag_b_id"]) not in seen]
         _cp["tensor_query"] = _time.perf_counter() - _s
         _cp["tensor_rows"] = len(rows)
 
@@ -1593,22 +1596,20 @@ class SynchronicityEngine:
     def _episodic_path(self, seed_memory_ids: list[str]) -> dict[str, float]:
         """Get episodic tensor neighbors of seed memories."""
         ph = ",".join("?" * len(seed_memory_ids))
-        rows = self._db.execute(
-            f"""
-            SELECT memory_b_id AS neighbor,
-                   semantic_strength + tag_projected_strength
-                   + co_retrieval_strength + bridge_strength AS score
-            FROM memory_relational_tensor
-            WHERE memory_a_id IN ({ph}) AND edge_status != 'archived'
-            UNION ALL
-            SELECT memory_a_id AS neighbor,
-                   semantic_strength + tag_projected_strength
-                   + co_retrieval_strength + bridge_strength AS score
-            FROM memory_relational_tensor
-            WHERE memory_b_id IN ({ph}) AND edge_status != 'archived'
-            """,
-            (*seed_memory_ids, *seed_memory_ids),
+        _score = ("semantic_strength + tag_projected_strength"
+                  " + co_retrieval_strength + bridge_strength")
+        _params = tuple(seed_memory_ids)
+        rows_a = self._db.execute(
+            f"SELECT memory_b_id AS neighbor, {_score} AS score "
+            f"FROM memory_relational_tensor WHERE memory_a_id IN ({ph}) AND edge_status != 'archived'",
+            _params,
         ).fetchall()
+        rows_b = self._db.execute(
+            f"SELECT memory_a_id AS neighbor, {_score} AS score "
+            f"FROM memory_relational_tensor WHERE memory_b_id IN ({ph}) AND edge_status != 'archived'",
+            _params,
+        ).fetchall()
+        rows = list(rows_a) + list(rows_b)
 
         seed_set = set(seed_memory_ids)
         scores: dict[str, float] = {}
@@ -1628,17 +1629,18 @@ class SynchronicityEngine:
             return set()
         min_edge = self._config.resonance_min_edge_strength
         ph = ",".join("?" * len(context_ids))
-        rows = self._db.execute(
-            f"""
-            SELECT DISTINCT tag_b_id AS partner FROM centroid_edges
-            WHERE tag_a_id IN ({ph}) AND edge_strength >= ?
-            UNION
-            SELECT DISTINCT tag_a_id AS partner FROM centroid_edges
-            WHERE tag_b_id IN ({ph}) AND edge_strength >= ?
-            """,
-            (*context_ids, min_edge, *context_ids, min_edge),
+        _params = (*context_ids, min_edge)
+        rows_a = self._db.execute(
+            f"SELECT tag_b_id AS partner FROM centroid_edges "
+            f"WHERE tag_a_id IN ({ph}) AND edge_strength >= ?",
+            _params,
         ).fetchall()
-        co_retrieved = {r["partner"] for r in rows}
+        rows_b = self._db.execute(
+            f"SELECT tag_a_id AS partner FROM centroid_edges "
+            f"WHERE tag_b_id IN ({ph}) AND edge_strength >= ?",
+            _params,
+        ).fetchall()
+        co_retrieved = {r["partner"] for r in rows_a} | {r["partner"] for r in rows_b}
         return candidate_ids & co_retrieved
 
     # ── Glyph Ramsey Lattice ─────────────────────────────────────────
@@ -2398,7 +2400,10 @@ class SynchronicityEngine:
         return result
 
     def get_glyph_association_scores(
-        self, context_tag_ids: list[int],
+        self,
+        context_tag_ids: list[int],
+        candidate_memory_ids: list[str] | None = None,
+        candidate_tag_ids_map: dict[str, list[int]] | None = None,
     ) -> list[tuple[str, float]]:
         """Score memories by glyph network association (tensor edge traversal).
 
@@ -2406,33 +2411,38 @@ class SynchronicityEngine:
         glyph tensor edges to find memories connected via glyph resonance,
         with lateral inhibition pruning antiparallel activations.
 
+        When candidate_memory_ids and candidate_tag_ids_map are provided,
+        scores only those candidates (no memory_tags query). Otherwise
+        falls back to full memory_tags resolution.
+
         Returns sorted (memory_id, score) pairs, normalized to [0, 1].
         """
         if not context_tag_ids:
             return []
 
         query_set = set(context_tag_ids)
-        placeholders = ",".join("?" * len(context_tag_ids))
         w_inhib = self._config.tensor_inhibition_weight
 
         # Get all tensor edges touching context tags that have glyph signal
-        rows = self._db.execute(
-            f"""
-            SELECT tag_a_id, tag_b_id,
-                   glyph_strength, cooccurrence_strength,
-                   inhibition_strength, parallelness
-            FROM tag_relational_tensor
-            WHERE tag_a_id IN ({placeholders}) AND glyph_strength > 0
-            UNION ALL
-            SELECT tag_a_id, tag_b_id,
-                   glyph_strength, cooccurrence_strength,
-                   inhibition_strength, parallelness
-            FROM tag_relational_tensor
-            WHERE tag_b_id IN ({placeholders}) AND glyph_strength > 0
-              AND tag_a_id NOT IN ({placeholders})
-            """,
-            (*context_tag_ids, *context_tag_ids, *context_tag_ids),
-        ).fetchall()
+        if self._tensor_cache:
+            rows = [r for r in self._tensor_cache.rows_touching(context_tag_ids)
+                    if r["glyph_strength"] > 0]
+        else:
+            placeholders = ",".join("?" * len(context_tag_ids))
+            _cols = "tag_a_id, tag_b_id, glyph_strength, cooccurrence_strength, inhibition_strength, parallelness"
+            _params = tuple(context_tag_ids)
+            rows_a = self._db.execute(
+                f"SELECT {_cols} FROM tag_relational_tensor "
+                f"WHERE tag_a_id IN ({placeholders}) AND glyph_strength > 0",
+                _params,
+            ).fetchall()
+            rows_b = self._db.execute(
+                f"SELECT {_cols} FROM tag_relational_tensor "
+                f"WHERE tag_b_id IN ({placeholders}) AND glyph_strength > 0",
+                _params,
+            ).fetchall()
+            seen = {(r["tag_a_id"], r["tag_b_id"]) for r in rows_a}
+            rows = list(rows_a) + [r for r in rows_b if (r["tag_a_id"], r["tag_b_id"]) not in seen]
 
         if not rows:
             return []
@@ -2472,31 +2482,44 @@ class SynchronicityEngine:
         if not partner_scores:
             return []
 
-        # Resolve associated partners → memories
-        partner_ids = list(partner_scores.keys())
+        # Resolve partner tags → memory scores using candidate set
         memory_scores: dict[str, float] = {}
-        for i in range(0, len(partner_ids), 500):
-            chunk = partner_ids[i:i + 500]
-            p2 = ",".join("?" * len(chunk))
-            mem_rows = self._db.execute(
-                f"SELECT memory_id, tag_id FROM memory_tags WHERE tag_id IN ({p2})",
-                tuple(chunk),
-            ).fetchall()
-            for r in mem_rows:
-                mid = r["memory_id"]
-                memory_scores[mid] = max(
-                    memory_scores.get(mid, 0.0),
-                    partner_scores[r["tag_id"]],
-                )
+        if candidate_memory_ids and candidate_tag_ids_map:
+            max_partner = max(partner_scores.values())
+            if max_partner > 0:
+                for mid in candidate_memory_ids:
+                    mem_tags = candidate_tag_ids_map.get(mid, [])
+                    best = 0.0
+                    for tid in mem_tags:
+                        s = partner_scores.get(tid, 0.0)
+                        if s > best:
+                            best = s
+                    if best > 0:
+                        memory_scores[mid] = best / max_partner
+        else:
+            partner_ids = list(partner_scores.keys())
+            for i in range(0, len(partner_ids), 500):
+                chunk = partner_ids[i:i + 500]
+                p2 = ",".join("?" * len(chunk))
+                mem_rows = self._db.execute(
+                    f"SELECT memory_id, tag_id FROM memory_tags WHERE tag_id IN ({p2})",
+                    tuple(chunk),
+                ).fetchall()
+                for r in mem_rows:
+                    mid = r["memory_id"]
+                    memory_scores[mid] = max(
+                        memory_scores.get(mid, 0.0),
+                        partner_scores[r["tag_id"]],
+                    )
+            if memory_scores:
+                max_score = max(memory_scores.values())
+                if max_score > 0:
+                    memory_scores = {
+                        mid: s / max_score for mid, s in memory_scores.items()
+                    }
 
         if not memory_scores:
             return []
-
-        max_score = max(memory_scores.values())
-        if max_score > 0:
-            memory_scores = {
-                mid: s / max_score for mid, s in memory_scores.items()
-            }
 
         return sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)
 
@@ -2525,21 +2548,30 @@ class SynchronicityEngine:
             return 0.0
 
         total_suppression = 0.0
-        for chunk_start in range(0, len(pairs), 450):
-            chunk = pairs[chunk_start:chunk_start + 450]
-            conditions = " OR ".join(
-                "(tag_a_id = ? AND tag_b_id = ?)" for _ in chunk
-            )
-            params = [v for a, b in chunk for v in (a, b)]
-            rows = self._db.execute(
-                f"SELECT inhibition_strength, parallelness "
-                f"FROM tag_relational_tensor "
-                f"WHERE ({conditions}) AND inhibition_strength > 0",
-                params,
-            ).fetchall()
-            for row in rows:
-                par = row["parallelness"]
-                total_suppression += row["inhibition_strength"] * max(0.0, -par)
+        if self._tensor_cache:
+            pair_set = set(pairs)
+            all_a_ids = {a for a, _ in pairs}
+            for row in self._tensor_cache.rows_for_a(all_a_ids):
+                key = (row["tag_a_id"], row["tag_b_id"])
+                if key in pair_set and row["inhibition_strength"] > 0:
+                    par = row["parallelness"]
+                    total_suppression += row["inhibition_strength"] * max(0.0, -par)
+        else:
+            for chunk_start in range(0, len(pairs), 450):
+                chunk = pairs[chunk_start:chunk_start + 450]
+                conditions = " OR ".join(
+                    "(tag_a_id = ? AND tag_b_id = ?)" for _ in chunk
+                )
+                params = [v for a, b in chunk for v in (a, b)]
+                rows = self._db.execute(
+                    f"SELECT inhibition_strength, parallelness "
+                    f"FROM tag_relational_tensor "
+                    f"WHERE ({conditions}) AND inhibition_strength > 0",
+                    params,
+                ).fetchall()
+                for row in rows:
+                    par = row["parallelness"]
+                    total_suppression += row["inhibition_strength"] * max(0.0, -par)
 
         return total_suppression
 

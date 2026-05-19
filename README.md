@@ -1,6 +1,6 @@
 # Chicory
 
-A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with optional lateral inhibition and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. A directional canopy tracks retrieval causality — inflow canopy identifies convergence attractors in memory-space, outflow canopy identifies distributor neighborhoods in tag-space — and feeds back into bridge hub penalties. Temporal tag episodes track drift in tag-space and detect when conversation returns to a previous topic region — episodes form a revisitable graph, not a timeline. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps.
+A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with optional lateral inhibition and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. A directional canopy tracks retrieval causality — inflow canopy identifies convergence attractors in memory-space, outflow canopy identifies distributor neighborhoods in tag-space — and feeds back into bridge hub penalties. Temporal tag episodes track drift in tag-space and detect when conversation returns to a previous topic region — episodes form a revisitable graph, not a timeline. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps. Retrieval runs two independent paths — FAISS embedding search and tag-graph navigation (TagSpace) — with an in-memory tensor cache eliminating all tensor I/O. Warm queries complete in ~35ms.
 
 ## Install
 
@@ -191,14 +191,14 @@ Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other f
                   |  tags, embeddings,  |       |     Retrieval       |
                   |  salience scoring   |       |  (FAISS + tensor)   |
                   +---------------------+       +---------------------+
-                             |                             |
-                    tag assignment                  retrieval logged
-                             v                             v
-                  +---------------------+       +---------------------+
-  Layer 2         |   Trend Engine      |       | Retrieval Tracker   |
-                  | level, velocity,    |       | frequency, tag hits |
-                  | jerk, temperature   |       |                     |
-                  +---------------------+       +---------------------+
+                             |                        |          |
+                    tag assignment             FAISS path   TagSpace path
+                             v                   |          |
+                  +---------------------+    +---------------------+
+  Layer 2         |   Trend Engine      |    | Retrieval Tracker   |
+                  | level, velocity,    |    | frequency, tag hits |
+                  | jerk, temperature   |    |                     |
+                  +---------------------+    +---------------------+
                              \                           /
                               \                         /
                                v                       v
@@ -220,6 +220,15 @@ Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other f
                            SynchronicityEvent objects
                                       v
                   +-------------------------------------------+
+  Layer 3         |              TagSpace                     |
+                  |  independent tag-graph retrieval path     |
+                  |  lexical match → tensor fan-out →         |
+                  |  inward ratio → memory resolution         |
+                  |  hub filtering for context tag pruning    |
+                  +-------------------------------------------+
+                                      |
+                                      v
+                  +-------------------------------------------+
   Layer 3.5       |          Prime Ramsey Lattice             |
                   |  angle = PCA(tag_centroids) -> atan2      |
                   |  slot(p) = floor(angle * p / 2pi) % p    |
@@ -236,6 +245,7 @@ Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other f
                   |    semiotic       (P(B|A), ingest+queries)|
                   |    glyph          (resonance, structural) |
                   |  + lateral inhibition (parallelness gate) |
+                  |  + in-memory TensorCache (~6MB, all I/O)  |
                   +-------------------------------------------+
                                       |
                            each retrieval triggers
@@ -386,6 +396,24 @@ parallelness(i) = max(|cos(direction_i, direction_j)|)  for all j ranking above 
 
 The net effect: strongest incoming associations grow, weakest parallel ones shrink, and orthogonal associations pass through unharmed. Old connections that stop being actively retrieved lose strength as new retrievals erode them.
 
+## Dual Retrieval Paths
+
+Retrieval runs two independent paths that merge into a single scored candidate set:
+
+**FAISS Path** — Embeds the query, searches the FAISS index for the top-K nearest neighbors by cosine similarity. These candidates are then re-ranked through candidate-scoped tensor scoring: resonant memory lookup, glyph associations, and semiotic convergence — all operating on the in-memory tensor cache, scoring only the ~400 FAISS candidates.
+
+**TagSpace Path** — Runs before embedding (instant). Tokenizes the query, matches tokens against an in-memory tag name index, expands seed tags through the tensor graph (fan-out), and scores results by inward ratio (convergence × inward fraction). Finds memories that share tag-graph structure with the query even when embedding similarity is low.
+
+Both paths contribute weighted scores to the same `scores` dict. TagSpace-discovered memories that weren't in FAISS results get scored by tag-graph signal alone. FAISS candidates get both signals.
+
+### In-Memory Tensor Cache
+
+The `TensorCache` loads the entire `tag_relational_tensor` (~74K rows, ~6MB) into Python dicts indexed by `tag_a_id` and `tag_b_id`. All tensor queries during retrieval become dict lookups (microseconds) instead of random page reads across a 10GB SQLite file (seconds). The cache is lazy-loaded on first access and invalidated after any tensor write.
+
+### Hub Filtering
+
+Context tags from FAISS top-5 results are filtered by seed edge count before downstream re-ranking. Tags whose degree to the combined lexical + centroid seed set exceeds `tag_space_max_context_seed_edges` are pruned as hubs — they connect to everything and add noise to resonant lookup and semiotic convergence.
+
 ## Glyph System
 
 The glyph system adds a parallel character-level lattice that captures structural relationships between tag *names* — relationships invisible to semantic embeddings.
@@ -526,6 +554,7 @@ chicory/
     ingestor.py                 File/directory ingestion with dedup (SHA256 content hash)
     document_ingestor.py        Full-text document ingestion with chunking
     code_summarizer.py          AST-based code structural summaries
+    ignore.py                   .gitignore-style path filtering for ingestion
     watcher.py                  Real-time directory monitoring (watchdog)
   layer1/                       Memory store, embeddings, salience, tags, FAISS
     memory_store.py             Core memory CRUD with embedding and salience
@@ -546,6 +575,9 @@ chicory/
     synchronicity_detector.py   Dormant reactivation, cross-domain bridges, semantic convergence
     synchronicity_engine.py     Prime Ramsey lattice, tensor, resonance computation
     centroid_subgraph.py        Retrieval-driven active reweighting (EMA centroids + edges)
+    tag_space.py                Independent tag-graph retrieval path (lexical + fan-out + inward ratio)
+    tensor_cache.py             In-memory cache for tag_relational_tensor (~74K rows, ~6MB)
+    directional_flow.py         Inflow (convergence attractor) + outflow (distributor) observers
     chain_anisotropy.py         Directional chain analysis in the tensor graph
     semiotic_graph.py           Semiotic convergence graph for tag-pair analysis
     cross_project_alignment.py  Cross-project signal alignment
@@ -602,18 +634,23 @@ examples/
 User sends message
   -> LLM generates tool calls
      -> store_memory(content, tags)
-        -> embed, assign tags, record trend events
+        -> [outside lock] glyph analysis, embedding (CPU-bound)
+        -> [inside lock] assign tags, store memory + pre-computed embedding
         -> update tag centroids (EMA)
-        -> glyph analysis: scan content for concept words
         -> forest reorganization (co-occurrence + bridge)
         -> episodic tensor: create candidate edges
         -> temporal episode: drift/revisit check, assign memory
         -> canopy observation (if block touched)
-        -> invalidate PCA cache
+        -> invalidate tensor cache + PCA cache
 
      -> retrieve_memories(query)
-        -> FAISS similarity search + tensor-boosted recall
-        -> glyph association boost (if glyph system active)
+        -> TagSpace lexical: tokenize query → match tag index → fan-out → score
+        -> FAISS similarity search (single call, reused for tag filter)
+        -> hub-filtered context tags (seed edge count pruning)
+        -> candidate-scoped re-ranking (all via in-memory TensorCache):
+           -> resonant memory lookup (tensor pair scores)
+           -> glyph association boost (candidate tags only)
+           -> semiotic convergence (batch signifies/signified_by)
         -> log retrieval
         -> query relevance filter:
            -> embed query, load centroids for result tags
@@ -689,9 +726,12 @@ Key parameters in `ChicoryConfig` (70+ total, all overridable via environment va
 | `episode_sync_boundary_strength` | `0.7` | Min effective strength for sync-forced boundary |
 | `episode_revisit_max_candidates` | `50` | Max dormant episodes checked for revisitation |
 | `canopy_directional_enabled` | `true` | Enable directional inflow/outflow canopy layers |
-| `canopy_directional_inflow_rescue_weight` | `0.3` | How much inflow rescues bridge hub penalty |
-| `canopy_directional_outflow_rescue_weight` | `0.3` | How much outflow rescues bridge hub penalty |
+| `canopy_directional_inflow_centroid_boost` | `0.3` | How much inflow rescues bridge hub penalty |
+| `canopy_directional_outflow_pressure_weight` | `0.5` | How much outflow rescues bridge hub penalty |
 | `canopy_directional_query_tag_similarity_threshold` | `0.3` | Centroid cosine threshold for query-side tag detection |
+| `tag_space_enabled` | `true` | Enable independent tag-graph retrieval path |
+| `tag_space_weight` | `0.15` | Lexical tag-graph path weight in hybrid scoring |
+| `tag_space_max_context_seed_edges` | `25` | Hub pruning: max edges from context tag to seeds |
 | `commons_enabled` | `false` | Enable cross-project signal federation |
 
 ## Tests

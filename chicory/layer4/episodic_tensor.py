@@ -498,21 +498,34 @@ class EpisodicTensor:
             self._batch_insert(rows)
         return len(rows)
 
-    def activate_edge(self, memory_a: str, memory_b: str) -> None:
-        """Record an activation and promote lifecycle based on composite strength.
+    def activate_edge(
+        self, memory_a: str, memory_b: str, outflow_strength: float = 0.0,
+    ) -> None:
+        """Record an activation, EMA-blend co_retrieval_strength, and promote lifecycle.
 
-        Lifecycle is driven by the edge's composite signal (semantic +
-        tag_projected + co_retrieval + bridge) rather than raw activation
-        count.  ``episodic_tag_affinity_threshold`` gates candidate→warm;
-        the mean of the composite and 1.0 gates warm→mature.
+        co_retrieval_strength is EMA'd toward (outflow_strength × status_weight),
+        where status_weight reflects lifecycle maturity (candidate 0.25 → mature 1.0).
+
+        Lifecycle promotion uses the composite signal (semantic +
+        tag_projected + co_retrieval + bridge).
         """
         a, b = min(memory_a, memory_b), max(memory_a, memory_b)
         threshold = self._cfg.episodic_tag_affinity_threshold
+        alpha = self._cfg.episodic_co_retrieval_ema_alpha
 
         self._db.execute(
             """UPDATE memory_relational_tensor SET
                    activation_count = activation_count + 1,
                    last_activated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+                   co_retrieval_strength =
+                       ? * (? * CASE edge_status
+                                  WHEN 'mature'    THEN 1.0
+                                  WHEN 'warm'      THEN 0.5
+                                  WHEN 'candidate' THEN 0.25
+                                  WHEN 'decaying'  THEN 0.1
+                                  ELSE 0.0
+                                END)
+                       + (1.0 - ?) * co_retrieval_strength,
                    edge_status = CASE
                        WHEN (semantic_strength + tag_projected_strength +
                              co_retrieval_strength + bridge_strength) >=
@@ -524,7 +537,7 @@ class EpisodicTensor:
                        ELSE edge_status
                    END
                WHERE memory_a_id = ? AND memory_b_id = ?""",
-            (threshold, threshold, a, b),
+            (alpha, outflow_strength, alpha, threshold, threshold, a, b),
         )
 
     # ------------------------------------------------------------------

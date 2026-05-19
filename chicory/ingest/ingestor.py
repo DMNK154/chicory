@@ -12,6 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from chicory.config import ChicoryConfig
 from chicory.ingest.chunker import Chunk, chunk_document
+from chicory.ingest.ignore import is_ignored, load_ignore_patterns
 from chicory.ingest.parsers import SUPPORTED_EXTENSIONS, parse_file
 from chicory.llm.base import BaseLLMClient
 from chicory.orchestrator.orchestrator import Orchestrator
@@ -160,24 +161,22 @@ def ingest_directory(
         console.print(f"[red]Not a directory: {directory}[/red]")
         return {"files_found": 0, "files_ingested": 0, "memories_created": 0}
 
-    # Collect all supported files
+    # Collect all supported files, respecting .chicoryignore
+    patterns = load_ignore_patterns(directory)
     if recursive:
         files = [
             f for f in directory.rglob("*")
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            if f.is_file()
+            and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            and not is_ignored(f, directory, patterns)
         ]
     else:
         files = [
             f for f in directory.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            if f.is_file()
+            and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            and not is_ignored(f, directory, patterns)
         ]
-
-    # Skip hidden files and common non-content directories
-    skip_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", ".env"}
-    files = [
-        f for f in files
-        if not any(part.startswith(".") or part in skip_dirs for part in f.parts)
-    ]
 
     files.sort()
 

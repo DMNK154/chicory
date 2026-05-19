@@ -1,0 +1,5 @@
+# Benchmark / test artifacts
+_bench_repo
+
+# Temporary debug/test scripts
+_*.py

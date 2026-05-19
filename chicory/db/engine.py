@@ -39,6 +39,7 @@ class DatabaseEngine:
         self._conn.execute("PRAGMA foreign_keys = ON")
         if not is_memory:
             self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA synchronous = NORMAL")
         self._conn.execute("PRAGMA busy_timeout = 5000")
         return self._conn
 

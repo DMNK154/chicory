@@ -49,6 +49,8 @@ class CanopyObserver:
         sync_event_ids: list[int] | None = None,
         meta_pattern_ids: list[int] | None = None,
         resonance_ids: list[int] | None = None,
+        outflow_boost: float = 0.0,
+        inflow_boost: float = 0.0,
     ) -> list[str]:
         """Run a canopy observation from a set of co-active memories.
 
@@ -71,7 +73,7 @@ class CanopyObserver:
         grown_shapes: list[CanopyShape] = []
 
         for shape in shapes:
-            scores = self._score_cluster(shape)
+            scores = self._score_cluster(shape, outflow_boost=outflow_boost, inflow_boost=inflow_boost)
             self._record_observation(shape, scores, source, source_id)
             block_id = self._upsert_canopy_block(shape, scores)
             self._upsert_support_edges(block_id, shape, scores)
@@ -236,7 +238,7 @@ class CanopyObserver:
     # Scoring: pressure = co-activation, inhibition = tag overlap
     # ------------------------------------------------------------------
 
-    def _score_cluster(self, shape: CanopyShape) -> ScoreBundle:
+    def _score_cluster(self, shape: CanopyShape, outflow_boost: float = 0.0, inflow_boost: float = 0.0) -> ScoreBundle:
         mids = shape.memory_ids
         if len(mids) < 2:
             return ScoreBundle()
@@ -270,6 +272,14 @@ class CanopyObserver:
             pressure = (coact_w * mean_co_ret + bridge_w * mean_bridge) / total_w
         else:
             pressure = 0.0
+
+        if outflow_boost > 0:
+            boost_w = self._cfg.canopy_directional_outflow_pressure_weight
+            pressure = pressure * (1.0 + boost_w * outflow_boost)
+
+        if inflow_boost > 0:
+            inflow_w = self._cfg.canopy_directional_inflow_pressure_weight
+            pressure = pressure * (1.0 + inflow_w * inflow_boost)
 
         # Inhibition: tag Jaccard overlap (suppress what tags already explain)
         tag_jaccard = self._cluster_tag_jaccard(mids)

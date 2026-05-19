@@ -93,6 +93,17 @@ class CentroidSubgraph:
         for tag_id, embedding in pairs:
             self.update_centroid_on_store(tag_id, embedding)
 
+    def _top_tags_by_centroids(self, tag_ids: list[int], cap: int) -> list[int]:
+        """Keep the `cap` tags with highest mean pairwise centroid similarity."""
+        centroids = self.get_centroids_batch(tag_ids)
+        have = [t for t in tag_ids if t in centroids]
+        if len(have) <= cap:
+            return have
+        C = np.stack([centroids[t] for t in have])
+        mean_sim = (C @ C.T).mean(axis=1)
+        top_idx = np.argpartition(-mean_sim, cap)[:cap]
+        return sorted([have[int(i)] for i in top_idx])
+
     def get_centroids_batch(
         self, tag_ids: list[int],
     ) -> dict[int, np.ndarray]:
@@ -161,17 +172,24 @@ class CentroidSubgraph:
 
     # ── Co-Retrieval Edge Tracking ─────────────────────────────────────
 
+    _CO_RETRIEVAL_TAG_CAP = 30
+
     def record_co_retrieval(self, tag_ids: list[int]) -> None:
         """Record that these tags were co-retrieved.
 
         For every pair, applies EMA: strength = alpha * 1.0 + (1 - alpha) * old.
         Uses UPSERT with SQL expression so no pre-load is needed.
+        Capped at top 30 tags by centroid mutual similarity to bound O(n²).
         """
         if len(tag_ids) < 2:
             return
 
+        tag_ids = sorted(set(tag_ids))
+        if len(tag_ids) > self._CO_RETRIEVAL_TAG_CAP:
+            tag_ids = self._top_tags_by_centroids(tag_ids, self._CO_RETRIEVAL_TAG_CAP)
+
         alpha = self._config.centroid_edge_ema_alpha
-        pairs = list(itertools.combinations(sorted(set(tag_ids)), 2))
+        pairs = list(itertools.combinations(tag_ids, 2))
 
         if pairs:
             self._db.executemany(
@@ -242,6 +260,7 @@ class CentroidSubgraph:
         self,
         activated_tag_ids: list[int],
         mean_relevance: float,
+        pair_diversity: dict[tuple[int, int], float] | None = None,
     ) -> dict[tuple[int, int], float]:
         """Core algorithm.  Called after each retrieval.
 
@@ -266,6 +285,8 @@ class CentroidSubgraph:
         _rt0 = _time.perf_counter()
 
         tag_ids = sorted(set(activated_tag_ids))
+        if len(tag_ids) > self._CO_RETRIEVAL_TAG_CAP:
+            tag_ids = self._top_tags_by_centroids(tag_ids, self._CO_RETRIEVAL_TAG_CAP)
         _rt["n_input_tags"] = len(tag_ids)
 
         _s = _time.perf_counter()
@@ -287,9 +308,12 @@ class CentroidSubgraph:
         incoming: dict[tuple[int, int], float] = {}
         for i in range(n):
             for j in range(i + 1, n):
+                pair_key = (tag_ids[i], tag_ids[j])
                 strength = float(sim_matrix[i, j]) * mean_relevance * scale
+                if pair_diversity is not None:
+                    strength *= 1.0 + pair_diversity.get(pair_key, 0.0)
                 if strength > 0:
-                    incoming[(tag_ids[i], tag_ids[j])] = strength
+                    incoming[pair_key] = strength
         _rt["compute_incoming"] = _time.perf_counter() - _s
         _rt["n_pairs"] = len(incoming)
 
@@ -416,21 +440,26 @@ class CentroidSubgraph:
         for i in range(0, len(tag_list), 500):
             chunk = tag_list[i:i + 500]
             ph = ",".join("?" * len(chunk))
-            rows = self._db.execute(
+            _params = (*chunk, min_res)
+            rows_a = self._db.execute(
                 f"""SELECT r.id, r.resonance_strength,
                        r.event_a_id, r.event_b_id
                     FROM resonances r
                     JOIN sync_event_tags st ON st.event_id = r.event_a_id
-                    WHERE st.tag_id IN ({ph}) AND r.resonance_strength >= ?
-                    UNION ALL
-                    SELECT r.id, r.resonance_strength,
+                    WHERE st.tag_id IN ({ph}) AND r.resonance_strength >= ?""",
+                _params,
+            ).fetchall()
+            rows_b = self._db.execute(
+                f"""SELECT r.id, r.resonance_strength,
                        r.event_a_id, r.event_b_id
                     FROM resonances r
                     JOIN sync_event_tags st ON st.event_id = r.event_b_id
                     WHERE st.tag_id IN ({ph}) AND r.resonance_strength >= ?""",
-                (*chunk, min_res, *chunk, min_res),
+                _params,
             ).fetchall()
-            for row in rows:
+            for row in rows_a:
+                matched[row["id"]] = row
+            for row in rows_b:
                 matched[row["id"]] = row
 
         if not matched:

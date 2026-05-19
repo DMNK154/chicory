@@ -19,6 +19,7 @@ from chicory.models.memory import Memory
 
 if TYPE_CHECKING:
     from chicory.layer3.synchronicity_engine import SynchronicityEngine
+    from chicory.layer3.tag_space import TagSpace
 
 
 class MemoryStore:
@@ -32,6 +33,7 @@ class MemoryStore:
         tag_manager: TagManager,
         salience: SalienceScorer,
         sync_engine: SynchronicityEngine | None = None,
+        tag_space: TagSpace | None = None,
     ) -> None:
         self._config = config
         self._db = db
@@ -39,6 +41,7 @@ class MemoryStore:
         self._tags = tag_manager
         self._salience = salience
         self._sync_engine = sync_engine
+        self._tag_space = tag_space
 
     def store(
         self,
@@ -51,6 +54,7 @@ class MemoryStore:
         content_hash: str | None = None,
         source_path: str | None = None,
         ingestion_tier: str = "critical",
+        precomputed_embeddings: list[np.ndarray] | None = None,
     ) -> Memory:
         """Store a new memory with tags and (optionally) embedding."""
         memory_id = str(uuid.uuid4())
@@ -108,9 +112,13 @@ class MemoryStore:
             if letter_counts:
                 self._tags.assign_letter_tags(memory_id, letter_counts)
 
-        # Generate and cache embeddings (outside transaction — not critical).
-        # Chunk long content so each chunk fits the embedding model's token limit.
-        if not skip_embedding:
+        # Store embeddings (outside transaction — not critical).
+        if precomputed_embeddings is not None:
+            if len(precomputed_embeddings) == 1:
+                self._embedding.store_cached(memory_id, precomputed_embeddings[0])
+            else:
+                self._embedding.store_chunks(memory_id, precomputed_embeddings)
+        elif not skip_embedding:
             chunks = chunk_text_for_embedding(content)
             if len(chunks) <= 1:
                 embedding = self._embedding.embed(content)
@@ -241,43 +249,81 @@ class MemoryStore:
         w_sem = self._config.hybrid_semantic_weight
         w_tag = self._config.hybrid_tag_weight
 
-        query_vec = self._embedding.embed(query)
-        _t["embed"] = _time.perf_counter() - _t0
-
-        _s = _time.perf_counter()
-        semantic_results = self.retrieve_semantic(query, top_k=k * 3, query_vec=query_vec)
-        _t["semantic_search"] = _time.perf_counter() - _s
         scores: dict[str, float] = {}
         components: dict[str, dict[str, float]] = {}
-        for mem, sim in semantic_results:
+        lexical_seeds: set[int] = set()
+
+        # Tag space lexical phase — runs BEFORE embedding (instant)
+        if self._tag_space and self._config.tag_space_enabled:
+            _s = _time.perf_counter()
+            ts_lex_scores, lexical_seeds = self._tag_space.score_lexical(query)
+            w_ts = self._config.tag_space_weight
+            for mid, ts_score in ts_lex_scores.items():
+                val = w_ts * ts_score
+                scores[mid] = scores.get(mid, 0.0) + val
+                if mid not in components:
+                    components[mid] = {}
+                components[mid]["tag_space_lex"] = val
+            _t["tag_space_lexical"] = _time.perf_counter() - _s
+            _t["tag_space_lexical_seeds"] = len(lexical_seeds)
+            _t["tag_space_lexical_memories"] = len(ts_lex_scores)
+
+        query_vec = self._embedding.embed(query)
+        self._last_query_vec = query_vec
+        _t["embed"] = _time.perf_counter() - _t0
+
+        # Single FAISS search — serves both unfiltered and tag-filtered channels
+        _s = _time.perf_counter()
+        fetch_k = (k * 5) if tags else (k * 3)
+        all_candidates = self._embedding.search_similar(
+            query_vec, top_k=fetch_k,
+            threshold=self._config.similarity_threshold,
+        )
+        _t["semantic_search"] = _time.perf_counter() - _s
+
+        for mid, sim in all_candidates:
             sem_val = w_sem * sim
-            scores[mem.id] = sem_val
-            components[mem.id] = {"semantic": sem_val, "tag": 0.0, "lattice": 0.0, "glyph": 0.0}
+            scores[mid] = scores.get(mid, 0.0) + sem_val
+            if mid not in components:
+                components[mid] = {}
+            components[mid]["semantic"] = sem_val
 
         if tags:
             _s = _time.perf_counter()
-            tag_semantic = self.retrieve_semantic(query, top_k=k, tag_filter=tags, query_vec=query_vec)
+            tag_memory_ids = self._get_memory_ids_by_tags(tags)
+            for mid, sim in all_candidates:
+                if mid in tag_memory_ids:
+                    tag_val = w_tag * sim
+                    scores[mid] = scores.get(mid, 0.0) + tag_val
+                    if mid not in components:
+                        components[mid] = {"semantic": 0.0, "tag": 0.0, "lattice": 0.0, "glyph": 0.0}
+                    components[mid]["tag"] = tag_val
             _t["tag_search"] = _time.perf_counter() - _s
-            for mem, sim in tag_semantic:
-                tag_val = w_tag * sim
-                scores[mem.id] = scores.get(mem.id, 0.0) + tag_val
-                if mem.id not in components:
-                    components[mem.id] = {"semantic": 0.0, "tag": 0.0, "lattice": 0.0, "glyph": 0.0}
-                components[mem.id]["tag"] = tag_val
 
+        candidate_tag_map: dict[str, list[int]] | None = None
         if self._sync_engine and self._config.lattice_retrieval_boost_enabled:
-            top5_ids = [mem.id for mem, _ in semantic_results[:5]]
-            candidate_ids = [mem.id for mem, _ in semantic_results]
+            candidate_ids = [mid for mid, _ in all_candidates]
+            top5_ids = candidate_ids[:5]
 
             _s = _time.perf_counter()
-            # Single batch lookup: top5_ids ⊂ candidate_ids, so one query
-            # gives us both maps. Old code paid the IN-clause cost twice.
             candidate_tag_map = self._tags.get_tag_ids_for_memories(candidate_ids)
             top5_set = set(top5_ids)
             context_tag_ids: set[int] = set()
             for mid, tids in candidate_tag_map.items():
                 if mid in top5_set:
                     context_tag_ids.update(tids)
+            # Prune hub tags by seed edge count. Hubs connect to many
+            # seeds; dead ends connect to few. Uses broad centroid seeds
+            # (threshold 0.2) so the count discriminates.
+            if context_tag_ids and self._tag_space and self._config.tag_space_enabled:
+                filter_seeds = lexical_seeds | self._tag_space.centroid_match(
+                    query_vec, threshold=0.2,
+                )
+                pre_filter = len(context_tag_ids)
+                context_tag_ids = self._tag_space.filter_context_tags(
+                    filter_seeds, context_tag_ids,
+                )
+                _t["context_tags_filtered"] = pre_filter - len(context_tag_ids)
             _t["tag_id_lookup"] = _time.perf_counter() - _s
 
             if context_tag_ids:
@@ -305,6 +351,8 @@ class MemoryStore:
                     _s = _time.perf_counter()
                     glyph_assoc = self._sync_engine.get_glyph_association_scores(
                         ctx_list,
+                        candidate_memory_ids=candidate_ids,
+                        candidate_tag_ids_map=candidate_tag_map,
                     )
                     _t["glyph_assoc"] = _time.perf_counter() - _s
                     _t["glyph_assoc_count"] = len(glyph_assoc)
@@ -343,7 +391,10 @@ class MemoryStore:
             return []
         top_ids = [mid for mid, _ in sorted_ids]
         score_map = dict(sorted_ids)
-        memories = self._get_by_ids(top_ids)
+        preloaded = None
+        if candidate_tag_map:
+            preloaded = {mid: candidate_tag_map[mid] for mid in top_ids if mid in candidate_tag_map}
+        memories = self._get_by_ids(top_ids, preloaded_tag_ids=preloaded)
         _t["load_memories"] = _time.perf_counter() - _s
         _t["total"] = _time.perf_counter() - _t0
 
@@ -393,8 +444,16 @@ class MemoryStore:
         ).fetchall()
         return {r["memory_id"] for r in rows}
 
-    def _get_by_ids(self, memory_ids: list[str]) -> dict[str, Memory]:
-        """Batch-load memories by IDs with a single tag query."""
+    def _get_by_ids(
+        self,
+        memory_ids: list[str],
+        preloaded_tag_ids: dict[str, list[int]] | None = None,
+    ) -> dict[str, Memory]:
+        """Batch-load memories by IDs with a single tag query.
+
+        When preloaded_tag_ids is provided, resolves tag IDs to names
+        instead of re-querying the memory_tags junction table.
+        """
         if not memory_ids:
             return {}
         placeholders = ",".join("?" * len(memory_ids))
@@ -402,7 +461,17 @@ class MemoryStore:
             f"SELECT * FROM memories WHERE id IN ({placeholders})",
             tuple(memory_ids),
         ).fetchall()
-        tags_map = self._tags.get_tags_for_memories(memory_ids)
+        if preloaded_tag_ids:
+            all_tids: set[int] = set()
+            for tids in preloaded_tag_ids.values():
+                all_tids.update(tids)
+            id_to_name = self._tags.get_names_by_ids(list(all_tids))
+            tags_map: dict[str, list[str]] = {
+                mid: [id_to_name[tid] for tid in preloaded_tag_ids.get(mid, []) if tid in id_to_name]
+                for mid in memory_ids
+            }
+        else:
+            tags_map = self._tags.get_tags_for_memories(memory_ids)
         result: dict[str, Memory] = {}
         for row in rows:
             mid = row["id"]

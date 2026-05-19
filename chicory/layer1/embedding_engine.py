@@ -26,6 +26,11 @@ class EmbeddingEngine:
         self._cache_chunks: list[tuple[str, np.ndarray]] | None = None
         # FAISS vector index — built lazily on first search
         self._vector_index = None  # VectorIndex | None
+        self._suppress_invalidation = False
+
+    def batch_write(self):
+        """Context manager: suppress cache invalidation until the batch completes."""
+        return _BatchWriteContext(self)
 
     def _load_model(self) -> None:
         """Lazily load the sentence-transformer model."""
@@ -102,12 +107,12 @@ class EmbeddingEngine:
             """,
             (memory_id, chunk_index, blob, self._config.embedding_model, len(embedding)),
         )
-        self._db.connection.commit()
-        # Incrementally add to FAISS index if it exists; otherwise clear cache
-        if self._vector_index is not None and self._vector_index.is_built:
-            self._vector_index.add(memory_id, [embedding])
-        self._cache_all = None
-        self._cache_chunks = None
+        if not self._suppress_invalidation:
+            self._db.connection.commit()
+            if self._vector_index is not None and self._vector_index.is_built:
+                self._vector_index.add(memory_id, [embedding])
+            self._cache_all = None
+            self._cache_chunks = None
 
     def store_chunks(self, memory_id: str, embeddings: list[np.ndarray]) -> None:
         """Store multiple chunk embeddings for a memory, replacing any existing ones."""
@@ -123,9 +128,9 @@ class EmbeddingEngine:
                 """,
                 (memory_id, i, blob, self._config.embedding_model, len(vec)),
             )
-        self._db.connection.commit()
-        # Replacement invalidates the index — IVF can't remove old entries
-        self._clear_memory_cache()
+        if not self._suppress_invalidation:
+            self._db.connection.commit()
+            self._clear_memory_cache()
 
     def invalidate(self, memory_id: str) -> None:
         """Remove all cached embeddings for a memory from the database."""
@@ -207,12 +212,13 @@ class EmbeddingEngine:
         if not rows:
             return 0
 
-        for row in rows:
-            chunks = chunk_text_for_embedding(row["content"])
-            if not chunks:
-                continue
-            vecs = self.embed_batch(chunks) if len(chunks) > 1 else [self.embed(chunks[0])]
-            self.store_chunks(row["id"], list(vecs))
+        with self.batch_write():
+            for row in rows:
+                chunks = chunk_text_for_embedding(row["content"])
+                if not chunks:
+                    continue
+                vecs = self.embed_batch(chunks) if len(chunks) > 1 else [self.embed(chunks[0])]
+                self.store_chunks(row["id"], list(vecs))
 
         return len(rows)
 
@@ -225,6 +231,22 @@ class EmbeddingEngine:
     def bulk_similarity(query: np.ndarray, candidates: np.ndarray) -> np.ndarray:
         """Cosine similarity of query against all candidates (assumed normalized)."""
         return candidates @ query
+
+
+class _BatchWriteContext:
+    """Suppresses per-write cache invalidation; flushes once on exit."""
+
+    def __init__(self, engine: EmbeddingEngine) -> None:
+        self._engine = engine
+
+    def __enter__(self) -> EmbeddingEngine:
+        self._engine._suppress_invalidation = True
+        return self._engine
+
+    def __exit__(self, *exc) -> None:
+        self._engine._suppress_invalidation = False
+        self._engine._db.connection.commit()
+        self._engine._clear_memory_cache()
 
 
 def _array_to_blob(arr: np.ndarray) -> bytes:
