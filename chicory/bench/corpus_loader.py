@@ -119,9 +119,12 @@ def ingest_corpus(
     logger.info("Found %d already-ingested source paths", len(existing_source_paths))
 
     t0 = time.time()
-    pending_batch: list[dict[str, Any]] = []
 
-    for i, (file_path, source_type) in enumerate(docs):
+    # Phase 0: Parse all documents and collect tags for classification
+    parsed: list[dict[str, Any]] = []
+    file_tags_map: dict[str, list[str]] = {}
+
+    for file_path, source_type in docs:
         doc = load_document(file_path)
         if doc is None:
             stats["skipped_parse"] += 1
@@ -156,23 +159,54 @@ def ingest_corpus(
                 if val and isinstance(val, str) and len(val) < 60:
                     tags.append(val.lower().replace(" ", "-"))
 
+        parsed.append({
+            "uuid": dataset_doc_uuid,
+            "title": title,
+            "content": full_text,
+            "tags": tags,
+            "source_type": source_type,
+        })
+        file_tags_map[dataset_doc_uuid] = tags
+
+    # Phase 0.5: Classify criticality (same as handle_ingest_documents)
+    if critical is None and parsed:
+        from chicory.ingest.criticality import classify_documents
+        classifications = classify_documents(
+            file_tags_map, orchestrator._db,
+            threshold=orchestrator._config.ingestion_criticality_threshold,
+        )
+        crit_count = sum(1 for v in classifications.values() if v == "critical")
+        logger.info(
+            "Auto-classified %d critical, %d reference out of %d documents",
+            crit_count, len(classifications) - crit_count, len(classifications),
+        )
+    else:
+        forced_tier = "critical" if critical else "reference"
+        classifications = {d["uuid"]: forced_tier for d in parsed}
+
+    # Phase 1: Store memories with correct tier
+    pending_batch: list[dict[str, Any]] = []
+    for entry in parsed:
+        tier = classifications.get(entry["uuid"], "reference")
+
         result = orchestrator.handle_store_memory(
-            content=full_text,
-            tags=tags,
+            content=entry["content"],
+            tags=entry["tags"],
             importance=0.5,
-            summary=f"[{source_type}] {title[:120]}" if title else f"[{source_type}] {dataset_doc_uuid}",
+            summary=f"[{entry['source_type']}] {entry['title'][:120]}" if entry["title"] else f"[{entry['source_type']}] {entry['uuid']}",
             skip_embedding=True,
             defer_side_effects=True,
-            source_path=dataset_doc_uuid,
-            ingestion_tier="reference" if critical is False else "critical" if critical is True else "auto",
+            source_path=entry["uuid"],
+            ingestion_tier=tier,
         )
+        result["_tier"] = tier
 
         pending_batch.append(result)
         stats["ingested"] += 1
-        stats["source_type_counts"][source_type] = stats["source_type_counts"].get(source_type, 0) + 1
+        stats["source_type_counts"][entry["source_type"]] = stats["source_type_counts"].get(entry["source_type"], 0) + 1
 
         if len(pending_batch) >= batch_size:
-            _flush_batch(orchestrator, pending_batch, stats, critical, skip_finalize)
+            _flush_batch(orchestrator, pending_batch, stats, skip_finalize)
             pending_batch.clear()
             logger.info(
                 "Progress: %d/%d ingested (%d skipped)",
@@ -181,7 +215,7 @@ def ingest_corpus(
             )
 
     if pending_batch:
-        _flush_batch(orchestrator, pending_batch, stats, critical, skip_finalize)
+        _flush_batch(orchestrator, pending_batch, stats, skip_finalize)
 
     stats["elapsed_seconds"] = round(time.time() - t0, 1)
     logger.info(
@@ -196,19 +230,20 @@ def _flush_batch(
     orchestrator,
     batch: list[dict[str, Any]],
     stats: dict[str, Any],
-    critical: bool | None = None,
     skip_finalize: bool = False,
 ) -> None:
-    """Batch-embed accumulated memories and optionally finalize."""
-    memory_ids = [r["memory_id"] for r in batch]
+    """Batch-embed accumulated memories and finalize critical ones."""
+    all_ids = [r["memory_id"] for r in batch]
+    critical_ids = [r["memory_id"] for r in batch if r.get("_tier") == "critical"]
+    reference_ids = [r["memory_id"] for r in batch if r.get("_tier") != "critical"]
 
-    orchestrator._batch_embed_memories(memory_ids)
+    orchestrator._batch_embed_memories(all_ids)
 
-    if critical is False or skip_finalize:
-        stats["reference"] += len(memory_ids)
-    else:
-        orchestrator._finalize_ingested_memories(memory_ids)
-        stats["critical"] += len(memory_ids)
+    stats["critical"] += len(critical_ids)
+    stats["reference"] += len(reference_ids)
+
+    if critical_ids and not skip_finalize:
+        orchestrator._finalize_ingested_memories(critical_ids)
 
 
 def main() -> None:

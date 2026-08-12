@@ -158,7 +158,7 @@ def retrieve_for_question(
     seen: set[str] = set()
     doc_uuids: list[str] = []
     for mem in memories:
-        mid = mem.get("id", "")
+        mid = mem.get("memory_id", "")
         uuid = memory_to_uuid.get(mid)
         if uuid and uuid not in seen:
             seen.add(uuid)

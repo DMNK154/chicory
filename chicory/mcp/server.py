@@ -260,14 +260,17 @@ def get_meta_patterns(ctx: Context) -> str:
 
 
 @mcp_server.tool()
-def get_lattice_resonances(ctx: Context) -> str:
+def get_lattice_resonances(ctx: Context, max_items: int = 10) -> str:
     """View the prime Ramsey lattice.
 
     Synchronicity events organized by angular position across prime scales.
     Shows resonances (structurally entangled events) and the void profile
     (latent attractor themes).
+
+    Returns top items by strength. Use max_items to control how many
+    positions/resonances are returned (default 10).
     """
-    return _call(ctx, "get_lattice_resonances", {})
+    return _call(ctx, "get_lattice_resonances", {"max_items": max_items})
 
 
 @mcp_server.tool()
@@ -336,6 +339,10 @@ def ingest_codebase(
             Defaults to all supported code file types.
         exclude_patterns: Optional directory names to skip (in addition to
             .git, node_modules, __pycache__, etc.).
+
+    Returns counts plus per-file listings: `summaries` (paths ingested),
+    `skipped` (files no summary could be extracted from) and
+    `already_ingested` (files whose summary is already in the network).
     """
     inp: dict = {"path": path}
     if file_patterns is not None:
@@ -373,6 +380,10 @@ def ingest_documents(
         exclude_patterns: Optional directory names to skip.
         critical: Force all files to critical (True) or reference (False).
             When None (default), each file is auto-classified by network relevance.
+
+    Returns counts plus per-file listings: `ingested` (path + tier),
+    `skipped` (files that could not be read or were empty) and
+    `already_ingested` (files whose content is already in the network).
     """
     inp: dict = {"path": path}
     if file_patterns is not None:

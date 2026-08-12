@@ -134,11 +134,18 @@ CHICORY_TOOLS = [
         "description": (
             "View the prime Ramsey lattice: synchronicity events organized by "
             "angular position across prime scales. Shows resonances (structurally "
-            "entangled events) and the void profile (latent attractor themes)."
+            "entangled events) and the void profile (latent attractor themes). "
+            "Returns top items by strength; use max_items to control count."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "max_items": {
+                    "type": "integer",
+                    "description": "Max positions/resonances to return (default 10).",
+                    "default": 10,
+                },
+            },
         },
     },
     {

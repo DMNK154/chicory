@@ -76,7 +76,7 @@ def _handle_get_meta_patterns(o: "Orchestrator", inp: dict) -> dict:
 
 
 def _handle_get_lattice_resonances(o: "Orchestrator", inp: dict) -> dict:
-    return o.handle_get_lattice_resonances()
+    return o.handle_get_lattice_resonances(max_items=inp.get("max_items", 10))
 
 
 def _handle_deep_retrieve(o: "Orchestrator", inp: dict) -> dict:

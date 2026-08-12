@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import struct
 from typing import Optional
 
@@ -11,6 +12,8 @@ from chicory.config import ChicoryConfig
 from chicory.db.engine import DatabaseEngine
 from chicory.exceptions import EmbeddingError
 from chicory.ingest.chunker import chunk_text_for_embedding
+
+_log = logging.getLogger(__name__)
 
 
 class EmbeddingEngine:
@@ -85,13 +88,26 @@ class EmbeddingEngine:
         if self._vector_index is None or self._vector_index.needs_rebuild:
             from chicory.layer1.vector_index import VectorIndex
 
-            chunks = self.get_all_chunk_embeddings()
+            mem_ids, matrix = self._load_chunk_matrix()
+            mem_gb = matrix.nbytes / (1024 ** 3) if matrix.size else 0
+            _log.info(
+                "Building FAISS index: %d chunks, %d dim, %.2f GB",
+                len(mem_ids), self._config.embedding_dimension, mem_gb,
+            )
             vi = VectorIndex(
                 dimension=self._config.embedding_dimension,
                 nprobe=self._config.faiss_nprobe,
                 rebuild_threshold=self._config.faiss_rebuild_threshold,
             )
-            vi.build(chunks)
+            try:
+                vi.build_from_matrix(mem_ids, matrix)
+            except MemoryError:
+                _log.error(
+                    "FAISS index build failed: unable to allocate %.2f GB "
+                    "for %d chunks. Reduce corpus size or add RAM.",
+                    mem_gb, len(mem_ids),
+                )
+                raise
             self._vector_index = vi
 
         thresh = threshold if threshold is not None else 0.0
@@ -173,6 +189,23 @@ class EmbeddingEngine:
         matrix = np.frombuffer(all_bytes, dtype=np.float32).reshape(-1, dim).copy()
         self._cache_all = {r["memory_id"]: matrix[i] for i, r in enumerate(rows)}
         return self._cache_all
+
+    def _load_chunk_matrix(self) -> tuple[list[str], np.ndarray]:
+        """Load all chunk embeddings as a contiguous matrix.
+
+        Returns (memory_ids, matrix) where matrix is (N, dim) float32.
+        One entry per chunk — memory_ids may contain duplicates.
+        """
+        rows = self._db.execute(
+            "SELECT memory_id, embedding, dimension FROM embeddings ORDER BY memory_id, chunk_index"
+        ).fetchall()
+        if not rows:
+            return [], np.array([], dtype=np.float32)
+        dim = rows[0]["dimension"]
+        mem_ids = [r["memory_id"] for r in rows]
+        all_bytes = b"".join(r["embedding"] for r in rows)
+        matrix = np.frombuffer(all_bytes, dtype=np.float32).reshape(-1, dim).copy()
+        return mem_ids, matrix
 
     def get_all_chunk_embeddings(self) -> list[tuple[str, np.ndarray]]:
         """Load all chunk embeddings. Returns [(memory_id, vector), ...].

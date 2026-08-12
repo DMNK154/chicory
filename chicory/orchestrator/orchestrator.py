@@ -1182,9 +1182,13 @@ class Orchestrator:
             "count": len(patterns),
         }
 
-    def handle_get_lattice_resonances(self) -> dict[str, Any]:
+    def handle_get_lattice_resonances(self, max_items: int = 10) -> dict[str, Any]:
         """Get lattice state including positions, resonances, and void profile."""
-        return self._sync_engine.get_lattice_state()
+        return self._sync_engine.get_lattice_state(
+            max_positions=max_items,
+            max_resonances=max_items,
+            max_glyphs=max_items * 2,
+        )
 
     def handle_ingest_codebase(
         self,
@@ -1198,6 +1202,11 @@ class Orchestrator:
         signatures, imports) via AST/regex parsing, and stores compact
         summaries. These summaries can later be retrieved via
         retrieve_memories instead of re-reading the full codebase.
+
+        The returned stats include per-file listings: ``summaries`` (paths
+        ingested), ``skipped`` (files no summary could be extracted from)
+        and ``already_ingested`` (files whose summary hash is already
+        stored), the skip lists being ``{"path": ..., "reason": ...}``.
         """
         import hashlib
         import fnmatch
@@ -1246,15 +1255,23 @@ class Orchestrator:
             "files_skipped": 0,
             "files_already_ingested": 0,
             "summaries": [],
+            "skipped": [],
+            "already_ingested": [],
         }
 
         # ── Phase 1: Store summaries (no embeddings) ──────────────
         new_memory_ids: list[str] = []
 
         for filepath in all_files:
+            rel_path = str(filepath.relative_to(directory)).replace("\\", "/")
+
             summary_text = summarize_file(filepath, base_dir=directory)
             if not summary_text:
                 stats["files_skipped"] += 1
+                stats["skipped"].append({
+                    "path": rel_path,
+                    "reason": "no_summary_extracted",
+                })
                 continue
 
             # Dedup by content hash
@@ -1268,10 +1285,13 @@ class Orchestrator:
             ).fetchone()
             if existing:
                 stats["files_already_ingested"] += 1
+                stats["already_ingested"].append({
+                    "path": rel_path,
+                    "reason": "duplicate_content_hash",
+                })
                 continue
 
             # Derive tags from file path
-            rel_path = str(filepath.relative_to(directory)).replace("\\", "/")
             tags = self._derive_code_tags(filepath, directory)
 
             # Store with hash for dedup — skip embedding in this phase
@@ -1357,6 +1377,11 @@ class Orchestrator:
           network integration.
 
         Set critical=True/False to force all files into one tier.
+
+        The returned stats include per-file listings: ``ingested``
+        (path + tier), ``skipped`` (unreadable/empty files) and
+        ``already_ingested`` (files whose content hash is already stored),
+        each entry being ``{"path": ..., "reason": ...}`` for the skip lists.
         """
         import hashlib
         import fnmatch
@@ -1406,6 +1431,8 @@ class Orchestrator:
             "critical_count": 0,
             "reference_count": 0,
             "ingested": [],
+            "skipped": [],
+            "already_ingested": [],
         }
 
         # Phase 0: Read all files and derive tags for classification
@@ -1413,9 +1440,15 @@ class Orchestrator:
         file_tags_map: dict[str, list[str]] = {}
 
         for filepath in files:
+            rel_path = str(filepath.relative_to(base_dir)).replace("\\", "/")
+
             text = read_document(filepath)
             if not text:
                 stats["files_skipped"] += 1
+                stats["skipped"].append({
+                    "path": rel_path,
+                    "reason": "unreadable_or_empty",
+                })
                 continue
 
             content_hash = hashlib.sha256(
@@ -1428,9 +1461,12 @@ class Orchestrator:
             ).fetchone()
             if existing:
                 stats["files_already_ingested"] += 1
+                stats["already_ingested"].append({
+                    "path": rel_path,
+                    "reason": "duplicate_content_hash",
+                })
                 continue
 
-            rel_path = str(filepath.relative_to(base_dir)).replace("\\", "/")
             tags = derive_document_tags(filepath, base_dir)
 
             file_data.append((filepath, text, content_hash, rel_path, tags))

@@ -102,7 +102,10 @@ class EpisodicTensor:
 
     def _load_episode_members(self) -> dict[int, list[str]]:
         rows = self._db.execute(
-            "SELECT memory_id, episode_id FROM memory_episode_assignments"
+            "SELECT a.memory_id, a.episode_id "
+            "FROM memory_episode_assignments a "
+            "JOIN memories m ON m.id = a.memory_id "
+            "WHERE m.ingestion_tier != 'reference'"
         ).fetchall()
         episodes: dict[int, list[str]] = {}
         for r in rows:
@@ -286,9 +289,10 @@ class EpisodicTensor:
 
     def _load_all_embeddings(self) -> tuple[list[str], np.ndarray]:
         rows = self._db.execute(
-            """SELECT memory_id, embedding, dimension FROM embeddings
-               WHERE chunk_index = 0
-               ORDER BY memory_id"""
+            """SELECT e.memory_id, e.embedding, e.dimension FROM embeddings e
+               JOIN memories m ON m.id = e.memory_id
+               WHERE e.chunk_index = 0 AND m.ingestion_tier != 'reference'
+               ORDER BY e.memory_id"""
         ).fetchall()
 
         if not rows:

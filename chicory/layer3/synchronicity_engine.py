@@ -486,11 +486,16 @@ class SynchronicityEngine:
 
     # ── State / tool handler ─────────────────────────────────────────
 
-    def get_lattice_state(self, max_positions: int = 50) -> dict:
+    def get_lattice_state(
+        self,
+        max_positions: int = 10,
+        max_resonances: int = 10,
+        max_glyphs: int = 20,
+    ) -> dict:
         """Return the lattice state for the tool handler.
 
-        Returns a summary with counts plus the top positions by strength
-        (capped at *max_positions*) to avoid OOM on large lattices.
+        Returns a summary with counts plus the top items by strength,
+        capped to keep the response token-friendly.
         """
         position_count = self._db.execute(
             "SELECT COUNT(*) as cnt FROM lattice_positions"
@@ -515,46 +520,52 @@ class SynchronicityEngine:
                 "sync_event_id": r["sync_event_id"],
                 "angle": round(r["angle"], 4),
                 "prime_slots": json.loads(r["prime_slots"]),
-                "placed_at": r["placed_at"],
                 "event_type": r["event_type"],
                 "event_description": r["event_description"],
                 "event_strength": round(r["strength"], 3),
             }
             if r["poincare_x"] is not None:
-                entry["poincare"] = {
-                    "x": round(r["poincare_x"], 6),
-                    "y": round(r["poincare_y"], 6),
-                    "radius": round(
-                        math.sqrt(r["poincare_x"] ** 2 + r["poincare_y"] ** 2), 6
-                    ),
-                }
+                entry["poincare_radius"] = round(
+                    math.sqrt(r["poincare_x"] ** 2 + r["poincare_y"] ** 2), 4
+                )
             positions.append(entry)
+
+        resonance_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM resonances"
+        ).fetchone()["cnt"]
 
         resonance_rows = self._db.execute(
             """
             SELECT event_ids, shared_primes, resonance_strength, description
             FROM resonances
             ORDER BY resonance_strength DESC
-            LIMIT 1000
-            """
+            LIMIT ?
+            """,
+            (max_resonances,),
         ).fetchall()
-
-        resonance_count = self._db.execute(
-            "SELECT COUNT(*) as cnt FROM resonances"
-        ).fetchone()["cnt"]
 
         void = self.compute_void_profile()
 
-        # Glyph lattice state
+        # Glyph lattice state (compact: no glyph_vector embeddings)
+        glyph_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM glyph_positions"
+        ).fetchone()["cnt"]
+
         glyph_rows = self._db.execute(
             """
-            SELECT gp.tag_id, gp.angle, gp.prime_slots, gp.glyph_vector,
+            SELECT gp.tag_id, gp.angle, gp.prime_slots,
                    gp.placed_at, t.name AS tag_name
             FROM glyph_positions gp
             JOIN tags t ON t.id = gp.tag_id
-            ORDER BY gp.angle
-            """
+            ORDER BY gp.placed_at DESC
+            LIMIT ?
+            """,
+            (max_glyphs,),
         ).fetchall()
+
+        glyph_res_count = self._db.execute(
+            "SELECT COUNT(*) as cnt FROM glyph_resonances"
+        ).fetchone()["cnt"]
 
         glyph_res_rows = self._db.execute(
             """
@@ -565,13 +576,10 @@ class SynchronicityEngine:
             JOIN tags ta ON ta.id = gr.tag_a_id
             JOIN tags tb ON tb.id = gr.tag_b_id
             ORDER BY gr.resonance_strength DESC
-            LIMIT 500
-            """
+            LIMIT ?
+            """,
+            (max_resonances,),
         ).fetchall()
-
-        glyph_res_count = self._db.execute(
-            "SELECT COUNT(*) as cnt FROM glyph_resonances"
-        ).fetchone()["cnt"]
 
         return {
             "positions": positions,
@@ -587,6 +595,7 @@ class SynchronicityEngine:
                 for r in resonance_rows
             ],
             "resonance_count": resonance_count,
+            "resonances_returned": len(resonance_rows),
             "void_profile": {
                 "edge_tags": json.loads(void.edge_tags),
                 "void_radius": round(void.void_radius, 4),
@@ -598,16 +607,14 @@ class SynchronicityEngine:
             "glyph_lattice": {
                 "positions": [
                     {
-                        "tag_id": r["tag_id"],
                         "tag_name": r["tag_name"],
                         "angle": round(r["angle"], 4),
                         "prime_slots": json.loads(r["prime_slots"]),
-                        "glyph_vector": np.frombuffer(r["glyph_vector"], dtype=np.float32).tolist(),
-                        "placed_at": r["placed_at"],
                     }
                     for r in glyph_rows
                 ],
-                "position_count": len(glyph_rows),
+                "position_count": glyph_count,
+                "positions_returned": len(glyph_rows),
                 "resonances": [
                     {
                         "tag_a": r["tag_a_name"],
@@ -618,6 +625,7 @@ class SynchronicityEngine:
                     for r in glyph_res_rows
                 ],
                 "resonance_count": glyph_res_count,
+                "resonances_returned": len(glyph_res_rows),
             },
         }
 

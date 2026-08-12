@@ -50,10 +50,26 @@ class VectorIndex:
             self._adds_since_build = 0
             return
 
-        faiss = _import_faiss()
-
         memory_ids = [mid for mid, _ in chunks]
         matrix = np.stack([vec for _, vec in chunks]).astype(np.float32)
+        self.build_from_matrix(memory_ids, matrix)
+
+    def build_from_matrix(self, memory_ids: list[str], matrix: np.ndarray) -> None:
+        """Train and populate the index from a pre-built matrix.
+
+        Args:
+            memory_ids: Parallel list of memory IDs (one per row).
+            matrix: (N, dim) float32 contiguous array.
+        """
+        if len(memory_ids) == 0:
+            self._index = None
+            self._id_to_memory = []
+            self._adds_since_build = 0
+            return
+
+        faiss = _import_faiss()
+
+        matrix = np.ascontiguousarray(matrix, dtype=np.float32)
         n = len(matrix)
 
         # Choose index type based on corpus size.
