@@ -29,6 +29,14 @@ CHICORY_TOOLS = [
                     "type": "string",
                     "description": "Optional one-line summary for quick reference.",
                 },
+                "author": {
+                    "type": "string",
+                    "description": "Who/what wrote this memory (provenance byline).",
+                },
+                "origin": {
+                    "type": "string",
+                    "description": "Where the memory came from (session, source, context).",
+                },
             },
             "required": ["content", "tags"],
         },
@@ -206,6 +214,262 @@ CHICORY_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {},
+        },
+    },
+    {
+        "name": "librarian_status",
+        "description": (
+            "Librarian overview: write-gate calibration stats (verdict counts "
+            "and score ranges), sweep patrol progress, quarantined memory "
+            "count, and subject roster summary."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "librarian_review",
+        "description": (
+            "The librarian's queue: quarantined memories awaiting judgment "
+            "and open sweep findings (near-duplicates, tag drift, missing "
+            "embeddings). Use librarian_resolve to act on items."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max items per section (default 20).",
+                },
+            },
+        },
+    },
+    {
+        "name": "librarian_resolve",
+        "description": (
+            "Apply a judgment from librarian_review. For a quarantined "
+            "memory: pass memory_id plus action (release_critical, "
+            "release_reference, or archive). For a sweep finding: pass "
+            "finding_id to mark it resolved."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "Quarantined memory to act on.",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["release_critical", "release_reference", "archive"],
+                    "description": "Judgment to apply to the memory.",
+                },
+                "finding_id": {
+                    "type": "integer",
+                    "description": "Sweep finding to mark resolved.",
+                },
+            },
+        },
+    },
+    {
+        "name": "librarian_maintain",
+        "description": (
+            "Run one librarian maintenance pass now: sweep the next batch "
+            "of the shelf-reading patrol, rebuild the subject roster, and "
+            "process the demand ledger (FAQ promotion, commission filing)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "librarian_consult",
+        "description": (
+            "The front desk's structured consultation: FAQ fast path for "
+            "known recurring questions, subject dispatch to matching "
+            "shelves, general hybrid retrieval, and open research tickets "
+            "near the query. Prefer this when answering a patron question."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The patron's question.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Results per channel (default 5).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "librarian_faq",
+        "description": (
+            "FAQ desk management. list (status candidate/active/stale/"
+            "retired), approve (activate a candidate, optional answer "
+            "rewrite + author byline), retire. Only approved entries are "
+            "served on the consult fast path."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "approve", "retire"],
+                },
+                "faq_id": {"type": "integer"},
+                "answer": {"type": "string"},
+                "author": {"type": "string"},
+                "status": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "librarian_closure",
+        "description": (
+            "Specialist closure — settle what a piece of work overturned. "
+            "supersede: record that one memory refutes a claim in another "
+            "(nothing is deleted; the older one afterwards arrives marked). "
+            "close: the full reverse-order unwind for a finished report — "
+            "supersede what it refuted, stale dependent FAQ answers, "
+            "resolve findings it explains, close the ticket. list, retract."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string",
+                           "enum": ["list", "supersede", "close", "retract"]},
+                "memory_id": {"type": "string"},
+                "superseding_id": {"type": "string"},
+                "report_memory_id": {"type": "string"},
+                "commission_id": {"type": "integer"},
+                "claim": {"type": "string"},
+                "reason": {"type": "string"},
+                "scope": {"type": "string", "enum": ["claim", "whole"]},
+                "actor": {"type": "string"},
+                "supersedes": {"type": "array", "items": {"type": "object"}},
+                "resolve_findings": {"type": "array",
+                                     "items": {"type": "integer"}},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "librarian_desk",
+        "description": (
+            "The library's standing report — start here. What changed "
+            "since you were last here, what needs your judgment, what was "
+            "learned, and the state of the building. action='ack' marks "
+            "the moment seen; reading alone never acknowledges."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["report", "ack"]},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "librarian_subjects",
+        "description": (
+            "Address the subject hierarchy. tree: the roster as an outline. "
+            "show: one shelf, addressed loosely — a path, a name, or just a "
+            "topic ('gnosticism') resolves to the most specific shelf "
+            "holding it; ambiguity returns candidates. children: direct "
+            "children. rename (path + name): give a shelf a human name, "
+            "which survives roster rebuilds. Prefer `label` over `name` "
+            "when speaking to a person."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["tree", "show", "children", "rename"],
+                },
+                "path": {"type": "string"},
+                "name": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "librarian_ingress",
+        "description": (
+            "Receipted ingress dwell: hold content under custody before "
+            "committing it to memory, giving temporal detection a window. "
+            "hold (issue receipt + examine the dwelling window), review, "
+            "settle, commit (needs tags), discard, examine, stats. "
+            "Findings are advisory, not verdicts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["hold", "examine", "review", "settle",
+                             "commit", "discard", "stats"],
+                },
+                "content": {"type": "string"},
+                "receipt": {"type": "string"},
+                "source": {"type": "string"},
+                "origin": {"type": "string"},
+                "author": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "importance": {"type": "number"},
+                "summary": {"type": "string"},
+                "status": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "librarian_recall",
+        "description": (
+            "Cross-domain analogic recall: counterparts that occupy the "
+            "same role in other subjects that the query occupies in its "
+            "home subject (offset transport between subject centroids). "
+            "Results are conjectures, labeled register: analogy."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "top_k": {
+                    "type": "integer",
+                    "description": "Counterparts per subject (default 3).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "librarian_commissions",
+        "description": (
+            "The commission queue: research tickets on the library's known "
+            "gaps. list (by status), file (question), claim, report "
+            "(attach a stored report memory), close."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "file", "claim", "report", "close"],
+                },
+                "commission_id": {"type": "integer"},
+                "question": {"type": "string"},
+                "report_memory_id": {"type": "string"},
+                "status": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
         },
     },
 ]

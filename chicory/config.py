@@ -258,6 +258,72 @@ class ChicoryConfig(BaseModel):
     ingestion_reference_importance: float = Field(default=0.3)
     ingestion_reference_summary_max_chars: int = Field(default=2000)
 
+    # Librarian — write gate, quarantine, linear sweep, subject roster
+    librarian_gate_enabled: bool = Field(default=True)
+    librarian_gate_enforce: bool = Field(default=False)  # False = shadow mode: log verdicts, never divert
+    librarian_gate_threshold: float = Field(default=0.25)
+    librarian_gate_min_centroids: int = Field(default=50)  # cold-start guard: gate stays open below this
+    librarian_sweep_enabled: bool = Field(default=True)
+    librarian_sweep_interval_minutes: float = Field(default=30.0)
+    librarian_sweep_batch_size: int = Field(default=50)
+    librarian_sweep_near_dup_threshold: float = Field(default=0.95)
+    librarian_sweep_drift_threshold: float = Field(default=0.15)
+    subject_min_edge_strength: float = Field(default=0.05)
+    subject_min_cluster_size: int = Field(default=3)
+    subject_max_name_tags: int = Field(default=3)
+    # Stop-tag rule: tags on more than this fraction of live memories are
+    # format/hub tags (document, pdf), not topics — excluded from subjects
+    subject_hub_tag_max_fraction: float = Field(default=0.2)
+    # A connected component larger than this fraction of eligible tags is
+    # a chained blob — re-clustered in centroid space instead
+    subject_max_component_fraction: float = Field(default=0.25)
+    subject_split_k: int = Field(default=0)  # 0 = auto (~sqrt(n/2))
+    # A shelf is too big to teach when it holds this share of live memories.
+    # Tag count alone misses this: a 99-tag subject can hold 77% of the
+    # library and never trip a tag-fraction cap.
+    subject_max_memory_fraction: float = Field(default=0.15)
+    subject_max_depth: int = Field(default=3)
+    # A split whose largest child holds this share of the parent's tags
+    # separated nothing — treat the parent as a leaf rather than emitting
+    # a near-identity child (the X / X~2 / X~3 chains).
+    subject_split_min_separation: float = Field(default=0.9)
+    # Routing consults coarse shelves; teaching works fine ones.
+    # -1 = auto: the shallowest depth that actually has >1 shelf.  On a
+    # densely connected corpus the root is a single "everything" node, and
+    # routing to it is a no-op — auto skips past that to the first level
+    # that presents a real choice.
+    consult_route_depth: int = Field(default=-1)
+
+    # Librarian front desk — demand ledger, FAQ, dispatch, commissions
+    librarian_demand_enabled: bool = Field(default=True)
+    librarian_demand_interval_minutes: float = Field(default=15.0)
+    demand_cluster_threshold: float = Field(default=0.85)
+    demand_process_batch: int = Field(default=200)
+    demand_history_retention_days: int = Field(default=30)
+    faq_serve_threshold: float = Field(default=0.90)
+    faq_promote_min_hits: int = Field(default=3)
+    faq_promote_min_score: float = Field(default=0.45)
+    commission_min_hits: int = Field(default=3)
+    commission_weak_score: float = Field(default=0.30)
+    consult_subject_threshold: float = Field(default=0.30)
+    consult_max_subjects: int = Field(default=3)
+    # Ingress dwell — receipted hold before commitment (detection window)
+    ingress_enabled: bool = Field(default=True)
+    ingress_dwell_seconds: float = Field(default=180.0)
+    ingress_window_lookback: int = Field(default=25)
+    ingress_burst_threshold: float = Field(default=0.93)
+    ingress_trajectory_min_history: int = Field(default=3)
+    ingress_trajectory_deviation_threshold: float = Field(default=0.20)
+    ingress_quarantine_resemblance_threshold: float = Field(default=0.90)
+    ingress_retention_days: int = Field(default=30)
+    ingress_settle_batch: int = Field(default=25)
+    ingress_prune_interval_minutes: float = Field(default=60.0)
+
+    penumbra_enabled: bool = Field(default=True)
+    penumbra_keep: int = Field(default=20)
+    penumbra_buried_min_near: int = Field(default=5)
+    recall_max_subjects: int = Field(default=4)
+
     # Commons Layer — cross-project signal federation
     commons_enabled: bool = Field(default=False)
     commons_db_path: Path = Field(
@@ -306,6 +372,11 @@ def load_config(**overrides) -> ChicoryConfig:
         "CHICORY_GLYPH_MODEL_DIR": "glyph_model_dir",
         "CHICORY_GPTGU_PATH": "gptgu_path",
         "CHICORY_GLYPH_BRIDGE_ENABLED": "glyph_bridge_enabled",
+        # The write gate ships in shadow mode; enforcement is a per-install
+        # decision made after calibrating against that install's own corpus,
+        # so it belongs in the environment rather than the shipped defaults.
+        "CHICORY_GATE_ENFORCE": "librarian_gate_enforce",
+        "CHICORY_GATE_THRESHOLD": "librarian_gate_threshold",
     }
     for env_key, config_key in mapping.items():
         if env_key in env and env[env_key]:
@@ -319,7 +390,9 @@ def load_config(**overrides) -> ChicoryConfig:
             kwargs[config_key] = val
 
     # Coerce string booleans from env vars
-    for bool_key in ("commons_enabled", "glyph_bridge_enabled"):
+    for bool_key in (
+        "commons_enabled", "glyph_bridge_enabled", "librarian_gate_enforce",
+    ):
         if isinstance(kwargs.get(bool_key), str):
             kwargs[bool_key] = kwargs[bool_key].lower() in ("true", "1", "yes")
 

@@ -54,6 +54,8 @@ class MemoryStore:
         content_hash: str | None = None,
         source_path: str | None = None,
         ingestion_tier: str = "critical",
+        author: str | None = None,
+        origin: str | None = None,
         precomputed_embeddings: list[np.ndarray] | None = None,
     ) -> Memory:
         """Store a new memory with tags and (optionally) embedding."""
@@ -69,12 +71,12 @@ class MemoryStore:
                 INSERT INTO memories
                     (id, content, summary, created_at, updated_at, source_model,
                      salience_model, salience_usage, salience_composite, content_hash,
-                     source_path, ingestion_tier)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?, ?)
+                     source_path, ingestion_tier, author, origin)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?, ?, ?, ?)
                 """,
                 (memory_id, content, summary, now, now, model,
                  salience_model, salience_composite, content_hash,
-                 source_path, ingestion_tier),
+                 source_path, ingestion_tier, author, origin),
             )
 
             # Assign word tags
@@ -138,6 +140,9 @@ class MemoryStore:
             salience_model=salience_model,
             salience_usage=0.0,
             salience_composite=salience_composite,
+            ingestion_tier=ingestion_tier,
+            author=author,
+            origin=origin,
             tags=tag_names,
         )
 
@@ -167,6 +172,10 @@ class MemoryStore:
         k = top_k or self._config.max_retrieval_results
         if query_vec is None:
             query_vec = self._embedding.embed(query)
+        # Keep parity with retrieve_hybrid: downstream consumers (demand
+        # ledger, query-side tags) read the vector for THIS query, never
+        # a stale one from a previous hybrid call.
+        self._last_query_vec = query_vec
 
         # Tag-filtered path: over-fetch then post-filter
         if tag_filter:
@@ -194,7 +203,10 @@ class MemoryStore:
         top_ids = [mid for mid, _ in filtered]
         score_map = dict(filtered)
         memories = self._get_by_ids(top_ids)
-        return [(memories[mid], score_map[mid]) for mid in top_ids if mid in memories]
+        return [
+            (memories[mid], score_map[mid]) for mid in top_ids
+            if mid in memories and memories[mid].ingestion_tier != "quarantine"
+        ]
 
     def retrieve_by_tags(
         self,
@@ -214,6 +226,7 @@ class MemoryStore:
                 SELECT m.* FROM memories m
                 JOIN memory_tags mt ON m.id = mt.memory_id
                 WHERE mt.tag_id IN ({placeholders}) AND m.is_archived = 0
+                  AND m.ingestion_tier != 'quarantine'
                 GROUP BY m.id
                 HAVING COUNT(DISTINCT mt.tag_id) = ?
                 ORDER BY m.salience_composite DESC
@@ -227,6 +240,7 @@ class MemoryStore:
                 SELECT DISTINCT m.* FROM memories m
                 JOIN memory_tags mt ON m.id = mt.memory_id
                 WHERE mt.tag_id IN ({placeholders}) AND m.is_archived = 0
+                  AND m.ingestion_tier != 'quarantine'
                 ORDER BY m.salience_composite DESC
                 """,
                 tuple(tag_ids),
@@ -381,7 +395,18 @@ class MemoryStore:
                                     components[mid]["convergence"] = w_conv * norm
 
         _s = _time.perf_counter()
-        sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        sorted_ids = ranked[:k]
+        # Penumbra: the runners-up that scored near the query and lost the
+        # top-k cut.  Stashed for the librarian's near-miss ledger — every
+        # retrieval computes these and would otherwise throw them away.
+        # Floor at the untagged serve threshold: a runner-up that could
+        # never have been served isn't "near", it's just noise.
+        floor = self._config.retrieval_min_relevance_score_untagged
+        self._last_penumbra = [
+            (mid, s) for mid, s in ranked[k : k + self._config.penumbra_keep]
+            if s >= floor
+        ]
         if not sorted_ids:
             _t["total"] = _time.perf_counter() - _t0
             import logging
@@ -406,12 +431,17 @@ class MemoryStore:
             for mid in top_ids if mid in memories
         }
 
-        return [(memories[mid], score_map[mid]) for mid in top_ids if mid in memories]
+        return [
+            (memories[mid], score_map[mid]) for mid in top_ids
+            if mid in memories and memories[mid].ingestion_tier != "quarantine"
+        ]
 
     def list_recent(self, limit: int = 20) -> list[Memory]:
         """List most recent memories."""
         rows = self._db.execute(
-            "SELECT * FROM memories WHERE is_archived = 0 ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM memories WHERE is_archived = 0 "
+            "AND ingestion_tier != 'quarantine' "
+            "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return self._rows_to_memories(rows)
@@ -510,5 +540,9 @@ class MemoryStore:
             retrieval_success_count=row["retrieval_success_count"],
             retrieval_total_count=row["retrieval_total_count"],
             is_archived=bool(row["is_archived"]),
+            ingestion_tier=row["ingestion_tier"],
+            author=row["author"],
+            origin=row["origin"],
+            custody_status=row["custody_status"],
             tags=tags,
         )

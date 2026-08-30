@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 37
 
 TABLES = [
     # -- Schema version tracking --
@@ -35,7 +35,11 @@ TABLES = [
         is_archived             INTEGER NOT NULL DEFAULT 0,
         content_hash            TEXT,
         source_path             TEXT,
-        ingestion_tier          TEXT NOT NULL DEFAULT 'critical'
+        ingestion_tier          TEXT NOT NULL DEFAULT 'critical',
+        author                  TEXT,
+        origin                  TEXT,
+        swept_at                TEXT,
+        custody_status          TEXT NOT NULL DEFAULT 'unswept'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_memories_salience ON memories(salience_composite DESC)",
@@ -43,6 +47,8 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed)",
     "CREATE INDEX IF NOT EXISTS idx_memories_source_path ON memories(source_path) WHERE source_path IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(ingestion_tier) WHERE ingestion_tier != 'critical'",
+    "CREATE INDEX IF NOT EXISTS idx_memories_swept_at ON memories(swept_at)",
 
     """
     CREATE TABLE IF NOT EXISTS embeddings (
@@ -763,6 +769,213 @@ TABLES = [
         updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
     )
     """,
+
+    # -- Librarian: subject roster (named topical clusters over tags) --
+    """
+    CREATE TABLE IF NOT EXISTS subjects (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        name           TEXT NOT NULL UNIQUE,
+        description    TEXT,
+        centroid       BLOB,
+        member_tag_ids TEXT NOT NULL,
+        memory_count   INTEGER NOT NULL DEFAULT 0,
+        status         TEXT NOT NULL DEFAULT 'active',
+        parent_id      INTEGER REFERENCES subjects(id),
+        depth          INTEGER NOT NULL DEFAULT 0,
+        path           TEXT,
+        display_name   TEXT,
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_subjects_status ON subjects(status)",
+    "CREATE INDEX IF NOT EXISTS idx_subjects_parent ON subjects(parent_id)",
+    "CREATE INDEX IF NOT EXISTS idx_subjects_depth ON subjects(depth)",
+    "CREATE INDEX IF NOT EXISTS idx_subjects_path ON subjects(path)",
+
+    # -- Librarian: write gate verdict log (shadow-mode calibration + audit) --
+    """
+    CREATE TABLE IF NOT EXISTS write_gate_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id   TEXT NOT NULL,
+        best_tag_id INTEGER,
+        score       REAL NOT NULL,
+        verdict     TEXT NOT NULL,
+        enforced    INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_write_gate_log_verdict ON write_gate_log(verdict)",
+    "CREATE INDEX IF NOT EXISTS idx_write_gate_log_created ON write_gate_log(created_at)",
+
+    # -- Librarian: linear sweep findings (shelf-reading patrol journal) --
+    """
+    CREATE TABLE IF NOT EXISTS sweep_findings (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id    TEXT NOT NULL,
+        finding_type TEXT NOT NULL,
+        detail       TEXT,
+        resolved     INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        UNIQUE(memory_id, finding_type, detail)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_sweep_findings_open ON sweep_findings(resolved) WHERE resolved = 0",
+
+    # -- Librarian: custody transition journal (auditable status changes) --
+    """
+    CREATE TABLE IF NOT EXISTS custody_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id   TEXT NOT NULL,
+        from_status TEXT NOT NULL,
+        to_status   TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        reason      TEXT,
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_custody_events_memory ON custody_events(memory_id)",
+
+    # -- Librarian: demand ledger (queries as first-class archive) --
+    """
+    CREATE TABLE IF NOT EXISTS query_history (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        query_text   TEXT NOT NULL,
+        embedding    BLOB,
+        result_count INTEGER NOT NULL DEFAULT 0,
+        top_score    REAL NOT NULL DEFAULT 0.0,
+        processed    INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_query_history_unprocessed ON query_history(processed) WHERE processed = 0",
+
+    """
+    CREATE TABLE IF NOT EXISTS query_clusters (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        centroid             BLOB NOT NULL,
+        representative_query TEXT NOT NULL,
+        hit_count            INTEGER NOT NULL DEFAULT 1,
+        mean_top_score       REAL NOT NULL DEFAULT 0.0,
+        created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_seen_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+
+    # -- Librarian: FAQ desk (crystallized answers to recurring questions) --
+    """
+    CREATE TABLE IF NOT EXISTS faq_entries (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        question_text          TEXT NOT NULL,
+        question_centroid      BLOB NOT NULL,
+        answer                 TEXT,
+        supporting_memory_ids  TEXT NOT NULL,
+        subject_ids            TEXT NOT NULL DEFAULT '[]',
+        status                 TEXT NOT NULL DEFAULT 'candidate',
+        hit_count              INTEGER NOT NULL DEFAULT 0,
+        author                 TEXT,
+        created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        last_verified_at       TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_faq_entries_status ON faq_entries(status)",
+
+    # -- Librarian: commission queue (assigned research on known gaps) --
+    """
+    CREATE TABLE IF NOT EXISTS commissions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        question_text    TEXT NOT NULL,
+        centroid         BLOB,
+        source           TEXT NOT NULL DEFAULT 'manual',
+        subject_ids      TEXT NOT NULL DEFAULT '[]',
+        status           TEXT NOT NULL DEFAULT 'open',
+        report_memory_id TEXT,
+        created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_commissions_status ON commissions(status)",
+
+    # -- Librarian: penumbra ledger (near-misses per memory, aggregated) --
+    """
+    CREATE TABLE IF NOT EXISTS retrieval_penumbra (
+        memory_id         TEXT PRIMARY KEY,
+        near_count        INTEGER NOT NULL DEFAULT 0,
+        retrieved_count   INTEGER NOT NULL DEFAULT 0,
+        last_near_at      TEXT,
+        last_retrieved_at TEXT
+    )
+    """,
+
+    # -- Librarian: ingress buffer (receipted dwell before commitment) --
+    """
+    CREATE TABLE IF NOT EXISTS message_ingress (
+        receipt        TEXT PRIMARY KEY,
+        content        TEXT NOT NULL,
+        content_hash   TEXT NOT NULL,
+        embedding      BLOB,
+        source         TEXT NOT NULL DEFAULT 'user',
+        origin         TEXT,
+        author         TEXT,
+        arrived_at     TEXT NOT NULL,
+        dwell_until    TEXT NOT NULL,
+        status         TEXT NOT NULL DEFAULT 'held',
+        examined_count INTEGER NOT NULL DEFAULT 0,
+        memory_id      TEXT,
+        settled_at     TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ingress_status ON message_ingress(status)",
+    "CREATE INDEX IF NOT EXISTS idx_ingress_dwell ON message_ingress(dwell_until) WHERE status = 'held'",
+    "CREATE INDEX IF NOT EXISTS idx_ingress_hash ON message_ingress(content_hash)",
+
+    """
+    CREATE TABLE IF NOT EXISTS ingress_findings (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        receipt      TEXT NOT NULL,
+        finding_type TEXT NOT NULL,
+        detail       TEXT,
+        severity     REAL NOT NULL DEFAULT 0.0,
+        -- '' (never NULL) for single-receipt findings: SQLite treats NULLs
+        -- as distinct in UNIQUE, so a nullable column here would let every
+        -- re-examination insert a duplicate of the same finding
+        peer_receipt TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        UNIQUE(receipt, finding_type, peer_receipt)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ingress_findings_receipt ON ingress_findings(receipt)",
+
+    # -- Librarian: supersession (authored, never derived, never pruned) --
+    """
+    CREATE TABLE IF NOT EXISTS supersessions (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        superseded_id  TEXT NOT NULL,
+        superseding_id TEXT NOT NULL,
+        scope          TEXT NOT NULL DEFAULT 'claim',
+        -- '' (never NULL) for "no specific claim named": SQLite treats
+        -- NULLs as distinct in UNIQUE, so a nullable column here would let
+        -- every re-record insert a duplicate and stop ON CONFLICT firing.
+        -- Same trap as ingress_findings.peer_receipt above.
+        claim          TEXT NOT NULL DEFAULT '',
+        reason         TEXT,
+        actor          TEXT NOT NULL,
+        retracted      INTEGER NOT NULL DEFAULT 0,
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        UNIQUE(superseded_id, superseding_id, claim)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_supersessions_old ON supersessions(superseded_id) WHERE retracted = 0",
+    "CREATE INDEX IF NOT EXISTS idx_supersessions_new ON supersessions(superseding_id)",
+
+    # -- Librarian: durable key/value state (watermarks, checkpoints) --
+    """
+    CREATE TABLE IF NOT EXISTS librarian_state (
+        key        TEXT PRIMARY KEY,
+        value      TEXT,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
 ]
 
 
@@ -832,6 +1045,24 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v26_to_v27(db)
             if current_version <= 27:
                 _migrate_v27_to_v28(db)
+            if current_version <= 28:
+                _migrate_v28_to_v29(db)
+            if current_version <= 29:
+                _migrate_v29_to_v30(db)
+            if current_version <= 30:
+                _migrate_v30_to_v31(db)
+            if current_version <= 31:
+                _migrate_v31_to_v32(db)
+            if current_version <= 32:
+                _migrate_v32_to_v33(db)
+            if current_version <= 33:
+                _migrate_v33_to_v34(db)
+            if current_version <= 34:
+                _migrate_v34_to_v35(db)
+            if current_version <= 35:
+                _migrate_v35_to_v36(db)
+            if current_version <= 36:
+                _migrate_v36_to_v37(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -845,8 +1076,20 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Directional canopy: inflow/outflow layers"),
+                (SCHEMA_VERSION, "Supersession: non-null claim so UNIQUE actually binds"),
             )
+
+
+def _has_table(db: DatabaseEngine, name: str) -> bool:
+    """Whether a table exists yet.
+
+    Migrations run BEFORE the TABLES loop creates anything, so a migration
+    that reads a table it did not itself create must check first — the
+    table may belong to a version the database has not reached.
+    """
+    return db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,),
+    ).fetchone() is not None
 
 
 def _migrate_v1_to_v2(db: DatabaseEngine) -> None:
@@ -1229,6 +1472,212 @@ def _migrate_v21_to_v22(db: DatabaseEngine) -> None:
         )
 
 
+def _migrate_v28_to_v29(db: DatabaseEngine) -> None:
+    """Add librarian provenance + sweep columns to memories.
+
+    New tables (subjects, write_gate_log, sweep_findings) use IF NOT EXISTS
+    in TABLES; only the memories columns need explicit migration.
+    """
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    cols = db.execute("PRAGMA table_info(memories)").fetchall()
+    col_names = {c["name"] for c in cols}
+
+    if "author" not in col_names:
+        db.execute("ALTER TABLE memories ADD COLUMN author TEXT")
+    if "origin" not in col_names:
+        db.execute("ALTER TABLE memories ADD COLUMN origin TEXT")
+    if "swept_at" not in col_names:
+        db.execute("ALTER TABLE memories ADD COLUMN swept_at TEXT")
+
+
+def _migrate_v29_to_v30(db: DatabaseEngine) -> None:
+    """Add custody_status to memories and backfill from existing state.
+
+    New tables (custody_events, query_history, query_clusters, faq_entries,
+    commissions) use IF NOT EXISTS in TABLES.
+    """
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    cols = db.execute("PRAGMA table_info(memories)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "custody_status" in col_names:
+        return
+
+    db.execute(
+        "ALTER TABLE memories ADD COLUMN custody_status TEXT NOT NULL DEFAULT 'unswept'"
+    )
+
+    # Backfill: quarantined tier wins; then swept memories split on open findings
+    db.execute(
+        "UPDATE memories SET custody_status = 'quarantined' "
+        "WHERE ingestion_tier = 'quarantine'"
+    )
+    findings_exist = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='sweep_findings'"
+    ).fetchone()
+    if findings_exist:
+        db.execute(
+            """
+            UPDATE memories SET custody_status = 'flagged'
+            WHERE custody_status = 'unswept' AND swept_at IS NOT NULL
+              AND id IN (SELECT memory_id FROM sweep_findings WHERE resolved = 0)
+            """
+        )
+    db.execute(
+        "UPDATE memories SET custody_status = 'clean' "
+        "WHERE custody_status = 'unswept' AND swept_at IS NOT NULL"
+    )
+
+    # Journal the backfill — custody transitions are never silent, even
+    # migration-time ones.  (custody_events is normally created by the
+    # TABLES loop, which runs AFTER migrations — create it here.)
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS custody_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id   TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status   TEXT NOT NULL,
+            actor       TEXT NOT NULL,
+            reason      TEXT,
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+        )
+        """
+    )
+    db.execute(
+        """
+        INSERT INTO custody_events (memory_id, from_status, to_status, actor, reason)
+        SELECT id, 'unswept', custody_status, 'migration', 'v29->v30 backfill'
+        FROM memories WHERE custody_status != 'unswept'
+        """
+    )
+
+
+def _migrate_v30_to_v31(db: DatabaseEngine) -> None:
+    """Add retrieval_penumbra table.
+
+    Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v31_to_v32(db: DatabaseEngine) -> None:
+    """Add message_ingress + ingress_findings tables.
+
+    Tables use IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v36_to_v37(db: DatabaseEngine) -> None:
+    """Rebuild supersessions with a NOT NULL claim.
+
+    A nullable column inside a UNIQUE tuple enforces nothing in SQLite,
+    so re-recording a supersession with no named claim duplicated the row
+    instead of updating it.  Rebuild the table, collapsing any duplicates
+    that were already written (keeping the most recent).
+    """
+    exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='supersessions'"
+    ).fetchone()
+    if not exists:
+        return
+    cols = db.execute("PRAGMA table_info(supersessions)").fetchall()
+    if not any(c["name"] == "claim" and c["notnull"] for c in cols):
+        db.execute("ALTER TABLE supersessions RENAME TO supersessions_old")
+        db.execute(
+            """
+            CREATE TABLE supersessions (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                superseded_id  TEXT NOT NULL,
+                superseding_id TEXT NOT NULL,
+                scope          TEXT NOT NULL DEFAULT 'claim',
+                claim          TEXT NOT NULL DEFAULT '',
+                reason         TEXT,
+                actor          TEXT NOT NULL,
+                retracted      INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+                UNIQUE(superseded_id, superseding_id, claim)
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO supersessions
+                (superseded_id, superseding_id, scope, claim, reason, actor,
+                 retracted, created_at)
+            SELECT superseded_id, superseding_id, scope,
+                   COALESCE(claim, ''), reason, actor, retracted, MAX(created_at)
+            FROM supersessions_old
+            GROUP BY superseded_id, superseding_id, COALESCE(claim, '')
+            """
+        )
+        db.execute("DROP TABLE supersessions_old")
+
+
+def _migrate_v35_to_v36(db: DatabaseEngine) -> None:
+    """Add the supersessions table.
+
+    Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v34_to_v35(db: DatabaseEngine) -> None:
+    """Add subjects.display_name — an authored field, never derived.
+
+    The roster rebuild refreshes derived columns but must leave this one
+    alone, so a name a person or specialist gave a shelf survives.
+    """
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='subjects'"
+    ).fetchone()
+    if not table_exists:
+        return
+    cols = {c["name"] for c in db.execute("PRAGMA table_info(subjects)").fetchall()}
+    if "display_name" not in cols:
+        db.execute("ALTER TABLE subjects ADD COLUMN display_name TEXT")
+
+
+def _migrate_v33_to_v34(db: DatabaseEngine) -> None:
+    """Add librarian_state.
+
+    Table uses IF NOT EXISTS in TABLES, so no explicit migration needed.
+    """
+    pass
+
+
+def _migrate_v32_to_v33(db: DatabaseEngine) -> None:
+    """Add hierarchy columns to subjects.
+
+    Existing subjects become depth-0 roots; the next roster rebuild
+    derives the tree.
+    """
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='subjects'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    cols = {c["name"] for c in db.execute("PRAGMA table_info(subjects)").fetchall()}
+    if "parent_id" not in cols:
+        db.execute("ALTER TABLE subjects ADD COLUMN parent_id INTEGER REFERENCES subjects(id)")
+    if "depth" not in cols:
+        db.execute("ALTER TABLE subjects ADD COLUMN depth INTEGER NOT NULL DEFAULT 0")
+    if "path" not in cols:
+        db.execute("ALTER TABLE subjects ADD COLUMN path TEXT")
+    db.execute("UPDATE subjects SET path = name WHERE path IS NULL")
+
+
 def _migrate_v22_to_v23(db: DatabaseEngine) -> None:
     """Add temporal tag episode tables.
 
@@ -1283,6 +1732,8 @@ def _migrate_v24_to_v25(db: DatabaseEngine) -> None:
         "CREATE INDEX IF NOT EXISTS idx_sync_event_tags_tid ON sync_event_tags(tag_id)"
     )
 
+    if not _has_table(db, "synchronicity_events"):
+        return
     rows = db.execute(
         "SELECT id, involved_tags FROM synchronicity_events"
     ).fetchall()
@@ -1310,6 +1761,8 @@ def _migrate_v25_to_v26(db: DatabaseEngine) -> None:
     Uses batched updates by rowid range to avoid WAL journal overflow
     on large databases.
     """
+    if not _has_table(db, "resonances"):
+        return
     row = db.execute(
         "SELECT MIN(resonance_strength) AS mn, MAX(resonance_strength) AS mx "
         "FROM resonances"
@@ -1355,6 +1808,8 @@ def _migrate_v25_to_v26(db: DatabaseEngine) -> None:
 
 def _migrate_v26_to_v27(db: DatabaseEngine) -> None:
     """Reset episode distance stats for Euclidean metric switch."""
+    if not _has_table(db, "temporal_episodes"):
+        return
     db.execute(
         "UPDATE temporal_episodes SET mean_distance = 0, variance_sum = 0, "
         "distance_samples = 0"

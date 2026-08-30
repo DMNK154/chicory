@@ -128,7 +128,7 @@ class CentroidSubgraph:
             "SELECT mt.tag_id, mt.memory_id "
             "FROM memory_tags mt "
             "JOIN memories m ON m.id = mt.memory_id "
-            "WHERE m.is_archived = 0"
+            "WHERE m.is_archived = 0 AND m.ingestion_tier != 'quarantine'"
         ).fetchall()
 
         if not rows:

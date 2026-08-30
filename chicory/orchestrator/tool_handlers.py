@@ -29,6 +29,18 @@ def dispatch_tool_call(
         "sync_network": _handle_sync_network,
         "get_last_trace": _handle_get_last_trace,
         "compare_traces": _handle_compare_traces,
+        "librarian_status": _handle_librarian_status,
+        "librarian_review": _handle_librarian_review,
+        "librarian_resolve": _handle_librarian_resolve,
+        "librarian_maintain": _handle_librarian_maintain,
+        "librarian_consult": _handle_librarian_consult,
+        "librarian_faq": _handle_librarian_faq,
+        "librarian_commissions": _handle_librarian_commissions,
+        "librarian_recall": _handle_librarian_recall,
+        "librarian_ingress": _handle_librarian_ingress,
+        "librarian_subjects": _handle_librarian_subjects,
+        "librarian_desk": _handle_librarian_desk,
+        "librarian_closure": _handle_librarian_closure,
     }
 
     handler = handlers.get(tool_name)
@@ -44,6 +56,8 @@ def _handle_store_memory(o: "Orchestrator", inp: dict) -> dict:
         tags=inp.get("tags", []),
         importance=inp.get("importance"),
         summary=inp.get("summary"),
+        author=inp.get("author"),
+        origin=inp.get("origin"),
     )
 
 
@@ -125,3 +139,108 @@ def _handle_get_last_trace(o: "Orchestrator", inp: dict) -> dict:
 
 def _handle_compare_traces(o: "Orchestrator", inp: dict) -> dict:
     return o.handle_compare_traces()
+
+
+def _handle_librarian_status(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_status()
+
+
+def _handle_librarian_review(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_review(limit=inp.get("limit", 20))
+
+
+def _handle_librarian_resolve(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_resolve(
+        memory_id=inp.get("memory_id"),
+        action=inp.get("action"),
+        finding_id=inp.get("finding_id"),
+    )
+
+
+def _handle_librarian_maintain(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_maintain()
+
+
+def _handle_librarian_consult(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_consult(
+        query=inp["query"],
+        top_k=inp.get("top_k", 5),
+    )
+
+
+def _handle_librarian_faq(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_faq(
+        action=inp.get("action", "list"),
+        faq_id=inp.get("faq_id"),
+        answer=inp.get("answer"),
+        author=inp.get("author"),
+        status=inp.get("status", "candidate"),
+        limit=inp.get("limit", 20),
+    )
+
+
+def _handle_librarian_recall(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_recall(
+        query=inp["query"],
+        top_k=inp.get("top_k", 3),
+    )
+
+
+def _handle_librarian_closure(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_closure(
+        action=inp.get("action", "list"),
+        memory_id=inp.get("memory_id"),
+        superseding_id=inp.get("superseding_id"),
+        report_memory_id=inp.get("report_memory_id"),
+        commission_id=inp.get("commission_id"),
+        claim=inp.get("claim"),
+        reason=inp.get("reason"),
+        scope=inp.get("scope", "claim"),
+        actor=inp.get("actor"),
+        supersedes=inp.get("supersedes"),
+        resolve_findings=inp.get("resolve_findings"),
+        limit=inp.get("limit", 20),
+    )
+
+
+def _handle_librarian_desk(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_desk(
+        action=inp.get("action", "report"),
+        limit=inp.get("limit", 5),
+    )
+
+
+def _handle_librarian_subjects(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_subjects(
+        action=inp.get("action", "tree"),
+        path=inp.get("path"),
+        name=inp.get("name"),
+        limit=inp.get("limit", 200),
+    )
+
+
+def _handle_librarian_ingress(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_ingress(
+        action=inp.get("action", "review"),
+        content=inp.get("content"),
+        receipt=inp.get("receipt"),
+        source=inp.get("source", "user"),
+        origin=inp.get("origin"),
+        author=inp.get("author"),
+        tags=inp.get("tags"),
+        importance=inp.get("importance"),
+        summary=inp.get("summary"),
+        status=inp.get("status", "held"),
+        limit=inp.get("limit", 25),
+    )
+
+
+def _handle_librarian_commissions(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_commissions(
+        action=inp.get("action", "list"),
+        commission_id=inp.get("commission_id"),
+        question=inp.get("question"),
+        report_memory_id=inp.get("report_memory_id"),
+        status=inp.get("status", "open"),
+        limit=inp.get("limit", 20),
+    )

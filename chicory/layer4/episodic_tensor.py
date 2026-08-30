@@ -105,7 +105,7 @@ class EpisodicTensor:
             "SELECT a.memory_id, a.episode_id "
             "FROM memory_episode_assignments a "
             "JOIN memories m ON m.id = a.memory_id "
-            "WHERE m.ingestion_tier != 'reference'"
+            "WHERE m.ingestion_tier NOT IN ('reference', 'quarantine')"
         ).fetchall()
         episodes: dict[int, list[str]] = {}
         for r in rows:
@@ -291,7 +291,8 @@ class EpisodicTensor:
         rows = self._db.execute(
             """SELECT e.memory_id, e.embedding, e.dimension FROM embeddings e
                JOIN memories m ON m.id = e.memory_id
-               WHERE e.chunk_index = 0 AND m.ingestion_tier != 'reference'
+               WHERE e.chunk_index = 0
+                 AND m.ingestion_tier NOT IN ('reference', 'quarantine')
                ORDER BY e.memory_id"""
         ).fetchall()
 
@@ -422,8 +423,10 @@ class EpisodicTensor:
             return 0
 
         mates = self._db.execute(
-            "SELECT memory_id FROM memory_episode_assignments "
-            "WHERE episode_id = ? AND memory_id != ?",
+            "SELECT a.memory_id FROM memory_episode_assignments a "
+            "JOIN memories m ON m.id = a.memory_id "
+            "WHERE a.episode_id = ? AND a.memory_id != ? "
+            "AND m.ingestion_tier NOT IN ('reference', 'quarantine')",
             (ep_row["episode_id"], memory_id),
         ).fetchall()
         mate_ids = [r["memory_id"] for r in mates]

@@ -23,6 +23,10 @@ class Memory(BaseModel):
     retrieval_success_count: int = 0
     retrieval_total_count: int = 0
     is_archived: bool = False
+    ingestion_tier: str = "critical"
+    author: Optional[str] = None
+    origin: Optional[str] = None
+    custody_status: str = "unswept"
     tags: list[str] = Field(default_factory=list)
 
 

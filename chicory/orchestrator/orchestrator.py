@@ -8,6 +8,11 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+# Module-level, not function-local: `from __future__ import annotations`
+# means np-typed signatures never evaluate, so a missing import here is
+# invisible until a runtime np.* call raises NameError.
+import numpy as np
+
 from chicory.config import ChicoryConfig
 from chicory.db.engine import DatabaseEngine
 from chicory.db.schema import apply_schema
@@ -29,6 +34,21 @@ from chicory.layer3.directional_flow import InflowObserver, OutflowObserver
 from chicory.layer4.episodic_tensor import EpisodicTensor
 from chicory.layer4.temporal_episodes import TemporalEpisodeTracker
 from chicory.layer4.feedback import FeedbackEngine
+from chicory.layer4.closure import ClosureLedger
+from chicory.layer4.desk import DeskReport
+from chicory.layer4.ingress import IngressBuffer
+from chicory.layer4.librarian import (
+    CommissionDesk,
+    DemandLedger,
+    FaqDesk,
+    LinearSweep,
+    PenumbraLedger,
+    SubjectRoster,
+    WriteGate,
+    analogic_target,
+    parallelness,
+    record_custody_transition,
+)
 from chicory.layer4.meta_analyzer import MetaAnalyzer
 from chicory.layer4.forest import ForestReorganizer
 from chicory.layer1.glyph_analyzer import analyze_text, extract_glyph_tags
@@ -147,10 +167,46 @@ class Orchestrator:
         )
         self._maybe_seed_temporal_episodes()
 
+        # Librarian — write gate, linear sweep patrol, subject roster
+        self._write_gate = WriteGate(
+            config, self._db, self._tag_manager, self._centroid_subgraph,
+        )
+        self._penumbra_ledger = PenumbraLedger(config, self._db)
+        self._linear_sweep = LinearSweep(
+            config, self._db, self._embedding_engine,
+            self._tag_manager, self._centroid_subgraph,
+            penumbra=self._penumbra_ledger,
+        )
+        self._subject_roster = SubjectRoster(
+            config, self._db, self._centroid_subgraph,
+        )
+
+        # Ingress dwell — receipted hold in front of memory commitment
+        self._ingress = IngressBuffer(config, self._db)
+
+        # The desk report — the library's standing "since we last spoke"
+        self._desk = DeskReport(config, self._db)
+
+        # Closure — supersession, and unwinding the chain a report closes
+        self._closure = ClosureLedger(config, self._db)
+
+        # Librarian front desk — FAQ, demand ledger, commissions
+        self._faq_desk = FaqDesk(config, self._db)
+        self._commission_desk = CommissionDesk(config, self._db)
+        self._demand_ledger = DemandLedger(
+            config, self._db, self._memory_store,
+            self._faq_desk, self._commission_desk, self._subject_roster,
+            closure=self._closure,
+        )
+
         # Rate limiting for detection — initialise to "now" so the first
         # retrieval isn't blocked by expensive sync/meta detection.
         self._last_sync_check: datetime | None = datetime.utcnow()
         self._last_meta_check: datetime | None = datetime.utcnow()
+        self._last_sweep_check: datetime | None = datetime.utcnow()
+        self._last_demand_check: datetime | None = datetime.utcnow()
+        self._last_ingress_check: datetime | None = None  # settle promptly
+        self._last_ingress_prune: datetime | None = None
 
         # Diagnostics — activation trace + context log
         self._prev_trace = None
@@ -632,6 +688,8 @@ class Orchestrator:
         defer_side_effects: bool = False,
         source_path: str | None = None,
         ingestion_tier: str = "critical",
+        author: str | None = None,
+        origin: str | None = None,
     ) -> dict[str, Any]:
         """Store a memory and fire side effects.
 
@@ -642,6 +700,11 @@ class Orchestrator:
         When defer_side_effects=True, skips _on_memory_stored (trend events,
         lattice placement, canopy, etc). Callers must handle side effects
         themselves — used by bulk ingestion to avoid O(n) expensive work.
+
+        The librarian write gate scores the incoming embedding against tag
+        centroids; below-threshold writes are diverted to the 'quarantine'
+        tier (when enforcement is on) and skip network side effects so a
+        suspect memory can't reshape the centroids it failed against.
         """
         salience = importance if importance is not None else 0.5
 
@@ -667,6 +730,27 @@ class Orchestrator:
         self._foreground_waiting.set()
         try:
             with self._foreground_db_lock:
+                # Librarian write gate — only gates default-tier writes where
+                # the embedding is in hand; bulk ingest paths classify tier
+                # themselves and pass skip_embedding=True.
+                gate_verdict = None
+                if (
+                    self._config.librarian_gate_enabled
+                    and precomputed is not None
+                    and ingestion_tier == "critical"
+                ):
+                    try:
+                        gate_verdict = self._write_gate.evaluate_content(
+                            precomputed, merged_tags,
+                        )
+                        if gate_verdict.diverted:
+                            ingestion_tier = "quarantine"
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Write gate evaluation failed; storing ungated"
+                        )
+                        gate_verdict = None
+
                 memory = self._memory_store.store(
                     content=content,
                     tags=merged_tags,
@@ -676,17 +760,32 @@ class Orchestrator:
                     content_hash=content_hash,
                     source_path=source_path,
                     ingestion_tier=ingestion_tier,
+                    author=author,
+                    origin=origin,
                     precomputed_embeddings=precomputed,
                 )
+
+                if gate_verdict is not None:
+                    self._write_gate.log(memory.id, gate_verdict)
 
                 if glyph_analysis["words"]:
                     self._store_glyph_metadata(memory.id, glyph_analysis)
 
-                if not defer_side_effects:
+                quarantined = ingestion_tier == "quarantine"
+                if quarantined:
+                    # store_cached incrementally added this embedding to any
+                    # live FAISS index; drop the index so the next search
+                    # rebuilds from the tier-filtered load query.
+                    self._embedding_engine._clear_memory_cache()
+                    record_custody_transition(
+                        self._db, memory.id, "quarantined", actor="gate",
+                        reason=f"score={gate_verdict.score:.3f}" if gate_verdict else "",
+                    )
+                if not defer_side_effects and not quarantined:
                     self._on_memory_stored(memory, glyph_analysis=glyph_analysis)
 
-                return {
-                    "status": "stored",
+                response: dict[str, Any] = {
+                    "status": "quarantined" if quarantined else "stored",
                     "memory_id": memory.id,
                     "tags": memory.tags,
                     "glyph_concepts": [
@@ -696,6 +795,12 @@ class Orchestrator:
                     "glyph_pairs": glyph_analysis["pairs"],
                     "salience": memory.salience_composite,
                 }
+                if gate_verdict is not None:
+                    response["gate"] = {
+                        "verdict": gate_verdict.verdict,
+                        "score": round(gate_verdict.score, 3),
+                    }
+                return response
         finally:
             self._foreground_waiting.clear()
 
@@ -727,6 +832,12 @@ class Orchestrator:
         import time as _time
         _t0 = _time.time()
 
+        # Reset the shared query-vector and penumbra slots so stale values
+        # from a previous call (or a background promotion pass) can never
+        # be paired with this query in the ledgers.
+        self._memory_store._last_query_vec = None
+        self._memory_store._last_penumbra = []
+
         if method == "semantic":
             results = self._memory_store.retrieve_semantic(query, top_k, tags)
         elif method == "tag" and tags:
@@ -734,6 +845,9 @@ class Orchestrator:
             results = [(m, 1.0) for m in tag_results[:top_k]]
         else:
             results = self._memory_store.retrieve_hybrid(query, tags, top_k)
+
+        query_vec_for_ledger = getattr(self._memory_store, "_last_query_vec", None)
+        penumbra_for_ledger = list(getattr(self._memory_store, "_last_penumbra", []))
 
         # Min-score gate: drop low-relevance results before they reach the LLM
         # or get reinforced by bookkeeping. Tag method always scores 1.0 so
@@ -765,7 +879,10 @@ class Orchestrator:
         _t_log = _time.time()
 
         # Side effects (background thread)
-        self._on_retrieval_completed(retrieval_id, results, query)
+        self._on_retrieval_completed(
+            retrieval_id, results, query, query_vec=query_vec_for_ledger,
+            penumbra=penumbra_for_ledger,
+        )
 
         _t_side = _time.time()
 
@@ -783,9 +900,13 @@ class Orchestrator:
                 "salience": mem.salience_composite,
                 "relevance_score": round(score, 3),
                 "created_at": mem.created_at.isoformat(),
+                "tier": mem.ingestion_tier,
+                "author": mem.author,
+                "custody": mem.custody_status,
             }
             self._annotate_glyph(entry, mem.content, glyph_meta_batch.get(mem.id))
             annotated.append(entry)
+        self._annotate_supersession(annotated)
 
         _t_annot = _time.time()
 
@@ -905,7 +1026,13 @@ class Orchestrator:
         all_retrieval_results: list[tuple[Memory, float]] = []
 
         # -- Level 0: Standard hybrid retrieval --
+        self._memory_store._last_query_vec = None
+        self._memory_store._last_penumbra = []
         level_0_results = self._memory_store.retrieve_hybrid(query, tags, level_k)
+        # Capture the ORIGINAL query's vector and penumbra now — expansion
+        # retrievals below overwrite the shared slots with their own.
+        query_vec_for_ledger = getattr(self._memory_store, "_last_query_vec", None)
+        penumbra_for_ledger = list(getattr(self._memory_store, "_last_penumbra", []))
 
         for mem, score in level_0_results:
             seen_ids.add(mem.id)
@@ -1020,8 +1147,13 @@ class Orchestrator:
                 results=combined_tuples,
                 model_version=self._config.llm_model,
             )
-            self._on_retrieval_completed(combined_id, all_retrieval_results, query)
+            self._on_retrieval_completed(
+                combined_id, all_retrieval_results, query,
+                query_vec=query_vec_for_ledger,
+                penumbra=penumbra_for_ledger,
+            )
 
+        self._annotate_supersession(all_results)
         return {
             "results": all_results,
             "count": len(all_results),
@@ -1042,6 +1174,9 @@ class Orchestrator:
             "salience": mem.salience_composite,
             "relevance_score": round(score, 3),
             "created_at": mem.created_at.isoformat(),
+            "tier": mem.ingestion_tier,
+            "author": mem.author,
+            "custody": mem.custody_status,
             "depth": depth,
         }
 
@@ -1088,6 +1223,988 @@ class Orchestrator:
             queries.append(expansion)
 
         return queries
+
+    # ── Librarian handlers ──────────────────────────────────────────
+
+    def handle_librarian_status(self) -> dict[str, Any]:
+        """Gate calibration stats, sweep progress, quarantine and subject counts."""
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                gate_rows = self._db.execute(
+                    """
+                    SELECT verdict, COUNT(*) AS n, AVG(score) AS avg_score,
+                           MIN(score) AS min_score
+                    FROM write_gate_log GROUP BY verdict
+                    """
+                ).fetchall()
+                quarantine_row = self._db.execute(
+                    "SELECT COUNT(*) AS n FROM memories "
+                    "WHERE ingestion_tier = 'quarantine' AND is_archived = 0"
+                ).fetchone()
+                subject_rows = self._db.execute(
+                    "SELECT status, COUNT(*) AS n FROM subjects GROUP BY status"
+                ).fetchall()
+                custody_rows = self._db.execute(
+                    "SELECT custody_status, COUNT(*) AS n FROM memories "
+                    "WHERE is_archived = 0 GROUP BY custody_status"
+                ).fetchall()
+                faq_rows = self._db.execute(
+                    "SELECT status, COUNT(*) AS n FROM faq_entries GROUP BY status"
+                ).fetchall()
+                commission_rows = self._db.execute(
+                    "SELECT status, COUNT(*) AS n FROM commissions GROUP BY status"
+                ).fetchall()
+                demand_row = self._db.execute(
+                    "SELECT COUNT(*) AS total, "
+                    "SUM(CASE WHEN processed = 0 THEN 1 ELSE 0 END) AS pending "
+                    "FROM query_history"
+                ).fetchone()
+                cluster_row = self._db.execute(
+                    "SELECT COUNT(*) AS n FROM query_clusters"
+                ).fetchone()
+                return {
+                    "gate": {
+                        "enabled": self._config.librarian_gate_enabled,
+                        "enforce": self._config.librarian_gate_enforce,
+                        "threshold": self._config.librarian_gate_threshold,
+                        "verdicts": {
+                            r["verdict"]: {
+                                "count": r["n"],
+                                "avg_score": round(r["avg_score"], 3) if r["avg_score"] is not None else None,
+                                "min_score": round(r["min_score"], 3) if r["min_score"] is not None else None,
+                            }
+                            for r in gate_rows
+                        },
+                    },
+                    "sweep": self._linear_sweep.progress(),
+                    "custody": {r["custody_status"]: r["n"] for r in custody_rows},
+                    "quarantined_memories": quarantine_row["n"] if quarantine_row else 0,
+                    "subjects": {r["status"]: r["n"] for r in subject_rows},
+                    "faq": {r["status"]: r["n"] for r in faq_rows},
+                    "commissions": {r["status"]: r["n"] for r in commission_rows},
+                    "demand": {
+                        "queries_recorded": demand_row["total"] or 0,
+                        "queries_pending": demand_row["pending"] or 0,
+                        "clusters": cluster_row["n"] or 0,
+                    },
+                    "penumbra": self._penumbra_ledger.stats(),
+                    "ingress": self._ingress.stats(),
+                }
+        finally:
+            self._foreground_waiting.clear()
+
+    def handle_librarian_review(self, limit: int = 20) -> dict[str, Any]:
+        """Quarantined memories and open sweep findings awaiting judgment."""
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                q_rows = self._db.execute(
+                    """
+                    SELECT m.id, m.summary, m.content, m.author, m.origin, m.created_at,
+                           g.score AS gate_score, g.verdict AS gate_verdict
+                    FROM memories m
+                    LEFT JOIN write_gate_log g ON g.memory_id = m.id
+                    WHERE m.ingestion_tier = 'quarantine' AND m.is_archived = 0
+                    ORDER BY m.created_at DESC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                quarantined = []
+                tags_map = self._tag_manager.get_tags_for_memories(
+                    [r["id"] for r in q_rows]
+                )
+                for r in q_rows:
+                    quarantined.append({
+                        "memory_id": r["id"],
+                        "summary": r["summary"],
+                        "content_preview": (r["content"] or "")[:400],
+                        "tags": tags_map.get(r["id"], []),
+                        "author": r["author"],
+                        "origin": r["origin"],
+                        "created_at": r["created_at"],
+                        "gate_score": r["gate_score"],
+                        "gate_verdict": r["gate_verdict"],
+                    })
+
+                f_rows = self._db.execute(
+                    """
+                    SELECT id, memory_id, finding_type, detail, created_at
+                    FROM sweep_findings WHERE resolved = 0
+                    ORDER BY created_at ASC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                findings = [dict(r) for r in f_rows]
+                return {
+                    "quarantined": quarantined,
+                    "open_findings": findings,
+                    "faq_candidates": self._faq_desk.candidates(limit),
+                    "open_commissions": self._commission_desk.list("open", limit),
+                }
+        finally:
+            self._foreground_waiting.clear()
+
+    def handle_librarian_resolve(
+        self,
+        memory_id: str | None = None,
+        action: str | None = None,
+        finding_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Apply a judgment: release/archive a quarantined memory, or
+        mark a sweep finding resolved.
+
+        Releasing to 'critical' runs the deferred store side effects so the
+        memory finally joins the network it was held out of.
+        """
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if finding_id is not None:
+                    frow = self._db.execute(
+                        "SELECT memory_id FROM sweep_findings WHERE id = ?",
+                        (finding_id,),
+                    ).fetchone()
+                    if frow is None:
+                        return {"error": f"Finding {finding_id} not found"}
+                    self._db.execute(
+                        "UPDATE sweep_findings SET resolved = 1 WHERE id = ?",
+                        (finding_id,),
+                    )
+                    # No open findings left on a flagged memory -> clean
+                    remaining = self._db.execute(
+                        "SELECT COUNT(*) AS n FROM sweep_findings "
+                        "WHERE memory_id = ? AND resolved = 0 "
+                        "AND finding_type != 'buried'",
+                        (frow["memory_id"],),
+                    ).fetchone()
+                    if (remaining["n"] or 0) == 0:
+                        srow = self._db.execute(
+                            "SELECT custody_status FROM memories WHERE id = ?",
+                            (frow["memory_id"],),
+                        ).fetchone()
+                        if srow and srow["custody_status"] == "flagged":
+                            record_custody_transition(
+                                self._db, frow["memory_id"], "clean",
+                                actor="judge",
+                                reason=f"finding {finding_id} resolved",
+                            )
+                    return {"status": "finding_resolved", "finding_id": finding_id}
+
+                if not memory_id or action not in (
+                    "release_critical", "release_reference", "archive",
+                ):
+                    return {
+                        "error": "Provide finding_id, or memory_id with action "
+                                 "in {release_critical, release_reference, archive}"
+                    }
+
+                row = self._db.execute(
+                    "SELECT ingestion_tier FROM memories WHERE id = ?",
+                    (memory_id,),
+                ).fetchone()
+                if not row:
+                    return {"error": f"Memory {memory_id} not found"}
+                if row["ingestion_tier"] != "quarantine":
+                    return {"error": f"Memory {memory_id} is not quarantined"}
+
+                if action == "archive":
+                    self._db.execute(
+                        "UPDATE memories SET is_archived = 1 WHERE id = ?",
+                        (memory_id,),
+                    )
+                    # Archiving settles the memory's open findings — the
+                    # sweep never revisits archived memories, so leaving
+                    # them open would orphan them in the review queue.
+                    self._db.execute(
+                        "UPDATE sweep_findings SET resolved = 1 "
+                        "WHERE memory_id = ? AND resolved = 0",
+                        (memory_id,),
+                    )
+                    self._embedding_engine._clear_memory_cache()
+                    return {"status": "archived", "memory_id": memory_id}
+
+                tier = "critical" if action == "release_critical" else "reference"
+                self._db.execute(
+                    "UPDATE memories SET ingestion_tier = ? WHERE id = ?",
+                    (tier, memory_id),
+                )
+                # Rebuild retrieval caches so the released memory enters FAISS
+                self._embedding_engine._clear_memory_cache()
+                if tier == "critical":
+                    memory = self._memory_store.get_by_id(memory_id)
+                    # Replay side effects with the llm-assigned word tags only —
+                    # get_by_id returns ALL tags (temporal, letter, split), and
+                    # _on_memory_stored would mint centroids/lattice positions
+                    # for bookkeeping tags it never sees on the normal path.
+                    word_rows = self._db.execute(
+                        "SELECT t.name FROM memory_tags mt "
+                        "JOIN tags t ON t.id = mt.tag_id "
+                        "WHERE mt.memory_id = ? AND mt.assigned_by = 'llm'",
+                        (memory_id,),
+                    ).fetchall()
+                    memory = memory.model_copy(
+                        update={"tags": [r["name"] for r in word_rows]},
+                    )
+                    self._on_memory_stored(memory)
+                record_custody_transition(
+                    self._db, memory_id, "certified",
+                    actor="judge", reason=action,
+                )
+                return {"status": "released", "memory_id": memory_id, "tier": tier}
+        finally:
+            self._foreground_waiting.clear()
+
+    def handle_librarian_maintain(self) -> dict[str, Any]:
+        """Manual maintenance: sweep a batch, rebuild subjects, process demand."""
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                sweep_stats = self._linear_sweep.run_batch()
+                roster_stats = self._subject_roster.rebuild()
+                # Same guard as the background phase: FAQ promotion does a
+                # live retrieval, and a FAISS rebuild must never happen
+                # while holding the foreground lock.
+                demand_stats = self._demand_ledger.process_batch(
+                    allow_retrieval=self._index_is_built(),
+                )
+                return {
+                    "sweep": sweep_stats,
+                    "subjects": roster_stats,
+                    "demand": demand_stats,
+                    "roster": self._subject_roster.list_subjects(limit=20),
+                }
+        finally:
+            self._foreground_waiting.clear()
+
+    def _index_is_built(self) -> bool:
+        vi = getattr(self._embedding_engine, "_vector_index", None)
+        return vi is not None and getattr(vi, "is_built", False)
+
+    def handle_librarian_consult(
+        self, query: str, top_k: int = 5,
+    ) -> dict[str, Any]:
+        """The front desk: FAQ fast path, then subject dispatch, then the
+        general shelf — with open research tickets surfaced alongside.
+
+        Response structure: faq (a served card or null), subjects (each
+        consulted shelf with its own results), general (whole-library
+        hybrid results), research_pending (open commissions near the query).
+        """
+        # Embed outside the lock (model forward pass is CPU-bound)
+        query_vec = self._embedding_engine.embed(query)
+
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                response: dict[str, Any] = {
+                    "faq": None,
+                    "subjects": [],
+                    "general": [],
+                    "research_pending": self._commission_desk.match_open(query_vec),
+                }
+
+                faq_hit = self._faq_desk.serve(query_vec)
+                if faq_hit is not None:
+                    # A cached answer built on a refuted memory must not be
+                    # served as canonical — and the fast path returns before
+                    # every other channel, so this is the one place to catch
+                    # it.  Stale the card and fall through to the shelves.
+                    refuted = self._closure.superseded_among(
+                        faq_hit.get("supporting_memory_ids", [])
+                    )
+                    if refuted:
+                        self._faq_desk.retire_to_stale(faq_hit["faq_id"])
+                        response["faq_withdrawn"] = {
+                            "faq_id": faq_hit["faq_id"],
+                            "reason": "rests on superseded memories",
+                            "superseded": sorted(refuted),
+                        }
+                        faq_hit = None
+                if faq_hit is not None:
+                    response["faq"] = faq_hit
+                    # A cached answer must not starve the supporting
+                    # memories of retrieval signal — run the normal
+                    # bookkeeping (salience, trends, reinforcement, demand)
+                    # over them, or FAQ-served shelves decay into burial
+                    # while being read daily.
+                    supporting = faq_hit["supporting_memory_ids"]
+                    hydrated = self._memory_store._get_by_ids(supporting)
+                    faq_results = [
+                        (hydrated[mid], faq_hit["match_score"])
+                        for mid in supporting if mid in hydrated
+                    ]
+                    if faq_results:
+                        retrieval_id = self._retrieval_tracker.log_retrieval(
+                            query_text=query,
+                            method="faq",
+                            results=[
+                                (mem.id, rank + 1, score)
+                                for rank, (mem, score) in enumerate(faq_results)
+                            ],
+                            model_version=self._config.llm_model,
+                        )
+                        self._on_retrieval_completed(
+                            retrieval_id, faq_results, query, query_vec=query_vec,
+                        )
+                    return response
+
+                # Subject dispatch: consult matching shelves individually
+                matches = self._subject_roster.match(
+                    query_vec,
+                    self._config.consult_subject_threshold,
+                    self._config.consult_max_subjects,
+                    max_depth=self._subject_roster.route_depth(),
+                )
+                for subject, sim in matches:
+                    # Cap member tags per shelf: a giant cluster would
+                    # otherwise build an unbounded SQL IN clause under
+                    # the foreground lock.
+                    tag_names = list(
+                        self._tag_manager.get_names_by_ids(
+                            subject["member_tag_ids"][:200]
+                        ).values()
+                    )
+                    if not tag_names:
+                        continue
+                    shelf = self._memory_store.retrieve_semantic(
+                        query, top_k, tag_filter=tag_names, query_vec=query_vec,
+                    )
+                    # Shelf-served memories earn 'retrieved' credit in the
+                    # penumbra ledger — otherwise routing's win case (served
+                    # on the shelf, runner-up globally) manufactures false
+                    # 'buried' findings.
+                    if shelf and self._config.penumbra_enabled:
+                        try:
+                            self._penumbra_ledger.record(
+                                [], [m.id for m, _ in shelf],
+                            )
+                        except Exception:
+                            logging.getLogger(__name__).exception(
+                                "Penumbra shelf credit failed"
+                            )
+                    shelf_entries = [
+                        {
+                            "memory_id": mem.id,
+                            "summary": mem.summary,
+                            "content_preview": mem.content[:300],
+                            "tags": mem.tags,
+                            "relevance_score": round(score, 3),
+                            "tier": mem.ingestion_tier,
+                            "author": mem.author,
+                            "custody": mem.custody_status,
+                        }
+                        for mem, score in shelf
+                    ]
+                    self._annotate_supersession(shelf_entries)
+                    response["subjects"].append({
+                        "name": subject["name"],
+                        "label": subject.get("label", subject["name"]),
+                        "description": subject["description"],
+                        "match_score": round(sim, 3),
+                        "results": shelf_entries,
+                    })
+
+                # General channel: full hybrid retrieval with the normal
+                # bookkeeping/side effects (this also records demand).
+                general = self._handle_retrieve_memories_locked(
+                    query, None, "hybrid", top_k,
+                )
+                response["general"] = general.get("results", [])
+                return response
+        finally:
+            self._foreground_waiting.clear()
+
+    def handle_librarian_faq(
+        self,
+        action: str = "list",
+        faq_id: int | None = None,
+        answer: str | None = None,
+        author: str | None = None,
+        status: str = "candidate",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """FAQ desk management: list candidates/entries, approve, retire.
+
+        Approval is the judgment step — a candidate's mechanical draft
+        becomes servable, optionally rewritten, and gets a byline.
+        """
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action == "list":
+                    if status == "candidate":
+                        return {"candidates": self._faq_desk.candidates(limit)}
+                    rows = self._db.execute(
+                        "SELECT id, question_text, answer, status, hit_count, "
+                        "author, last_verified_at FROM faq_entries "
+                        "WHERE status = ? ORDER BY hit_count DESC LIMIT ?",
+                        (status, limit),
+                    ).fetchall()
+                    return {"entries": [dict(r) for r in rows]}
+                if action == "approve":
+                    if faq_id is None:
+                        return {"error": "approve requires faq_id"}
+                    ok = self._faq_desk.approve(faq_id, answer=answer, author=author)
+                    return (
+                        {"status": "approved", "faq_id": faq_id} if ok
+                        else {"error": f"FAQ {faq_id} not found or retired"}
+                    )
+                if action == "retire":
+                    if faq_id is None:
+                        return {"error": "retire requires faq_id"}
+                    ok = self._faq_desk.retire(faq_id)
+                    return (
+                        {"status": "retired", "faq_id": faq_id} if ok
+                        else {"error": f"FAQ {faq_id} not found"}
+                    )
+                return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
+    def handle_librarian_commissions(
+        self,
+        action: str = "list",
+        commission_id: int | None = None,
+        question: str | None = None,
+        report_memory_id: str | None = None,
+        status: str = "open",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Commission queue: list, file, claim, report, close.
+
+        Specialists store their report as a normal memory (with author and
+        origin set), then attach it via report before closing.
+        """
+        question_vec = None
+        if action == "file" and question:
+            question_vec = self._embedding_engine.embed(question)
+
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action == "list":
+                    return {"commissions": self._commission_desk.list(status, limit)}
+                if action == "file":
+                    if not question:
+                        return {"error": "file requires question"}
+                    subject_ids = [
+                        s["id"] for s, _ in self._subject_roster.match(
+                            question_vec,
+                            self._config.consult_subject_threshold,
+                            self._config.consult_max_subjects,
+                        )
+                    ] if question_vec is not None else []
+                    return self._commission_desk.file(
+                        question, question_vec,
+                        source="manual", subject_ids=subject_ids,
+                    )
+                if action in ("claim", "report", "close"):
+                    if commission_id is None:
+                        return {"error": f"{action} requires commission_id"}
+                    target = {
+                        "claim": "claimed", "report": "reported", "close": "closed",
+                    }[action]
+                    if action == "report":
+                        if not report_memory_id:
+                            return {"error": "report requires report_memory_id"}
+                        # A report must be a real, live, unquarantined memory
+                        rrow = self._db.execute(
+                            "SELECT is_archived, ingestion_tier FROM memories "
+                            "WHERE id = ?",
+                            (report_memory_id,),
+                        ).fetchone()
+                        if rrow is None:
+                            return {"error": f"Report memory {report_memory_id} not found"}
+                        if rrow["is_archived"] or rrow["ingestion_tier"] == "quarantine":
+                            return {
+                                "error": "Report memory is archived or quarantined. "
+                                         "A patron must review and release it before "
+                                         "it can be attached; leave the ticket "
+                                         "claimed and note it for review."
+                            }
+                    ok = self._commission_desk.set_status(
+                        commission_id, target, report_memory_id,
+                    )
+                    return (
+                        {"status": target, "commission_id": commission_id} if ok
+                        else {"error": f"Commission {commission_id} not found"}
+                    )
+                return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
+    def handle_librarian_desk(
+        self, action: str = "report", limit: int = 5,
+    ) -> dict[str, Any]:
+        """The standing desk report: what changed, what needs you, what
+        was learned, and the state of the building.
+
+        Reading does NOT acknowledge — call action='ack' when you have
+        actually dealt with what the report showed, and the next report's
+        "since" window starts from there.
+        """
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action == "report":
+                    return self._desk.report(limit)
+                if action == "ack":
+                    return self._desk.acknowledge()
+                return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
+    def handle_librarian_subjects(
+        self,
+        action: str = "tree",
+        path: str | None = None,
+        name: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Address the subject hierarchy.
+
+        tree  — the whole active roster as an outline (path, depth, size).
+        show  — one node, addressed loosely: an exact path, a bare name, a
+                given name, or just a topic ("gnosticism") resolves to the
+                most specific shelf holding it.  Ambiguity comes back as
+                candidates rather than an error.
+        children — the direct children of a node.
+        rename — give a shelf a human name (authored; survives rebuilds).
+
+        Routing (librarian_consult) deliberately stays at the coarse
+        depth; teaching addresses deeper nodes by path.
+        """
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action == "tree":
+                    nodes = self._subject_roster.tree(limit)
+                    return {
+                        "route_depth": self._subject_roster.route_depth(),
+                        "max_depth": self._config.subject_max_depth,
+                        "nodes": [
+                            {
+                                "path": n["path"],
+                                "depth": n["depth"],
+                                "label": n["label"],
+                                "name": n["name"],
+                                "named": n["display_name"] is not None,
+                                "memory_count": n["memory_count"],
+                                "tags": len(n["member_tag_ids"]),
+                            }
+                            for n in nodes
+                        ],
+                    }
+
+                if action == "rename":
+                    if not path:
+                        return {"error": "rename requires path"}
+                    node = self._subject_roster.rename(path, name)
+                    if node is None:
+                        return self._subject_miss(path)
+                    return {
+                        "status": "renamed",
+                        "path": node["path"],
+                        "label": node["label"],
+                        "derived_name": node["name"],
+                    }
+
+                if action in ("show", "children"):
+                    if not path:
+                        return {"error": f"{action} requires path"}
+                    resolution = self._subject_roster.resolve(path)
+                    node = resolution.get("match")
+                    if node is None:
+                        return self._subject_miss(path, resolution)
+                    children = self._subject_roster.children_of(node["path"])
+                    if action == "children":
+                        return {
+                            "path": node["path"],
+                            "label": node["label"],
+                            "children": [
+                                {"path": c["path"], "label": c["label"],
+                                 "depth": c["depth"],
+                                 "memory_count": c["memory_count"]}
+                                for c in children
+                            ],
+                        }
+                    tag_names = list(
+                        self._tag_manager.get_names_by_ids(
+                            node["member_tag_ids"][:300]
+                        ).values()
+                    )
+                    return {
+                        "path": node["path"],
+                        "label": node["label"],
+                        "name": node["name"],
+                        "named": node["display_name"] is not None,
+                        "resolved_by": resolution.get("how", "exact"),
+                        "depth": node["depth"],
+                        "description": node["description"],
+                        "memory_count": node["memory_count"],
+                        "tags": tag_names,
+                        "children": [
+                            {"path": c["path"], "label": c["label"],
+                             "memory_count": c["memory_count"]}
+                            for c in children
+                        ],
+                    }
+
+                return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
+    def _annotate_supersession(self, entries: list[dict[str, Any]]) -> None:
+        """Mark any result whose claims have since been overturned.
+
+        A refuted memory keeps its byline and its place; it must simply
+        never arrive looking as authoritative as the thing that corrected
+        it.  Silent equality is how a library serves its own mistakes.
+        """
+        if not entries:
+            return
+        try:
+            marks = self._closure.for_memories(
+                [e["memory_id"] for e in entries]
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("Supersession lookup failed")
+            return
+        for entry in entries:
+            found = marks.get(entry["memory_id"])
+            if found:
+                entry["superseded_by"] = found
+
+    def handle_librarian_closure(
+        self,
+        action: str = "list",
+        memory_id: str | None = None,
+        superseding_id: str | None = None,
+        report_memory_id: str | None = None,
+        commission_id: int | None = None,
+        claim: str | None = None,
+        reason: str | None = None,
+        scope: str = "claim",
+        actor: str | None = None,
+        supersedes: list[dict] | None = None,
+        resolve_findings: list[int] | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Specialist closure — settle what a piece of work overturned.
+
+        supersede — record that one memory overturns a claim in another.
+                    Nothing is deleted; the older memory keeps its byline
+                    and afterwards arrives marked.
+        close     — the full reverse-order unwind for a finished report:
+                    supersede what it refuted, stale dependent FAQ answers,
+                    resolve findings it explains, close the ticket.
+        list      — recent supersessions.
+        retract   — withdraw one (the correction was itself wrong).
+        """
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                who = actor or "librarian"
+                if action == "supersede":
+                    if not (memory_id and superseding_id):
+                        return {"error": "supersede requires memory_id and "
+                                         "superseding_id"}
+                    return self._closure.supersede(
+                        superseded_id=memory_id, superseding_id=superseding_id,
+                        actor=who, claim=claim, reason=reason, scope=scope,
+                    )
+                if action == "close":
+                    if not report_memory_id:
+                        return {"error": "close requires report_memory_id"}
+                    return self._closure.close_chain(
+                        report_memory_id=report_memory_id, actor=who,
+                        commission_id=commission_id, supersedes=supersedes,
+                        resolve_findings=resolve_findings,
+                    )
+                if action == "retract":
+                    if not (memory_id and superseding_id):
+                        return {"error": "retract requires memory_id and "
+                                         "superseding_id"}
+                    ok = self._closure.retract(memory_id, superseding_id)
+                    return ({"status": "retracted"} if ok
+                            else {"error": "no such standing supersession"})
+                if action == "list":
+                    return {"supersessions": self._closure.recent(limit=limit)}
+                return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
+    def _subject_miss(self, query: str, resolution: dict | None = None) -> dict:
+        """Turn a failed lookup into a useful answer, not a dead end."""
+        res = resolution if resolution is not None else self._subject_roster.resolve(query)
+        if res.get("ambiguous"):
+            return {
+                "error": f"'{query}' matches several shelves — name one",
+                "matched_by": res.get("how"),
+                "candidates": [
+                    {"path": n["path"], "label": n["label"],
+                     "memory_count": n["memory_count"]}
+                    for n in res["ambiguous"]
+                ],
+            }
+        return {
+            "error": f"No shelf matches '{query}'",
+            "did_you_mean": [
+                {"path": n["path"], "label": n["label"],
+                 "memory_count": n["memory_count"]}
+                for n in res.get("suggestions", [])
+            ],
+        }
+
+    def handle_librarian_ingress(
+        self,
+        action: str = "review",
+        content: str | None = None,
+        receipt: str | None = None,
+        source: str = "user",
+        origin: str | None = None,
+        author: str | None = None,
+        tags: list[str] | None = None,
+        importance: float | None = None,
+        summary: str | None = None,
+        status: str = "held",
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        """Receipted ingress dwell: hold, examine, settle, commit.
+
+        hold    — take content into custody, issue a receipt, and examine
+                  the whole window (so this arrival is compared against
+                  everything still dwelling).  Commits nothing.
+        examine — re-run detection over held content (all, or one receipt).
+        review  — list receipts by status with their findings.
+        settle  — close one dwell (or every elapsed dwell) with a verdict.
+        commit  — promote a settled receipt into a memory (needs tags).
+        discard — settle without shelving; the receipt and findings remain.
+        stats   — buffer counts by status and finding type.
+        """
+        if not self._config.ingress_enabled and action in ("hold", "examine"):
+            return {"error": "Ingress dwell is disabled (ingress_enabled=False)"}
+
+        # Embed outside the lock — CPU-bound model forward pass
+        embedding = None
+        if action == "hold" and content:
+            try:
+                embedding = self._embedding_engine.embed(content)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Ingress embedding failed; holding without a vector "
+                    "(cross-message comparison degrades to lexical only)"
+                )
+
+        commit_payload = None
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action == "hold":
+                    if not content:
+                        return {"error": "hold requires content"}
+                    record = self._ingress.hold(
+                        content, embedding=embedding, source=source,
+                        origin=origin, author=author,
+                    )
+                    # Examine the whole window: the new arrival and every
+                    # message still dwelling are compared against each other.
+                    findings = self._ingress.examine()
+                    record["findings"] = [
+                        f for f in findings
+                        if record["receipt"] in (f["receipt"], f.get("peer_receipt"))
+                    ]
+                    record["window_findings"] = len(findings)
+                    return record
+
+                if action == "examine":
+                    return {"findings": self._ingress.examine(receipt)}
+
+                if action == "review":
+                    return {
+                        "status": status,
+                        "receipts": self._ingress.list_receipts(status, limit),
+                    }
+
+                if action == "settle":
+                    if receipt:
+                        return self._ingress.settle(receipt)
+                    return self._ingress.settle_due()
+
+                if action == "discard":
+                    if not receipt:
+                        return {"error": "discard requires receipt"}
+                    ok = self._ingress.mark_discarded(receipt)
+                    return (
+                        {"status": "discarded", "receipt": receipt} if ok
+                        else {"error": f"Unknown receipt: {receipt}"}
+                    )
+
+                if action == "stats":
+                    return self._ingress.stats()
+
+                if action == "commit":
+                    if not receipt:
+                        return {"error": "commit requires receipt"}
+                    record = self._ingress.get(receipt)
+                    if record is None:
+                        return {"error": f"Unknown receipt: {receipt}"}
+                    if record["status"] == "held":
+                        return {
+                            "error": "Receipt is still dwelling — settle it "
+                                     "first so detection has run",
+                            "dwell_until": record["dwell_until"],
+                        }
+                    if record["status"] == "committed":
+                        return {
+                            "error": "Already committed",
+                            "memory_id": record["memory_id"],
+                        }
+                    if record["status"] == "discarded":
+                        return {
+                            "error": "Receipt was discarded — committing it "
+                                     "would silently reverse that decision",
+                        }
+                    if not tags:
+                        return {"error": "commit requires tags"}
+                    commit_payload = record
+                else:
+                    return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
+        # Store outside the lock block — handle_store_memory takes the lock
+        # itself (and runs the write gate on the content).
+        result = self.handle_store_memory(
+            content=commit_payload["content"],
+            tags=tags or [],
+            importance=importance,
+            summary=summary,
+            author=commit_payload.get("author"),
+            origin=commit_payload.get("origin") or f"ingress:{receipt}",
+        )
+        memory_id = result.get("memory_id")
+        if memory_id:
+            self._foreground_waiting.set()
+            try:
+                with self._foreground_db_lock:
+                    self._ingress.mark_committed(receipt, memory_id)
+            finally:
+                self._foreground_waiting.clear()
+        return {
+            "status": "committed",
+            "receipt": receipt,
+            "memory_id": memory_id,
+            "store_status": result.get("status"),
+            "gate": result.get("gate"),
+            "findings_at_commit": commit_payload["findings"],
+        }
+
+    def handle_librarian_recall(
+        self, query: str, top_k: int = 3,
+    ) -> dict[str, Any]:
+        """Analogic recall: cross-domain counterparts by structural role.
+
+        Resolves the query's home subject, computes its offset from the
+        home centroid, and searches other shelves at the transported
+        position (centroid_B + offset).  Results are CONJECTURES — the
+        same role in a different domain, not established associations —
+        and every entry says so.
+        """
+        query_vec = self._embedding_engine.embed(query)
+
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                home_matches = self._subject_roster.match(
+                    query_vec,
+                    self._config.consult_subject_threshold, 1,
+                    max_depth=self._subject_roster.route_depth(),
+                )
+                if not home_matches:
+                    return {
+                        "note": "No home subject matched this query — "
+                                "analogic recall needs a resolvable domain. "
+                                "Run librarian_maintain to rebuild the roster.",
+                        "counterparts": [],
+                    }
+                home, home_sim = home_matches[0]
+                subjects = self._subject_roster.active_with_centroids(
+                    max_depth=self._subject_roster.route_depth(),
+                )
+                home_centroid = next(
+                    s["centroid"] for s in subjects if s["id"] == home["id"]
+                )
+
+                counterparts = []
+                others = [s for s in subjects if s["id"] != home["id"]]
+                for other in others[: self._config.recall_max_subjects]:
+                    target = analogic_target(
+                        home_centroid, query_vec, other["centroid"],
+                    )
+                    tag_names = list(
+                        self._tag_manager.get_names_by_ids(
+                            other["member_tag_ids"][:200]
+                        ).values()
+                    )
+                    if not tag_names:
+                        continue
+                    shelf = self._memory_store.retrieve_semantic(
+                        query, top_k, tag_filter=tag_names, query_vec=target,
+                    )
+                    if not shelf:
+                        continue
+                    mem_ids = [m.id for m, _ in shelf]
+                    ph = ",".join("?" * len(mem_ids))
+                    emb_rows = self._db.execute(
+                        f"SELECT memory_id, embedding FROM embeddings "
+                        f"WHERE memory_id IN ({ph}) AND chunk_index = 0",
+                        tuple(mem_ids),
+                    ).fetchall()
+                    emb_map = {
+                        r["memory_id"]: np.frombuffer(
+                            r["embedding"], dtype=np.float32
+                        ).copy()
+                        for r in emb_rows
+                    }
+                    results = []
+                    for mem, score in shelf:
+                        entry = {
+                            "memory_id": mem.id,
+                            "summary": mem.summary,
+                            "content_preview": mem.content[:300],
+                            "tags": mem.tags,
+                            "target_similarity": round(score, 3),
+                            "tier": mem.ingestion_tier,
+                            "author": mem.author,
+                            "custody": mem.custody_status,
+                            "register": "analogy",
+                        }
+                        if mem.id in emb_map:
+                            entry["parallelness"] = round(parallelness(
+                                emb_map[mem.id], other["centroid"],
+                                home_centroid, query_vec,
+                            ), 3)
+                        results.append(entry)
+                    self._annotate_supersession(results)
+                    counterparts.append({
+                        "subject": other["name"],
+                        "counterpart_of": home["name"],
+                        "results": results,
+                    })
+
+                return {
+                    "home_subject": home["name"],
+                    "home_match_score": round(home_sim, 3),
+                    "register": "analogy",
+                    "note": "Counterparts by structural role — conjectures, "
+                            "not established associations. Verify against "
+                            "the shelves before treating as evidence.",
+                    "counterparts": counterparts,
+                }
+        finally:
+            self._foreground_waiting.clear()
 
     def handle_get_trends(
         self, tag_names: list[str] | None = None
@@ -1996,6 +3113,7 @@ class Orchestrator:
                 self._centroid_cache = None
                 self._tag_space.invalidate_caches()
                 self._tensor_cache.invalidate()
+                self._write_gate.invalidate_cache()
 
         # Place word tags on the glyph Ramsey lattice
         word_tags = [t for t in memory.tags if t]
@@ -2035,6 +3153,8 @@ class Orchestrator:
         retrieval_id: int,
         results: list[tuple[Memory, float]],
         query: str = "",
+        query_vec=None,
+        penumbra: list | None = None,
     ) -> None:
         """Fire after a retrieval is completed.
 
@@ -2048,7 +3168,9 @@ class Orchestrator:
         import time as _time
         _bk_start = _time.perf_counter()
         try:
-            self._retrieval_bookkeeping(retrieval_id, results, query)
+            self._retrieval_bookkeeping(
+                retrieval_id, results, query, query_vec, penumbra,
+            )
         except Exception:
             logging.getLogger(__name__).exception(
                 "Error in retrieval bookkeeping"
@@ -2080,6 +3202,9 @@ class Orchestrator:
         phases = [
             ("deferred retrieval work", self._run_deferred_retrieval_work),
             ("sync detection", self._maybe_run_sync_detection),
+            ("linear sweep", self._maybe_run_linear_sweep),
+            ("demand processing", self._maybe_run_demand_processing),
+            ("ingress settle", self._maybe_settle_ingress),
         ]
         if self._signal_processor:
             phases.append(("commons auto-process", self._commons_auto_process))
@@ -2185,6 +3310,8 @@ class Orchestrator:
         retrieval_id: int,
         results: list[tuple[Memory, float]],
         query: str = "",
+        query_vec=None,
+        penumbra: list | None = None,
     ) -> None:
         """Phase 1: cheap per-retrieval bookkeeping (batch SQL writes).
 
@@ -2194,6 +3321,30 @@ class Orchestrator:
         """
         import time as _time
         _bt = {}
+
+        # Demand ledger: record the initiation BEFORE the empty-results
+        # bail — a query the store couldn't serve is the gap signal the
+        # ledger exists to accumulate.
+        if self._config.librarian_demand_enabled and query:
+            try:
+                self._demand_ledger.record(
+                    query_text=query,
+                    query_vec=query_vec,
+                    result_count=len(results),
+                    top_score=max((s for _, s in results), default=0.0),
+                )
+            except Exception:
+                logging.getLogger(__name__).exception("Demand ledger record failed")
+
+        # Penumbra ledger: near-misses recorded even for empty result sets
+        if self._config.penumbra_enabled and (penumbra or results):
+            try:
+                self._penumbra_ledger.record(
+                    penumbra or [], [mem.id for mem, _ in results],
+                )
+            except Exception:
+                logging.getLogger(__name__).exception("Penumbra record failed")
+
         if not results:
             return
 
@@ -2292,10 +3443,14 @@ class Orchestrator:
                 all_tag_ids_flat.extend(tids)
             all_unique = set(all_tag_ids_flat)
 
-            # Filter to query-relevant tags via centroid similarity
-            query_vec = getattr(self._memory_store, "_last_query_vec", None)
-            if query_vec is not None:
-                relevant = self._tag_space.centroid_match(query_vec)
+            # Filter to query-relevant tags via centroid similarity.
+            # Prefer the vector threaded in for THIS retrieval — the shared
+            # slot may hold another call's vector (consult FAQ path, recall).
+            qv = query_vec if query_vec is not None else getattr(
+                self._memory_store, "_last_query_vec", None,
+            )
+            if qv is not None:
+                relevant = self._tag_space.centroid_match(qv)
                 unique_tags = sorted(all_unique & relevant)
             else:
                 unique_tags = sorted(all_unique)
@@ -2437,6 +3592,85 @@ class Orchestrator:
 
         # Also maybe run meta-analysis
         self._maybe_run_meta_analysis()
+
+    def _maybe_run_linear_sweep(self) -> None:
+        """Advance the librarian's shelf-reading patrol if enough time has passed.
+
+        Each pass sweeps one batch of the least-recently-visited memories;
+        the cursor (memories.swept_at) is durable, so coverage survives
+        restarts.  Traffic-paced: only advances when retrievals arrive.
+        """
+        if not self._config.librarian_sweep_enabled:
+            return
+        now = datetime.utcnow()
+        interval = timedelta(minutes=self._config.librarian_sweep_interval_minutes)
+        if self._last_sweep_check and (now - self._last_sweep_check) < interval:
+            return
+        self._last_sweep_check = now
+
+        stats = self._linear_sweep.run_batch()
+        if stats.get("findings"):
+            logging.getLogger(__name__).info(
+                "Linear sweep: %d memories, findings %s",
+                stats["swept"], stats["findings"],
+            )
+
+    def _maybe_settle_ingress(self) -> None:
+        """Close dwells whose window has elapsed, and prune old receipts.
+
+        Runs every background pass (no rate limit beyond 30s) — a dwell
+        that has elapsed should settle promptly, since nothing downstream
+        can act on the content until it does.
+        """
+        if not self._config.ingress_enabled:
+            return
+        now = datetime.utcnow()
+        if self._last_ingress_check and (now - self._last_ingress_check).total_seconds() < 30:
+            return
+        self._last_ingress_check = now
+
+        stats = self._ingress.settle_due(
+            limit=self._config.ingress_settle_batch,
+        )
+        if stats.get("flagged") or stats.get("remaining"):
+            logging.getLogger(__name__).info(
+                "Ingress settle: %s", stats,
+            )
+
+        # Retention is a slow janitorial pass — running it every 30s would
+        # full-scan the buffer under the foreground lock to delete nothing.
+        prune_interval = timedelta(
+            minutes=self._config.ingress_prune_interval_minutes
+        )
+        if (
+            self._last_ingress_prune is None
+            or (now - self._last_ingress_prune) >= prune_interval
+        ):
+            self._last_ingress_prune = now
+            self._ingress.prune()
+
+    def _maybe_run_demand_processing(self) -> None:
+        """Cluster the demand ledger and promote FAQs / file commissions.
+
+        FAQ promotion runs a live retrieval to gather supporting memories,
+        so it's gated on an already-built vector index — never rebuild
+        FAISS while holding the foreground lock.
+        """
+        if not self._config.librarian_demand_enabled:
+            return
+        now = datetime.utcnow()
+        interval = timedelta(minutes=self._config.librarian_demand_interval_minutes)
+        if self._last_demand_check and (now - self._last_demand_check) < interval:
+            return
+        self._last_demand_check = now
+
+        stats = self._demand_ledger.process_batch(
+            allow_retrieval=self._index_is_built(),
+        )
+        if stats.get("faq_candidates") or stats.get("commissions_filed"):
+            logging.getLogger(__name__).info(
+                "Demand processing: %s", stats,
+            )
 
     def _maybe_run_meta_analysis(self) -> None:
         """Run meta-pattern analysis if enough time has passed."""
