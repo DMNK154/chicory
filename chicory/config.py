@@ -267,10 +267,12 @@ class ChicoryConfig(BaseModel):
     # Set False to disable without a code change; the cache is derived from
     # db_path so separate databases never share one.
     faiss_index_cache_enabled: bool = Field(default=True)
-    # How long a query waits for a concurrent index build before answering
-    # from the resident matrix instead. Unbounded waiting is how a 40s
-    # background build became a 57.4s tool call.
-    faiss_index_wait_seconds: float = Field(default=2.0)
+    # How long a query with NO index waits for one to be built. A query
+    # that already holds a usable index never waits at all — it serves from
+    # what it has and lets the rebuild happen. This bound only covers the
+    # genuinely cold case, where returning early would mean reporting "no
+    # matches" for a library that simply is not loaded yet.
+    faiss_index_wait_seconds: float = Field(default=120.0)
 
     # Ingestion — two-tier criticality classification
     ingestion_criticality_threshold: float = Field(default=0.3)

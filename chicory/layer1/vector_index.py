@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -167,61 +169,154 @@ class VectorIndex:
     # staleness; this class stores it verbatim and does not interpret it.
 
     def save(self, path: Path, meta: dict) -> None:
-        """Write the index, its id map, and caller metadata beside `path`."""
+        """Atomically publish the index, its id map, and caller metadata.
+
+        The set is written into a directory named for a fresh nonce, and
+        only then is a small pointer file swapped to name it. That pointer
+        rename is the single commit point.
+
+        Three independent renames cannot be made safe by cross-checking
+        them. The dangerous interleaving is a NEW index beside an OLD id
+        map and an OLD meta: those two agree with each other, so any
+        nonce shared between them still validates, and every query returns
+        real vectors under the wrong memory ids -- confident, plausible,
+        wrong. Only one commit point removes that state.
+        """
         if self._index is None:
             return
         faiss = _import_faiss()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        nonce = uuid.uuid4().hex
+        set_dir = path.parent / f"{path.name}.{nonce}"
 
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        faiss.write_index(self._index, str(tmp))
-        tmp.replace(path)
+        try:
+            set_dir.mkdir(parents=True, exist_ok=False)
+            faiss.write_index(self._index, str(set_dir / "index.faiss"))
 
-        # Store the id map compactly: 351k x 36-char ids are 50MB raw but
-        # ~19MB as unique-plus-inverse, and the ids repeat per chunk.
-        arr = np.asarray(self._id_to_memory)
-        uniq, inv = np.unique(arr, return_inverse=True)
-        ids_tmp = path.with_suffix(path.suffix + ".ids.npz.tmp")
-        # Hand savez an open handle: given a *path* it appends ".npz" to
-        # anything not already ending in it, silently writing a different
-        # file than the one about to be renamed.
-        with open(ids_tmp, "wb") as fh:
-            np.savez(fh, uniq=uniq, inv=inv.astype(np.int32))
-        ids_tmp.replace(path.with_suffix(path.suffix + ".ids.npz"))
+            # Store the id map compactly: 351k x 36-char ids are 50MB raw
+            # but ~19MB as unique-plus-inverse, and ids repeat per chunk.
+            uniq, inv = np.unique(
+                np.asarray(self._id_to_memory), return_inverse=True,
+            )
+            # Hand savez an open handle: given a *path* it appends ".npz"
+            # to anything not already ending in it, writing a different
+            # file than the one you named.
+            with open(set_dir / "ids.npz", "wb") as fh:
+                np.savez(fh, uniq=uniq, inv=inv.astype(np.int32))
 
-        payload = dict(meta)
-        payload.update({
-            "dimension": self._dimension,
-            "is_ivf": self._is_ivf,
-            "ntotal": int(self._index.ntotal),
-            "id_map_len": len(self._id_to_memory),
-        })
-        meta_tmp = path.with_suffix(path.suffix + ".meta.json.tmp")
-        meta_tmp.write_text(json.dumps(payload), encoding="utf-8")
-        meta_tmp.replace(path.with_suffix(path.suffix + ".meta.json"))
+            payload = dict(meta)
+            payload.update({
+                "dimension": self._dimension,
+                "is_ivf": self._is_ivf,
+                "ntotal": int(self._index.ntotal),
+                "id_map_len": len(self._id_to_memory),
+                "nonce": nonce,
+            })
+            (set_dir / "meta.json").write_text(
+                json.dumps(payload), encoding="utf-8",
+            )
+
+            # Commit. Everything above is invisible until this line lands,
+            # and a crash before it leaves the previous set intact.
+            ptr_tmp = path.parent / f"{path.name}.current.tmp"
+            ptr_tmp.write_text(nonce, encoding="utf-8")
+            ptr_tmp.replace(self._pointer_path(path))
+        except Exception:
+            _log.exception("Index cache save failed; discarding partial set")
+            shutil.rmtree(set_dir, ignore_errors=True)
+            raise
+
+        self._prune_old_sets(path, keep=nonce)
+
+    @staticmethod
+    def _pointer_path(path: Path) -> Path:
+        return path.parent / f"{path.name}.current"
+
+    @staticmethod
+    def _prune_old_sets(path: Path, keep: str | None = None) -> None:
+        """Remove superseded set directories and any legacy flat sidecars."""
+        prefix = f"{path.name}."
+        try:
+            entries = list(path.parent.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            name = entry.name
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if entry.is_dir():
+                if keep is None or suffix != keep:
+                    shutil.rmtree(entry, ignore_errors=True)
+            elif suffix in ("ids.npz", "meta.json", "tmp",
+                            "ids.npz.tmp", "meta.json.tmp"):
+                # Sidecars from the pre-pointer layout.
+                try:
+                    entry.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if keep is None:
+            for p in (VectorIndex._pointer_path(path), path):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def discard_cache(self, path: Path) -> None:
+        """Remove the pointer and every set, leaving nothing loadable."""
+        path = Path(path)
+        try:
+            VectorIndex._pointer_path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._prune_old_sets(path, keep=None)
 
     def load(self, path: Path) -> Optional[dict]:
-        """Load a saved index. Returns its metadata, or None if unusable.
+        """Load the committed set. Returns its metadata, or None if unusable.
 
-        Any inconsistency returns None so the caller rebuilds — the worst
-        case is exactly today's behaviour.
+        Any inconsistency returns None so the caller rebuilds -- the worst
+        case is exactly the behaviour that existed before this cache.
         """
         path = Path(path)
-        ids_path = path.with_suffix(path.suffix + ".ids.npz")
-        meta_path = path.with_suffix(path.suffix + ".meta.json")
-        if not (path.exists() and ids_path.exists() and meta_path.exists()):
+        ptr = self._pointer_path(path)
+        if not ptr.exists():
             return None
 
         try:
+            nonce = ptr.read_text(encoding="utf-8").strip()
+            set_dir = path.parent / f"{path.name}.{nonce}"
+            index_path = set_dir / "index.faiss"
+            ids_path = set_dir / "ids.npz"
+            meta_path = set_dir / "meta.json"
+            if not (index_path.exists() and ids_path.exists()
+                    and meta_path.exists()):
+                _log.info("Cached index rejected: set %s incomplete", nonce)
+                return None
+
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("nonce") != nonce:
+                _log.warning("Cached index rejected: pointer/meta nonce differ")
+                return None
             if int(meta.get("dimension", -1)) != self._dimension:
                 _log.info("Cached index rejected: dimension mismatch")
                 return None
 
-            faiss = _import_faiss()
-            index = faiss.read_index(str(path))
+            # The caller's own row count must equal the vectors actually in
+            # the index. A build that snapshots the corpus at T0 and stamps
+            # a watermark read at T1 yields count=N+1 beside ntotal=N, and
+            # that cache claims to cover a memory it never indexed.
+            m_count, m_ntotal = meta.get("count"), meta.get("ntotal")
+            if (m_count is not None and m_ntotal is not None
+                    and m_count != m_ntotal):
+                _log.warning(
+                    "Cached index rejected: meta count %s != ntotal %s "
+                    "(corpus changed mid-build)", m_count, m_ntotal,
+                )
+                return None
 
+            faiss = _import_faiss()
+            index = faiss.read_index(str(index_path))
             with np.load(ids_path, allow_pickle=False) as z:
                 id_map = z["uniq"][z["inv"]].tolist()
 
