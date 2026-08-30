@@ -2,31 +2,55 @@
 
 from __future__ import annotations
 
-import json
 import logging
+import os
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
-from mcp.server.fastmcp import Context, FastMCP
+# Wall clock at process start, before any heavy import.
+#
+# The client's connect deadline starts at SPAWN, but the first log statement
+# used to come after `Orchestrator(config)` returned — so everything before
+# it was dark, and "28.2s with 1s of margin" was really "28.2s plus an
+# unmeasured amount, which is why it timed out".  Anchor every startup
+# timing to this instead.
+_T_BOOT = time.time()
 
-from chicory.config import load_config
-from chicory.orchestrator.orchestrator import Orchestrator
-from chicory.orchestrator.tool_handlers import dispatch_tool_call
-
-# File-based diagnostic log so we can debug MCP hangs
+# File-based diagnostic log so we can debug MCP hangs.  The pid is in the
+# FORMAT rather than the filename: two servers appending to one file made
+# "which process was slow" unanswerable, but a file per pid would pile up
+# forever.  This keeps one file and still attributes every line.
 _log_path = Path.home() / ".chicory" / "mcp_debug.log"
 _log_path.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     filename=str(_log_path),
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [pid %(process)d] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+logger.info("=== process start ===")
+
+import json  # noqa: E402
+from collections.abc import AsyncIterator  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from typing import Optional  # noqa: E402
+
+_t_imp = time.time()
+from mcp.server.fastmcp import Context, FastMCP  # noqa: E402
+
+logger.info("mcp sdk imported in %.1fs", time.time() - _t_imp)
+
+_t_imp = time.time()
+from chicory.config import load_config  # noqa: E402
+from chicory.orchestrator.orchestrator import Orchestrator  # noqa: E402
+from chicory.orchestrator.tool_handlers import dispatch_tool_call  # noqa: E402
+
+logger.info(
+    "chicory imported in %.1fs (%.1fs since process start)",
+    time.time() - _t_imp, time.time() - _T_BOOT,
+)
 
 
 # ── Lifespan ────────────────────────────────────────────────────────
@@ -51,32 +75,88 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+    _t = time.time()
     config = load_config()
     orchestrator = Orchestrator(config)
-    logger.info("Chicory orchestrator initialized (db=%s)", config.db_path)
+    logger.info(
+        "Chicory orchestrator initialized in %.1fs (db=%s, %.1fs since "
+        "process start)",
+        time.time() - _t, config.db_path, time.time() - _T_BOOT,
+    )
 
-    # Eagerly load embedding model + FAISS index in the main thread.
-    # Loading lazily in FastMCP's thread pool deadlocks (torch/asyncio conflict).
+    # Load the embedding model HERE, before yielding, even though it costs
+    # a few seconds of connect time.
+    #
+    # It cannot go in the background thread with the rest.  The torch /
+    # sentence-transformers import does not interleave with FastMCP's
+    # request handling: put it on a side thread and it stalls holding
+    # _model_lock, while the first tool call that needs an embedding
+    # blocks on that lock for as long as the client is willing to wait
+    # (observed: "model loaded in 605.4s" for a load that takes ~6s alone,
+    # the figure tracking the client's timeout exactly).  Loading it up
+    # front is a few seconds; loading it beside a waiting request is
+    # unbounded.
+    t_model = time.time()
     try:
-        t0 = time.time()
-        embedding = orchestrator._memory_store._embedding
-        embedding._load_model()
-        logger.info("Embedding model loaded in %.1fs", time.time() - t0)
-
-        t1 = time.time()
-        embedding.search_similar(embedding.embed("warmup"), top_k=1)
-        logger.info("FAISS index built in %.1fs", time.time() - t1)
+        orchestrator._memory_store._embedding._load_model()
+        logger.info("Embedding model loaded in %.1fs", time.time() - t_model)
     except Exception:
-        logger.exception("Eager model/index load failed (will retry lazily)")
+        logger.exception("Eager model load failed (will retry lazily)")
 
-    # Eagerly load ByT5 glyph encoder (same reason: torch deadlocks in thread pool)
-    if orchestrator.glyph_encoder is not None:
+    # faiss is the same story as torch — a native extension whose import
+    # stalls for minutes if it happens on a side thread while a request is
+    # in flight (observed: "loaded faiss with AVX2 support" taking 9
+    # minutes).  Import it now; the module is normally pulled in lazily on
+    # the first search, which is exactly the wrong moment.
+    t_faiss = time.time()
+    try:
+        from chicory.layer1.vector_index import _import_faiss
+
+        _import_faiss()
+        logger.info("faiss imported in %.1fs", time.time() - t_faiss)
+    except Exception:
+        logger.exception("Eager faiss import failed (will import lazily)")
+
+    # What remains for the background thread is pure Python/numpy/SQL —
+    # building the index and warming the retrieval path — which does
+    # interleave with request handling, so it stays off the connect path.
+    def _background_warmup() -> None:
         try:
+            embedding = orchestrator._memory_store._embedding
+
+            t1 = time.time()
+            embedding.search_similar(embedding.embed("warmup"), top_k=1)
+            logger.info("FAISS index built in %.1fs", time.time() - t1)
+
+            # Warm the whole retrieval path, not just the model and index.
+            # The first hybrid retrieval also cold-loads the tag-space
+            # structures and lattice caches — on a six-figure library that
+            # is tens of seconds, and paying it here means the patron's
+            # first question doesn't. Everything after this is sub-second.
             t2 = time.time()
-            orchestrator.glyph_encoder._load_model()
-            logger.info("Glyph encoder loaded in %.1fs", time.time() - t2)
+            orchestrator._memory_store.retrieve_hybrid("warmup", None, 1)
+            logger.info("Retrieval path warmed in %.1fs", time.time() - t2)
         except Exception:
-            logger.exception("Glyph encoder load failed (will use letter-count fallback)")
+            logger.exception("Background warmup failed (will warm lazily instead)")
+
+        if orchestrator.glyph_encoder is not None:
+            try:
+                t2 = time.time()
+                orchestrator.glyph_encoder._load_model()
+                logger.info("Glyph encoder loaded in %.1fs", time.time() - t2)
+            except Exception:
+                logger.exception("Glyph encoder load failed (will use letter-count fallback)")
+
+    import threading
+    threading.Thread(
+        target=_background_warmup, name="chicory-warmup", daemon=True,
+    ).start()
+
+    # The number that actually matters: everything above this line is on the
+    # client's connect deadline (MCP_TIMEOUT, default 30000ms).
+    logger.info(
+        "CONNECT PATH COMPLETE in %.1fs since process start", time.time() - _T_BOOT,
+    )
 
     try:
         yield AppContext(
@@ -169,16 +249,26 @@ def store_memory(
     tags: list[str],
     importance: Optional[float] = None,
     summary: Optional[str] = None,
+    author: Optional[str] = None,
+    origin: Optional[str] = None,
 ) -> str:
     """Store a new memory with tags and importance rating.
 
     Use this when the conversation contains information worth remembering.
+
+    Provenance: pass author (who/what wrote this, e.g. "claude",
+    "librarian") and origin (where it came from, e.g. a session or
+    source description) so retrieval can surface the byline.
     """
     inp: dict = {"content": content, "tags": tags}
     if importance is not None:
         inp["importance"] = importance
     if summary is not None:
         inp["summary"] = summary
+    if author is not None:
+        inp["author"] = author
+    if origin is not None:
+        inp["origin"] = origin
     return _call(ctx, "store_memory", inp)
 
 
@@ -482,6 +572,332 @@ def get_commons_log(
         return _inject_glyph_definitions(json.dumps(entries, default=str))
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+def librarian_status(ctx: Context) -> str:
+    """Librarian overview: write-gate calibration stats, sweep patrol
+    progress, quarantined memory count, and subject roster summary.
+
+    The write gate scores every stored memory against tag centroids; in
+    shadow mode it only logs verdicts (see gate.verdicts) so the
+    threshold can be calibrated before enforcement is enabled.
+    """
+    return _call(ctx, "librarian_status", {})
+
+
+@mcp_server.tool()
+def librarian_review(
+    ctx: Context,
+    limit: Optional[int] = None,
+) -> str:
+    """Review the librarian's queue: quarantined memories awaiting
+    judgment and open sweep findings (near-duplicates, tag drift,
+    missing embeddings).
+
+    Use librarian_resolve to act on items in this queue.
+
+    Args:
+        limit: Max items per section (default 20).
+    """
+    inp: dict = {}
+    if limit is not None:
+        inp["limit"] = limit
+    return _call(ctx, "librarian_review", inp)
+
+
+@mcp_server.tool()
+def librarian_resolve(
+    ctx: Context,
+    memory_id: Optional[str] = None,
+    action: Optional[str] = None,
+    finding_id: Optional[int] = None,
+) -> str:
+    """Apply a judgment from librarian_review.
+
+    For a quarantined memory: pass memory_id plus action —
+    'release_critical' (join the network fully), 'release_reference'
+    (retrievable but excluded from episode structure), or 'archive'.
+
+    For a sweep finding: pass finding_id to mark it resolved.
+    """
+    inp: dict = {}
+    if memory_id is not None:
+        inp["memory_id"] = memory_id
+    if action is not None:
+        inp["action"] = action
+    if finding_id is not None:
+        inp["finding_id"] = finding_id
+    return _call(ctx, "librarian_resolve", inp)
+
+
+@mcp_server.tool()
+def librarian_consult(
+    ctx: Context,
+    query: str,
+    top_k: Optional[int] = None,
+) -> str:
+    """Ask the front desk. The structured consultation path:
+
+    1. FAQ fast path — a verified cached answer if this is a known
+       recurring question (with its supporting memory ids and byline).
+    2. Subject dispatch — matching shelves consulted individually,
+       each returning its own results.
+    3. General channel — whole-library hybrid retrieval.
+    Plus research_pending: open commissions near this query.
+
+    Prefer this over retrieve_memories when answering a patron question;
+    use retrieve_memories for raw lookup.
+    """
+    inp: dict = {"query": query}
+    if top_k is not None:
+        inp["top_k"] = top_k
+    return _call(ctx, "librarian_consult", inp)
+
+
+@mcp_server.tool()
+def librarian_faq(
+    ctx: Context,
+    action: Optional[str] = None,
+    faq_id: Optional[int] = None,
+    answer: Optional[str] = None,
+    author: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """FAQ desk management.
+
+    action='list' (default): status='candidate' lists drafts awaiting
+    judgment; status='active'/'stale'/'retired' lists entries.
+    action='approve': activate a candidate (faq_id; optional answer
+    rewrite and author byline). Approval is the judgment step — only
+    approved entries are served on the fast path.
+    action='retire': permanently retire an entry (faq_id).
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("faq_id", faq_id), ("answer", answer),
+        ("author", author), ("status", status), ("limit", limit),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_faq", inp)
+
+
+@mcp_server.tool()
+def librarian_commissions(
+    ctx: Context,
+    action: Optional[str] = None,
+    commission_id: Optional[int] = None,
+    question: Optional[str] = None,
+    report_memory_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """The commission queue — assigned research on the library's known gaps.
+
+    action='list' (default, filter by status: open/claimed/reported/closed).
+    action='file': open a ticket (question). Recurring weak-answer query
+    clusters also file tickets automatically.
+    action='claim': take a ticket (commission_id).
+    action='report': attach a report (commission_id + report_memory_id —
+    store the report first via store_memory with author and origin set).
+    action='close': close a ticket (commission_id).
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("commission_id", commission_id),
+        ("question", question), ("report_memory_id", report_memory_id),
+        ("status", status), ("limit", limit),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_commissions", inp)
+
+
+@mcp_server.tool()
+def librarian_closure(
+    ctx: Context,
+    action: Optional[str] = None,
+    memory_id: Optional[str] = None,
+    superseding_id: Optional[str] = None,
+    report_memory_id: Optional[str] = None,
+    commission_id: Optional[int] = None,
+    claim: Optional[str] = None,
+    reason: Optional[str] = None,
+    scope: Optional[str] = None,
+    actor: Optional[str] = None,
+    supersedes: Optional[list[dict]] = None,
+    resolve_findings: Optional[list[int]] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """Specialist closure — settle what a piece of work overturned.
+
+    When a report contradicts something the library already asserts, the
+    old claim does not stop existing on its own. Close the loop:
+
+    action='close' (report_memory_id, optional commission_id,
+      supersedes=[{memory_id, claim, reason, scope}], resolve_findings=[])
+      runs the whole unwind in reverse order — supersede what the report
+      refuted, mark dependent FAQ answers stale, resolve findings it
+      explains, close the ticket.
+    action='supersede' (memory_id, superseding_id, claim, reason, scope)
+      records one correction on its own.
+    action='list' / 'retract'.
+
+    Nothing is ever deleted. A superseded memory keeps its byline and its
+    place, and simply arrives marked from then on. Use scope='claim' (the
+    default) when only one assertion fell — a digest that got a section
+    wrong is not worthless — and 'whole' only when the entire memory is
+    replaced.
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("memory_id", memory_id),
+        ("superseding_id", superseding_id),
+        ("report_memory_id", report_memory_id),
+        ("commission_id", commission_id), ("claim", claim),
+        ("reason", reason), ("scope", scope), ("actor", actor),
+        ("supersedes", supersedes), ("resolve_findings", resolve_findings),
+        ("limit", limit),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_closure", inp)
+
+
+@mcp_server.tool()
+def librarian_desk(
+    ctx: Context,
+    action: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """The library's standing report — start here, before anything else.
+
+    action='report' (default): what changed since you were last here,
+    what needs your judgment (quarantine, findings, FAQ drafts, open
+    commissions, flagged arrivals), what was learned (digests written,
+    tickets closed), and the state of the building.
+    action='ack': mark the current moment as seen, so the next report's
+    "since" window starts from here.
+
+    Reading never acknowledges — a report you did not act on comes back.
+    """
+    inp: dict = {}
+    for key, val in (("action", action), ("limit", limit)):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_desk", inp)
+
+
+@mcp_server.tool()
+def librarian_subjects(
+    ctx: Context,
+    action: Optional[str] = None,
+    path: Optional[str] = None,
+    name: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """Address the subject hierarchy — the shelves, as a tree.
+
+    action='tree' (default): the whole active roster as an outline, with
+    each node's path, label, depth, memory count and tag count.
+    action='show': one shelf. Address it loosely — an exact path, a bare
+    name, a given name, or just a topic ('gnosticism') resolves to the
+    most specific shelf holding it. If several match you get candidates
+    back, not an error; if none, you get suggestions.
+    action='children': direct children of a shelf.
+    action='rename' (path + name): give a shelf a human name. Names are
+    authored, not derived, so they survive roster rebuilds — use this
+    when a shelf's real subject is clear and its machine label isn't.
+
+    Prefer a shelf's `label` over its derived `name` when speaking to a
+    person. Routing stays coarse; teach cycles address deeper shelves.
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("path", path), ("name", name), ("limit", limit),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_subjects", inp)
+
+
+@mcp_server.tool()
+def librarian_ingress(
+    ctx: Context,
+    action: Optional[str] = None,
+    content: Optional[str] = None,
+    receipt: Optional[str] = None,
+    source: Optional[str] = None,
+    origin: Optional[str] = None,
+    author: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    importance: Optional[float] = None,
+    summary: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """Receipted ingress dwell — hold content under custody before it is
+    committed to memory, so temporal detection has a window to run in.
+
+    action='hold': take content into custody and get a receipt. Commits
+    nothing. Examines the whole dwelling window, so this arrival is
+    compared against messages still held — that cross-message view is the
+    point (a repetition burst is invisible one message at a time).
+    action='review': list receipts by status (held/cleared/flagged/
+    committed/discarded) with their findings.
+    action='settle': close a dwell (receipt) or every elapsed dwell.
+    action='commit': promote a settled receipt into a memory (needs tags).
+    action='discard': settle without shelving; receipt and findings remain.
+    action='examine' / 'stats'.
+
+    Findings are ADVISORY — trajectory deviation fires on novelty as
+    readily as on attack, and the diction screen is trivially evaded.
+    Weigh them alongside provenance; never treat one as a verdict.
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("content", content), ("receipt", receipt),
+        ("source", source), ("origin", origin), ("author", author),
+        ("tags", tags), ("importance", importance), ("summary", summary),
+        ("status", status), ("limit", limit),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_ingress", inp)
+
+
+@mcp_server.tool()
+def librarian_recall(
+    ctx: Context,
+    query: str,
+    top_k: Optional[int] = None,
+) -> str:
+    """Cross-domain analogic recall: what occupies the same ROLE in other
+    subjects that this query occupies in its home subject?
+
+    Works by offset transport between subject centroids — results are
+    conjectures (labeled register: analogy), not established associations.
+    Use for creative bridging, cross-domain inspiration, and finding
+    structural rhymes the co-occurrence machinery can't see.
+    """
+    inp: dict = {"query": query}
+    if top_k is not None:
+        inp["top_k"] = top_k
+    return _call(ctx, "librarian_recall", inp)
+
+
+@mcp_server.tool()
+def librarian_maintain(ctx: Context) -> str:
+    """Run one librarian maintenance pass now: sweep the next batch of
+    the shelf-reading patrol and rebuild the subject roster from the
+    tag co-retrieval graph.
+
+    The sweep also runs automatically in the background on an interval;
+    this tool forces a batch immediately.
+    """
+    return _call(ctx, "librarian_maintain", {})
 
 
 # ── Entry point ─────────────────────────────────────────────────────

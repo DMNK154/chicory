@@ -248,9 +248,29 @@ class ChicoryConfig(BaseModel):
     deep_retrieve_depth_decay: float = Field(default=0.7)
     deep_retrieve_time_depth_weight: float = Field(default=0.3)
 
-    # FAISS vector index
-    faiss_nprobe: int = Field(default=8)
+    # FAISS vector index.
+    #
+    # nprobe is how many of the IVF index's cells a query inspects, and it
+    # sets recall, not just speed: at 351k chunks the index has 2370 cells,
+    # so nprobe=8 searched 0.34% of it and returned 71.7% of the true
+    # top-20 (measured against a brute-force scan over 200 queries drawn
+    # from real memories).  Roughly one best match in four was never seen.
+    # 64 recovers that to 89.3% for +0.6ms per query; 128 buys a further
+    # 2.6 points for twice the time.  Recall plateaus near 94% regardless,
+    # because search() over-fetches only top_k*3 chunks before
+    # deduplicating to memories.
+    faiss_nprobe: int = Field(default=64)
     faiss_rebuild_threshold: int = Field(default=500)
+    # Cache the built index on disk. Rebuilding costs 39-57s on a 351k-chunk
+    # corpus and ran on every server start, which the first retrieval then
+    # waited out (measured: a 57.4s retrieve_memories, almost all lock wait).
+    # Set False to disable without a code change; the cache is derived from
+    # db_path so separate databases never share one.
+    faiss_index_cache_enabled: bool = Field(default=True)
+    # How long a query waits for a concurrent index build before answering
+    # from the resident matrix instead. Unbounded waiting is how a 40s
+    # background build became a 57.4s tool call.
+    faiss_index_wait_seconds: float = Field(default=2.0)
 
     # Ingestion — two-tier criticality classification
     ingestion_criticality_threshold: float = Field(default=0.3)

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "chicory": {
+      "type": "stdio",
+      "command": "C:/Chicory/.venv/Scripts/python.exe",
+      "args": [
+        "-m",
+        "chicory.mcp.server"
+      ],
+      "cwd": "C:/Chicory"
+    }
+  }
+}

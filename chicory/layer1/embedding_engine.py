@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import struct
+import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -30,21 +32,31 @@ class EmbeddingEngine:
         # FAISS vector index — built lazily on first search
         self._vector_index = None  # VectorIndex | None
         self._suppress_invalidation = False
+        # Serialize the expensive one-time loads so a background warmup
+        # thread and an early tool call can't double-load or race the build
+        self._model_lock = threading.Lock()
+        self._index_lock = threading.Lock()
+        self._index_wait_seconds = float(
+            getattr(config, "faiss_index_wait_seconds", 2.0)
+        )
 
     def batch_write(self):
         """Context manager: suppress cache invalidation until the batch completes."""
         return _BatchWriteContext(self)
 
     def _load_model(self) -> None:
-        """Lazily load the sentence-transformer model."""
+        """Lazily load the sentence-transformer model (thread-safe)."""
         if self._model is not None:
             return
-        try:
-            from sentence_transformers import SentenceTransformer
+        with self._model_lock:
+            if self._model is not None:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self._config.embedding_model)
-        except Exception as e:
-            raise EmbeddingError(f"Failed to load embedding model: {e}") from e
+                self._model = SentenceTransformer(self._config.embedding_model)
+            except Exception as e:
+                raise EmbeddingError(f"Failed to load embedding model: {e}") from e
 
     def embed(self, text: str) -> np.ndarray:
         """Generate an embedding for a single text."""
@@ -86,32 +98,194 @@ class EmbeddingEngine:
         (memory_id, score) pairs sorted by descending score.
         """
         if self._vector_index is None or self._vector_index.needs_rebuild:
-            from chicory.layer1.vector_index import VectorIndex
-
-            mem_ids, matrix = self._load_chunk_matrix()
-            mem_gb = matrix.nbytes / (1024 ** 3) if matrix.size else 0
-            _log.info(
-                "Building FAISS index: %d chunks, %d dim, %.2f GB",
-                len(mem_ids), self._config.embedding_dimension, mem_gb,
-            )
-            vi = VectorIndex(
-                dimension=self._config.embedding_dimension,
-                nprobe=self._config.faiss_nprobe,
-                rebuild_threshold=self._config.faiss_rebuild_threshold,
-            )
+            # Bounded acquire. This lock is held for the whole index build,
+            # and an unbounded wait on it is how a background rebuild became
+            # a 57.4s `retrieve_memories` (semantic_search 30.3s + embed
+            # 26.3s were pure lock wait, returning 0.7s after the builder
+            # released). A caller must never inherit the builder's duration.
+            if not self._index_lock.acquire(timeout=self._index_wait_seconds):
+                return self._search_exact_fallback(query_vec, top_k, threshold)
             try:
-                vi.build_from_matrix(mem_ids, matrix)
-            except MemoryError:
-                _log.error(
-                    "FAISS index build failed: unable to allocate %.2f GB "
-                    "for %d chunks. Reduce corpus size or add RAM.",
-                    mem_gb, len(mem_ids),
-                )
-                raise
-            self._vector_index = vi
+                if self._vector_index is None or self._vector_index.needs_rebuild:
+                    from chicory.layer1.vector_index import VectorIndex
+
+                    if self._vector_index is None and self._try_load_cached_index():
+                        return self._vector_index.search(
+                            query_vec, top_k,
+                            threshold=threshold if threshold is not None else 0.0,
+                        )
+
+                    mem_ids, matrix = self._load_chunk_matrix()
+                    mem_gb = matrix.nbytes / (1024 ** 3) if matrix.size else 0
+                    _log.info(
+                        "Building FAISS index: %d chunks, %d dim, %.2f GB",
+                        len(mem_ids), self._config.embedding_dimension, mem_gb,
+                    )
+                    vi = VectorIndex(
+                        dimension=self._config.embedding_dimension,
+                        nprobe=self._config.faiss_nprobe,
+                        rebuild_threshold=self._config.faiss_rebuild_threshold,
+                    )
+                    try:
+                        vi.build_from_matrix(mem_ids, matrix)
+                    except MemoryError:
+                        _log.error(
+                            "FAISS index build failed: unable to allocate %.2f GB "
+                            "for %d chunks. Reduce corpus size or add RAM.",
+                            mem_gb, len(mem_ids),
+                        )
+                        raise
+                    self._vector_index = vi
+                    self._save_cached_index()
+            finally:
+                self._index_lock.release()
 
         thresh = threshold if threshold is not None else 0.0
         return self._vector_index.search(query_vec, top_k, threshold=thresh)
+
+    def _search_exact_fallback(
+        self,
+        query_vec: np.ndarray,
+        top_k: int,
+        threshold: float | None,
+    ) -> list[tuple[str, float]]:
+        """Answer while another thread holds the index lock.
+
+        Uses the chunk matrix ONLY if it is already resident — loading it
+        here would just trade one long wait for another. When it is
+        resident this is exact search, so the answer is at least as good as
+        the IVF index would have given; when it is not, an empty result is
+        returned rather than a hang, and logged so it is never mistaken for
+        a recall regression.
+        """
+        chunks = self._cache_chunks
+        if not chunks:
+            _log.warning(
+                "Index busy and no resident matrix — returning no semantic "
+                "hits for this query (index still building)"
+            )
+            return []
+
+        t = time.time()
+        mat = np.vstack([v for _, v in chunks]).astype(np.float32)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        q = query_vec.astype(np.float32).ravel()
+        qn = np.linalg.norm(q) or 1.0
+        sims = (mat / norms) @ (q / qn)
+
+        thresh = threshold if threshold is not None else 0.0
+        k = min(len(sims), max(top_k * 3, top_k))
+        top = np.argpartition(-sims, k - 1)[:k] if k < len(sims) else np.arange(len(sims))
+        best: dict[str, float] = {}
+        for i in top:
+            s = float(sims[i])
+            if s < thresh:
+                continue
+            mid = chunks[i][0]
+            if mid not in best or s > best[mid]:
+                best[mid] = s
+        out = sorted(best.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        _log.info(
+            "Index busy — exact fallback over %d resident chunks in %.2fs",
+            len(chunks), time.time() - t,
+        )
+        return out
+
+    # ── On-disk index cache ─────────────────────────────────────────
+
+    def _index_cache_path(self):
+        from pathlib import Path
+        db = Path(self._config.db_path)
+        return db.with_suffix(db.suffix + ".faiss")
+
+    def _embedding_watermark(self) -> tuple[int, int]:
+        """(max id, row count) over exactly the rows the index is built from.
+
+        `embeddings.id` is INTEGER PRIMARY KEY AUTOINCREMENT, so it is
+        monotonic and never reused; INSERT OR REPLACE gets a fresh higher
+        id. Pairing it with a count also catches deletes, which lower the
+        count without moving the maximum.
+
+        The JOIN is load-bearing, not decoration. A tier change — releasing
+        a memory from quarantine — touches no row in `embeddings`, so a key
+        taken over that table alone would match while the cached index still
+        excluded the released memory, making a transient bug permanent
+        across restarts. Keying on the same query `_load_chunk_matrix` uses
+        costs ~0.8s against a 39-57s rebuild.
+        """
+        row = self._db.execute(
+            """
+            SELECT COALESCE(MAX(e.id), 0) AS mx, COUNT(*) AS n
+            FROM embeddings e JOIN memories m ON m.id = e.memory_id
+            WHERE m.is_archived = 0 AND m.ingestion_tier != 'quarantine'
+            """
+        ).fetchone()
+        return int(row["mx"]), int(row["n"])
+
+    def _try_load_cached_index(self) -> bool:
+        """Load the on-disk index if it is exactly current. Else return False.
+
+        Deliberately all-or-nothing: any doubt falls through to a full
+        rebuild, which is the behaviour that existed before this cache.
+        """
+        if not getattr(self._config, "faiss_index_cache_enabled", True):
+            return False
+        path = self._index_cache_path()
+        if not path.exists():
+            return False
+
+        from chicory.layer1.vector_index import VectorIndex
+
+        vi = VectorIndex(
+            dimension=self._config.embedding_dimension,
+            nprobe=self._config.faiss_nprobe,
+            rebuild_threshold=self._config.faiss_rebuild_threshold,
+        )
+        t = time.time()
+        meta = vi.load(path)
+        if meta is None:
+            return False
+
+        max_id, count = self._embedding_watermark()
+        if meta.get("max_embedding_id") != max_id or meta.get("count") != count:
+            _log.info(
+                "Cached index stale (saved %s/%s, now %s/%s) — rebuilding",
+                meta.get("max_embedding_id"), meta.get("count"), max_id, count,
+            )
+            return False
+        if meta.get("model_name") != self._config.embedding_model:
+            _log.info("Cached index rejected: built with a different model")
+            return False
+
+        self._vector_index = vi
+        _log.info(
+            "FAISS index loaded from cache in %.2fs (%d vectors)",
+            time.time() - t, vi.ntotal,
+        )
+        return True
+
+    def _save_cached_index(self) -> None:
+        if not getattr(self._config, "faiss_index_cache_enabled", True):
+            return
+        if self._vector_index is None:
+            return
+        try:
+            max_id, count = self._embedding_watermark()
+            t = time.time()
+            self._vector_index.save(
+                self._index_cache_path(),
+                {
+                    "max_embedding_id": max_id,
+                    "count": count,
+                    "model_name": self._config.embedding_model,
+                    "nprobe": self._config.faiss_nprobe,
+                },
+            )
+            _log.info("FAISS index cached in %.2fs", time.time() - t)
+        except Exception:
+            # A cache that cannot be written must never break retrieval.
+            _log.exception("Failed to write FAISS index cache")
 
     def store_cached(self, memory_id: str, embedding: np.ndarray, chunk_index: int = 0) -> None:
         """Store a single chunk embedding in the database."""
@@ -177,7 +351,11 @@ class EmbeddingEngine:
             return self._cache_all
 
         rows = self._db.execute(
-            "SELECT memory_id, embedding, dimension FROM embeddings WHERE chunk_index = 0"
+            """
+            SELECT e.memory_id, e.embedding, e.dimension FROM embeddings e
+            JOIN memories m ON m.id = e.memory_id
+            WHERE e.chunk_index = 0 AND m.ingestion_tier != 'quarantine'
+            """
         ).fetchall()
         if not rows:
             self._cache_all = {}
@@ -195,9 +373,16 @@ class EmbeddingEngine:
 
         Returns (memory_ids, matrix) where matrix is (N, dim) float32.
         One entry per chunk — memory_ids may contain duplicates.
+        Archived and quarantined memories are excluded so they never
+        enter the FAISS index.
         """
         rows = self._db.execute(
-            "SELECT memory_id, embedding, dimension FROM embeddings ORDER BY memory_id, chunk_index"
+            """
+            SELECT e.memory_id, e.embedding, e.dimension FROM embeddings e
+            JOIN memories m ON m.id = e.memory_id
+            WHERE m.is_archived = 0 AND m.ingestion_tier != 'quarantine'
+            ORDER BY e.memory_id, e.chunk_index
+            """
         ).fetchall()
         if not rows:
             return [], np.array([], dtype=np.float32)
@@ -218,7 +403,12 @@ class EmbeddingEngine:
             return self._cache_chunks
 
         rows = self._db.execute(
-            "SELECT memory_id, embedding, dimension FROM embeddings ORDER BY memory_id, chunk_index"
+            """
+            SELECT e.memory_id, e.embedding, e.dimension FROM embeddings e
+            JOIN memories m ON m.id = e.memory_id
+            WHERE m.is_archived = 0 AND m.ingestion_tier != 'quarantine'
+            ORDER BY e.memory_id, e.chunk_index
+            """
         ).fetchall()
         if not rows:
             self._cache_chunks = []

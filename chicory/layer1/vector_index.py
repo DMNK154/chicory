@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 
 def _import_faiss():
@@ -135,19 +140,129 @@ class VectorIndex:
         return sorted_results[:top_k]
 
     def add(self, memory_id: str, vectors: list[np.ndarray]) -> None:
-        """Incrementally add vectors for a new memory."""
+        """Incrementally add vectors for a new memory.
+
+        One faiss call for the whole batch: per-vector `add()` measured
+        10.4ms each on a 351k IVF index (500 vectors = 5.2s), against
+        0.006s for the same 500 added together.
+
+        Note this appends and never removes, so the positional id map stays
+        valid.  If removal is ever added, this must switch to
+        `add_with_ids` with a persisted counter — after a `remove_ids`,
+        plain `add()` reuses ids and silently collides with live vectors.
+        """
+        if self._index is None or not vectors:
+            return
+        batch = np.ascontiguousarray(np.stack(vectors), dtype=np.float32)
+        self._index.add(batch)
+        self._id_to_memory.extend([memory_id] * len(batch))
+        self._adds_since_build += len(batch)
+
+    # ── Persistence ─────────────────────────────────────────────────
+    #
+    # Rebuilding from the embeddings table costs 39-57s on a 351k-chunk
+    # corpus (SQL scan + IVF k-means training), and it ran on every server
+    # start.  A written index reads back in well under a second and searches
+    # identically.  `meta` carries whatever the caller needs to decide
+    # staleness; this class stores it verbatim and does not interpret it.
+
+    def save(self, path: Path, meta: dict) -> None:
+        """Write the index, its id map, and caller metadata beside `path`."""
         if self._index is None:
             return
-        for vec in vectors:
-            v = vec.reshape(1, -1).astype(np.float32)
-            self._index.add(v)
-            self._id_to_memory.append(memory_id)
-            self._adds_since_build += 1
+        faiss = _import_faiss()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        faiss.write_index(self._index, str(tmp))
+        tmp.replace(path)
+
+        # Store the id map compactly: 351k x 36-char ids are 50MB raw but
+        # ~19MB as unique-plus-inverse, and the ids repeat per chunk.
+        arr = np.asarray(self._id_to_memory)
+        uniq, inv = np.unique(arr, return_inverse=True)
+        ids_tmp = path.with_suffix(path.suffix + ".ids.npz.tmp")
+        # Hand savez an open handle: given a *path* it appends ".npz" to
+        # anything not already ending in it, silently writing a different
+        # file than the one about to be renamed.
+        with open(ids_tmp, "wb") as fh:
+            np.savez(fh, uniq=uniq, inv=inv.astype(np.int32))
+        ids_tmp.replace(path.with_suffix(path.suffix + ".ids.npz"))
+
+        payload = dict(meta)
+        payload.update({
+            "dimension": self._dimension,
+            "is_ivf": self._is_ivf,
+            "ntotal": int(self._index.ntotal),
+            "id_map_len": len(self._id_to_memory),
+        })
+        meta_tmp = path.with_suffix(path.suffix + ".meta.json.tmp")
+        meta_tmp.write_text(json.dumps(payload), encoding="utf-8")
+        meta_tmp.replace(path.with_suffix(path.suffix + ".meta.json"))
+
+    def load(self, path: Path) -> Optional[dict]:
+        """Load a saved index. Returns its metadata, or None if unusable.
+
+        Any inconsistency returns None so the caller rebuilds — the worst
+        case is exactly today's behaviour.
+        """
+        path = Path(path)
+        ids_path = path.with_suffix(path.suffix + ".ids.npz")
+        meta_path = path.with_suffix(path.suffix + ".meta.json")
+        if not (path.exists() and ids_path.exists() and meta_path.exists()):
+            return None
+
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if int(meta.get("dimension", -1)) != self._dimension:
+                _log.info("Cached index rejected: dimension mismatch")
+                return None
+
+            faiss = _import_faiss()
+            index = faiss.read_index(str(path))
+
+            with np.load(ids_path, allow_pickle=False) as z:
+                id_map = z["uniq"][z["inv"]].tolist()
+
+            if index.ntotal != len(id_map):
+                _log.warning(
+                    "Cached index rejected: ntotal %d != id map %d",
+                    index.ntotal, len(id_map),
+                )
+                return None
+
+            self._index = index
+            self._id_to_memory = id_map
+            self._is_ivf = bool(meta.get("is_ivf", False))
+            self._adds_since_build = 0
+            if self._is_ivf:
+                self._index.nprobe = self._nprobe
+            return meta
+        except Exception:
+            _log.exception("Cached index load failed; will rebuild")
+            return None
 
     @property
     def needs_rebuild(self) -> bool:
-        """True if enough incremental adds have happened to warrant retraining."""
-        return self._adds_since_build >= self._rebuild_threshold
+        """True if enough incremental adds have happened to warrant retraining.
+
+        Proportional, not absolute: a flat threshold of 500 on a 351k-chunk
+        corpus retrains the whole index for a 0.14% change.
+        """
+        if self._index is None:
+            return False
+        base = self._index.ntotal - self._adds_since_build
+        if base <= 0:
+            return self._adds_since_build >= self._rebuild_threshold
+        return (
+            self._adds_since_build >= self._rebuild_threshold
+            and self._adds_since_build >= 0.25 * base
+        )
+
+    @property
+    def ntotal(self) -> int:
+        return 0 if self._index is None else int(self._index.ntotal)
 
     @property
     def is_built(self) -> bool:
