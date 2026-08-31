@@ -40,7 +40,15 @@ class DatabaseEngine:
         if not is_memory:
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA synchronous = NORMAL")
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        # 5s was too short for this workload. A store triggers global network
+        # passes (parallelness over ~91k tensor rows, tensor rewrites) that
+        # hold write locks for far longer, so an ordinary concurrent
+        # retrieval — which writes bookkeeping of its own — was enough to
+        # kill a twelve-minute ingest at its final step with "database is
+        # locked", after the memory rows had already been committed.
+        self._conn.execute(
+            f"PRAGMA busy_timeout = {int(getattr(self._config, 'db_busy_timeout_ms', 30000))}"
+        )
         return self._conn
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> sqlite3.Cursor:

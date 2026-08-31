@@ -17,6 +17,10 @@ class ChicoryConfig(BaseModel):
 
     # Paths
     db_path: Path = Field(default_factory=lambda: Path.home() / ".chicory" / "chicory.db")
+    # How long a statement waits on a write lock before giving up. Stores
+    # trigger global network passes that hold locks for tens of seconds, so
+    # the previous 5s meant a concurrent retrieval could fail an ingest.
+    db_busy_timeout_ms: int = Field(default=30000)
 
     # LLM
     llm_provider: str = Field(default="auto")  # auto, anthropic, openai, grok, gemini, null

@@ -350,6 +350,15 @@ CHICORY_TOOLS = [
                 "report_memory_id": {"type": "string"},
                 "commission_id": {"type": "integer"},
                 "claim": {"type": "string"},
+                "all_claims": {
+                    "type": "boolean",
+                    "description": (
+                        "retract only: withdraw every correction between the "
+                        "pair, not just the named claim. A pair can carry "
+                        "several independent corrections, so this must be "
+                        "deliberate."
+                    ),
+                },
                 "reason": {"type": "string"},
                 "scope": {"type": "string", "enum": ["claim", "whole"]},
                 "actor": {"type": "string"},

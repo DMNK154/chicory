@@ -235,7 +235,7 @@ def _call(ctx: Context, tool_name: str, tool_input: dict) -> str:
     elapsed = time.time() - t0
     n = len(result.get("results", [])) if isinstance(result, dict) else "?"
     logger.info("TOOL DONE: %s  %.1fs  results=%s", tool_name, elapsed, n)
-    response = json.dumps(result, default=str)
+    response = json.dumps(result, default=str, ensure_ascii=False)
     return _inject_glyph_definitions(response)
 
 
@@ -527,7 +527,7 @@ def sync_network(ctx: Context) -> str:
     app_ctx = ctx.request_context.lifespan_context
     orchestrator = app_ctx.orchestrator
     stats = orchestrator.run_sync()
-    return _inject_glyph_definitions(json.dumps(stats, default=str))
+    return _inject_glyph_definitions(json.dumps(stats, default=str, ensure_ascii=False))
 
 
 @mcp_server.tool()
@@ -543,7 +543,7 @@ def process_signals(ctx: Context) -> str:
     if not processor:
         return json.dumps({"error": "Commons not enabled or chicory-commons-man not installed"})
     result = processor.process_pending()
-    return _inject_glyph_definitions(json.dumps(result, default=str))
+    return _inject_glyph_definitions(json.dumps(result, default=str, ensure_ascii=False))
 
 
 @mcp_server.tool()

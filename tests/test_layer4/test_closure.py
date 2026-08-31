@@ -349,3 +349,30 @@ class TestReviewFixes:
         led.supersede("a", "new", actor="x")
         assert led.superseded_among(["a", "b"]) == {"a"}
         assert led.superseded_among([]) == set()
+
+
+def test_retract_forwards_the_claim(ledger):
+    """A claim-scoped supersession must be retractable through the handler.
+
+    The orchestrator accepted a `claim` argument and the MCP schema
+    advertised it, but the handler never passed it to retract(), which then
+    fell back to matching claim = ''. Every claim-scoped supersession --
+    the documented default -- was permanently unretractable, while the API
+    looked like it supported exactly that.
+    """
+    config, db, led = ledger
+    old, new = "mem-old", "mem-new"
+    _mem(db, old)
+    _mem(db, new)
+    claim = "the earlier figure was wrong"
+
+    led.supersede(old, new, claim=claim, scope="claim", actor="test")
+    assert led.superseded_among([old]), "precondition: supersession stands"
+
+    # Without the claim, retract cannot match a claim-scoped row.
+    assert led.retract(old, new) is False
+    assert led.superseded_among([old]), "retract removed the wrong row"
+
+    # With it, it can.
+    assert led.retract(old, new, claim=claim) is True
+    assert not led.superseded_among([old])

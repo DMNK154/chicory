@@ -1884,6 +1884,7 @@ class Orchestrator:
         report_memory_id: str | None = None,
         commission_id: int | None = None,
         claim: str | None = None,
+        all_claims: bool = False,
         reason: str | None = None,
         scope: str = "claim",
         actor: str | None = None,
@@ -1926,7 +1927,15 @@ class Orchestrator:
                     if not (memory_id and superseding_id):
                         return {"error": "retract requires memory_id and "
                                          "superseding_id"}
-                    ok = self._closure.retract(memory_id, superseding_id)
+                    # Forward the claim. Without it retract() falls back to
+                    # matching claim = '', so it could only ever withdraw a
+                    # whole-scope supersession — every claim-scoped one, which
+                    # is the documented default, was unretractable while the
+                    # schema advertised the argument.
+                    ok = self._closure.retract(
+                        memory_id, superseding_id,
+                        claim=claim, all_claims=all_claims,
+                    )
                     return ({"status": "retracted"} if ok
                             else {"error": "no such standing supersession"})
                 if action == "list":
