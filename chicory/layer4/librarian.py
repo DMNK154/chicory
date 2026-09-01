@@ -1653,6 +1653,24 @@ class DemandLedger:
             (query_text, blob, result_count, top_score),
         )
 
+    def _embed_query(self, text: str) -> np.ndarray | None:
+        """Embed a query whose caller had no vector to give us.
+
+        Returns None when there is nothing to embed or the engine is
+        unavailable, so the caller can count the loss instead of pretending
+        the row was clustered.
+        """
+        if not text or not text.strip():
+            return None
+        engine = getattr(self._memory_store, "_embedding", None)
+        if engine is None:
+            return None
+        try:
+            return _unit(engine.embed(text).astype(np.float32))
+        except Exception:
+            _log.exception("Demand ledger could not embed %r", text[:60])
+            return None
+
     def process_batch(self, allow_retrieval: bool = True) -> dict:
         """Assign unprocessed queries to clusters, then promote or commission.
 
@@ -1665,17 +1683,37 @@ class DemandLedger:
             "WHERE processed = 0 ORDER BY id ASC LIMIT ?",
             (self._config.demand_process_batch,),
         ).fetchall()
-        if not rows:
-            return {"processed": 0, "faq_candidates": 0, "commissions_filed": 0}
 
+        # No early return on an empty batch.  Promotion below is the retry
+        # path for clusters deferred because the index was not built, and
+        # returning here made that retry depend on new query traffic
+        # arriving — so a cluster deferred just as traffic stopped was
+        # never promoted at all.  Observed: eight hits on one question,
+        # mean_top_score 0.92, both gates passed, and no FAQ card, because
+        # every later pass took this branch.
         clusters = self._load_clusters()
         threshold = self._config.demand_cluster_threshold
         touched: set[int] = set()
 
+        recovered = 0
+        dropped = 0
         for r in rows:
-            if r["embedding"] is None:
-                continue
-            vec = _unit(_blob_to_array(r["embedding"]))
+            blob = r["embedding"]
+            if blob is None:
+                # record() stores the query even when the caller had no
+                # vector to give it, and clustering then skipped the row
+                # while the update below still marked it processed — demand
+                # consumed and lost, silently.  Embed it here instead: it is
+                # the same work record() would have done, and _promote
+                # already embeds in this same call.
+                vec = self._embed_query(r["query_text"])
+                if vec is None:
+                    dropped += 1
+                    continue
+                recovered += 1
+            else:
+                vec = _unit(_blob_to_array(blob))
+
             best_id, best_sim = None, threshold
             for cid, (centroid, _, _) in clusters.items():
                 sim = float(np.dot(vec, centroid))
@@ -1704,6 +1742,10 @@ class DemandLedger:
                 clusters[best_id] = (new_centroid, hits + 1, new_mean)
                 touched.add(best_id)
 
+        # Rows that could not be embedded are marked processed too, and
+        # counted above rather than lost quietly: leaving them unprocessed
+        # would park them at the head of an ORDER BY id ASC queue forever,
+        # starving every query behind them.
         self._db.executemany(
             "UPDATE query_history SET processed = 1 WHERE id = ?",
             [(r["id"],) for r in rows],
@@ -1718,15 +1760,22 @@ class DemandLedger:
         # the clusters retain the aggregate; the raw ledger is operational
         # telemetry, not memory.
         retention_days = self._config.demand_history_retention_days
-        if retention_days > 0:
+        if rows and retention_days > 0:
             self._db.execute(
                 "DELETE FROM query_history WHERE processed = 1 "
                 "AND created_at < datetime('now', ?)",
                 (f"-{int(retention_days)} days",),
             )
 
+        if dropped:
+            _log.warning(
+                "Demand ledger dropped %d unembeddable quer%s",
+                dropped, "y" if dropped == 1 else "ies",
+            )
         return {
             "processed": len(rows),
+            "recovered_embeddings": recovered,
+            "dropped_unembeddable": dropped,
             "faq_candidates": faq_count,
             "commissions_filed": commission_count,
         }

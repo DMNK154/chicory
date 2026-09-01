@@ -406,10 +406,12 @@ def _mem(mid: str) -> Memory:
 
 
 class _StubStore:
-    """Stub memory_store: DemandLedger only calls retrieve_hybrid."""
+    """Stub memory_store: DemandLedger calls retrieve_hybrid, and reaches
+    for _embedding to recover queries recorded without a vector."""
 
-    def __init__(self, results):
+    def __init__(self, results, embedding=None):
         self.results = results
+        self._embedding = embedding
 
     def retrieve_hybrid(self, query, tags=None, top_k=None):
         return self.results
@@ -725,6 +727,69 @@ class TestReviewFixes:
         ledger.record("popular", _basis_vec(0), 5, 0.8)
         stats2 = ledger.process_batch(allow_retrieval=True)
         assert stats2["faq_candidates"] == 1  # retried, not lost
+
+    def test_deferred_promotion_retries_with_no_new_traffic(self, stack):
+        """The retry above only worked because a new query arrived with it.
+
+        process_batch used to return early on an empty batch, so promotion —
+        the retry path for a cluster deferred while the index was unbuilt —
+        never ran unless fresh traffic happened to arrive.  A cluster
+        deferred just as the library went quiet was never promoted at all.
+        """
+        _insert_memory(stack["db"], "sup1")
+        faq = FaqDesk(stack["config"], stack["db"])
+        commissions = CommissionDesk(stack["config"], stack["db"])
+        ledger = DemandLedger(
+            stack["config"], stack["db"],
+            _StubStore([(_mem("sup1"), 0.9)]),
+            faq, commissions, stack["roster"],
+        )
+        for _i in range(3):
+            ledger.record("popular", _basis_vec(0), 5, 0.8)
+        assert ledger.process_batch(allow_retrieval=False)["faq_candidates"] == 0
+
+        # Nothing new recorded — the library has gone quiet.
+        stats = ledger.process_batch(allow_retrieval=True)
+        assert stats["processed"] == 0
+        assert stats["faq_candidates"] == 1
+
+    def test_query_recorded_without_a_vector_is_recovered(self, stack):
+        ledger = DemandLedger(
+            stack["config"], stack["db"],
+            _StubStore([], embedding=MockEmbeddingEngine(dimension=DIM)),
+            FaqDesk(stack["config"], stack["db"]),
+            CommissionDesk(stack["config"], stack["db"]),
+            stack["roster"],
+        )
+        ledger.record("a question nobody could embed", None, 0, 0.0)
+        stats = ledger.process_batch(allow_retrieval=False)
+        assert stats["recovered_embeddings"] == 1
+        assert stats["dropped_unembeddable"] == 0
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_clusters"
+        ).fetchone()["n"] == 1
+
+    def test_unembeddable_query_is_counted_and_does_not_block(self, stack):
+        """No engine to recover with: the loss must be reported, and the row
+        must still leave the queue or it starves everything behind it."""
+        ledger = DemandLedger(
+            stack["config"], stack["db"], _StubStore([]),
+            FaqDesk(stack["config"], stack["db"]),
+            CommissionDesk(stack["config"], stack["db"]),
+            stack["roster"],
+        )
+        ledger.record("unembeddable", None, 0, 0.0)
+        ledger.record("fine", _basis_vec(0), 5, 0.8)
+        stats = ledger.process_batch(allow_retrieval=False)
+        assert stats["dropped_unembeddable"] == 1
+        assert stats["processed"] == 2
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_history WHERE processed = 0"
+        ).fetchone()["n"] == 0
+        # The healthy query still clustered.
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_clusters"
+        ).fetchone()["n"] == 1
 
     def test_closed_commission_not_refiled_by_demand(self, stack):
         faq = FaqDesk(stack["config"], stack["db"])
