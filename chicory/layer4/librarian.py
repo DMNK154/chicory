@@ -470,8 +470,16 @@ class SubjectRoster:
         self._db = db
         self._centroids = centroid_subgraph
 
-    def rebuild(self) -> dict:
+    def rebuild(self, cold: bool = False) -> dict:
         """Recompute the roster as a TREE from the co-retrieval graph.
+
+        Warm by default: both the component hysteresis and the split
+        seeding inherit from the standing roster, so shelf paths hold
+        still across rebuilds and stay usable as addresses.  ``cold=True``
+        discards that inheritance and re-derives the tree purely from the
+        geometry — the escape hatch for a roster that has drifted somewhere
+        it should not have, and the only way to adopt a better partition
+        the warm path would never find on its own.
 
         Connected components give the roots; any node too large to be
         taught is split in centroid space and its children persisted
@@ -507,7 +515,7 @@ class SubjectRoster:
 
         min_size = self._config.subject_min_cluster_size
         roots = [
-            c for c in self._connected_components(topical_ids)
+            c for c in self._connected_components(topical_ids, cold=cold)
             if len(c) >= min_size
         ]
 
@@ -518,6 +526,9 @@ class SubjectRoster:
             "total_memories": total_memories,
             "max_depth_seen": 0,
             "tag_members": self._load_tag_members(),
+            # Snapshot before the first _persist_node write, so children are
+            # seeded from the previous roster and not from this one.
+            "prior_by_depth": {} if cold else self._prior_by_depth(),
         }
         for cluster in roots:
             self._persist_node(cluster, None, 0, "", state)
@@ -539,6 +550,7 @@ class SubjectRoster:
             "subjects_active": len(state["active_paths"]),
             "subjects_retired": retired,
             "max_depth": state["max_depth_seen"],
+            "mode": "cold" if cold else "warm",
         }
 
     def _persist_node(
@@ -595,7 +607,11 @@ class SubjectRoster:
 
         if not self._should_split(cluster, memory_count, depth, state):
             return
-        children = self._split_in_centroid_space(cluster)
+        # A node at depth d inherits the arity depth d+1 actually had.
+        children = self._split_in_centroid_space(
+            cluster,
+            prior_leaf=(state.get("prior_by_depth") or {}).get(depth + 1),
+        )
         children = self._absorb_undersized(children)
         if len(children) < 2:
             return  # geometry could not separate it; leave the node as a leaf
@@ -1001,10 +1017,64 @@ class SubjectRoster:
             and r["memory_count"] <= hub_cap
         }
 
-    def _split_in_centroid_space(self, cluster: set[int]) -> list[set[int]]:
-        """K-means over tag centroids (pure numpy, k-means++ seeding,
-        fixed seed for reproducibility).  Falls back to the unsplit
-        cluster if centroids are missing."""
+    def _warm_centers(
+        self,
+        have: list[int],
+        matrix: np.ndarray,
+        prior_leaf: dict[int, int],
+    ) -> np.ndarray | None:
+        """Initial centres taken from how these tags were grouped before.
+
+        This is the fix for the splitter's real instability.  k-means++
+        seeds with ``matrix[rng.randint(len(have))]`` — an index drawn from
+        the array's LENGTH — and ``have`` is sorted tag ids, so inserting a
+        handful of tags both changes the draw and shifts every position
+        after them.  Seed 42 does not help: it is the draw that moves.
+        Measured, six new tags in a 1,020-tag root reseeded the clustering
+        and re-partitioned all three levels beneath it.
+
+        Grouping by the standing roster's leaf assignment removes the
+        length dependence entirely — centres come from the data's own prior
+        structure, so a few new tags perturb the assignment instead of
+        reseeding it.  Returns None when there is nothing to inherit (cold
+        start, or a parent whose children no longer resolve), and the
+        caller falls back to k-means++.
+        """
+        min_size = self._config.subject_min_cluster_size
+        groups: dict[int, list[int]] = {}
+        for idx, tag_id in enumerate(have):
+            leaf = prior_leaf.get(tag_id)
+            if leaf is not None:
+                groups.setdefault(leaf, []).append(idx)
+
+        usable = [idxs for idxs in groups.values() if len(idxs) >= min_size]
+        if len(usable) < 2:
+            return None
+        # Largest first, so if the cap bites it drops the least-established
+        # groups rather than an arbitrary set.
+        usable.sort(key=len, reverse=True)
+        return np.stack([
+            _unit(matrix[idxs].mean(axis=0).astype(np.float32))
+            for idxs in usable
+        ])
+
+    def _split_in_centroid_space(
+        self, cluster: set[int], prior_leaf: dict[int, int] | None = None,
+    ) -> list[set[int]]:
+        """K-means over tag centroids (pure numpy).
+
+        Seeded from the standing roster's grouping where there is one, and
+        from k-means++ (fixed seed) where there is not.  Falls back to the
+        unsplit cluster if centroids are missing.
+
+        Warm seeding means the tree's SHAPE is inherited: each rebuild
+        starts in the basin the last one settled in, and refines it rather
+        than re-deriving it.  That is deliberate — a shelf path is an
+        address that digests, commissions and the teach cycle all quote,
+        and an address that re-derives is not an address.  The cost is that
+        the tree can no longer discover a better partition on its own;
+        ``rebuild(cold=True)`` is the way back to a clean derivation.
+        """
         ids = sorted(cluster)
         centroids = self._centroids.get_centroids_batch(ids)
         have = [t for t in ids if t in centroids]
@@ -1012,27 +1082,33 @@ class SubjectRoster:
             return [cluster]
         matrix = np.stack([centroids[t] for t in have])
 
-        k = self._config.subject_split_k
-        if k <= 0:
-            k = max(2, int(round((len(have) / 2) ** 0.5)))
-        k = min(k, len(have) // self._config.subject_min_cluster_size, len(have))
-        if k < 2:
-            return [cluster]
-
-        rng = np.random.RandomState(42)
-        # k-means++ seeding on cosine (unit vectors: euclidean ~ cosine)
-        centers = [matrix[rng.randint(len(have))]]
-        for _ in range(k - 1):
-            dists = np.min(
-                np.stack([1.0 - matrix @ c for c in centers]), axis=0,
+        C = self._warm_centers(have, matrix, prior_leaf) if prior_leaf else None
+        if C is not None:
+            k = len(C)
+        else:
+            k = self._config.subject_split_k
+            if k <= 0:
+                k = max(2, int(round((len(have) / 2) ** 0.5)))
+            k = min(
+                k, len(have) // self._config.subject_min_cluster_size, len(have),
             )
-            dists = np.clip(dists, 0, None)
-            total = dists.sum()
-            if total <= 0:
-                centers.append(matrix[rng.randint(len(have))])
-                continue
-            centers.append(matrix[rng.choice(len(have), p=dists / total)])
-        C = np.stack(centers)
+            if k < 2:
+                return [cluster]
+
+            rng = np.random.RandomState(42)
+            # k-means++ seeding on cosine (unit vectors: euclidean ~ cosine)
+            centers = [matrix[rng.randint(len(have))]]
+            for _ in range(k - 1):
+                dists = np.min(
+                    np.stack([1.0 - matrix @ c for c in centers]), axis=0,
+                )
+                dists = np.clip(dists, 0, None)
+                total = dists.sum()
+                if total <= 0:
+                    centers.append(matrix[rng.randint(len(have))])
+                    continue
+                centers.append(matrix[rng.choice(len(have), p=dists / total)])
+            C = np.stack(centers)
 
         assign = np.zeros(len(have), dtype=np.int64)
         for _ in range(50):
@@ -1057,19 +1133,105 @@ class SubjectRoster:
             max(out, key=len).update(unplaced)
         return out
 
-    def _connected_components(self, tag_ids: set[int]) -> list[set[int]]:
-        min_strength = self._config.subject_min_edge_strength
+    def _prior_by_depth(self) -> dict[int, dict[int, int]]:
+        """Tag -> shelf, one map per depth of the standing roster.
+
+        Level-aware on purpose.  Seeding a split from the roster's *leaf*
+        assignment collapses the tree: leaves from every depth arrive as
+        one flat set of sibling centres, so a root inherits ~50 children at
+        once and none of them is large enough to split again.  Measured, it
+        took a three-level tree down to one.
+
+        Splitting a node at depth d therefore seeds from depth d+1 — the
+        arity that level actually had — which inherits the shape rather
+        than flattening it.
+
+        Snapshotted once at the start of a rebuild and never re-read:
+        _persist_node writes each node before recursing into it, so a lazy
+        read would inherit from the rebuild in progress instead of the one
+        before it.
+        """
         rows = self._db.execute(
-            "SELECT tag_a_id, tag_b_id FROM centroid_edges WHERE edge_strength >= ?",
+            "SELECT id, depth, member_tag_ids FROM subjects "
+            "WHERE status = 'active' ORDER BY depth ASC, id ASC"
+        ).fetchall()
+        by_depth: dict[int, dict[int, int]] = {}
+        for r in rows:
+            level = by_depth.setdefault(r["depth"], {})
+            try:
+                for tag_id in json.loads(r["member_tag_ids"]):
+                    level[tag_id] = r["id"]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return by_depth
+
+    def _prior_components(self) -> dict[int, int]:
+        """Which root component each tag sat in under the standing roster.
+
+        Read before anything is persisted, so it describes the partition
+        readers are currently addressing — the thing hysteresis exists to
+        hold still.  Depth 0 only: those nodes carry their whole subtree's
+        tags, which is exactly the component boundary that matters.
+
+        Empty on a cold start (no roster yet), and callers treat that as
+        "no hysteresis" rather than "nothing may merge" — a fresh install
+        must still be able to form its first partition.
+        """
+        rows = self._db.execute(
+            "SELECT id, member_tag_ids FROM subjects "
+            "WHERE status = 'active' AND depth = 0"
+        ).fetchall()
+        prior: dict[int, int] = {}
+        for r in rows:
+            try:
+                for tag_id in json.loads(r["member_tag_ids"]):
+                    prior[tag_id] = r["id"]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return prior
+
+    def _connected_components(
+        self, tag_ids: set[int], cold: bool = False,
+    ) -> list[set[int]]:
+        """Group tags into components, with hysteresis against churn.
+
+        A single co-retrieval is enough to KEEP two tags in the shelf they
+        already share, but not enough to MERGE two shelves that were
+        separate.  Without that asymmetry, component formation is a
+        knife-edge — see subject_edge_merge_min_count for the measurement.
+
+        The cost of the asymmetry, stated plainly: the roster is no longer
+        a pure function of the geometry.  It depends on the roster before
+        it, which is what makes a shelf path a stable address instead of a
+        fresh derivation each rebuild.  It remains idempotent run to run.
+        """
+        min_strength = self._config.subject_min_edge_strength
+        keep_min = self._config.subject_edge_keep_min_count
+        merge_min = self._config.subject_edge_merge_min_count
+        prior = {} if cold else self._prior_components()
+
+        rows = self._db.execute(
+            "SELECT tag_a_id, tag_b_id, co_retrieval_count FROM centroid_edges "
+            "WHERE edge_strength >= ?",
             (min_strength,),
         ).fetchall()
 
         adjacency: dict[int, set[int]] = {t: set() for t in tag_ids}
         for r in rows:
             a, b = r["tag_a_id"], r["tag_b_id"]
-            if a in tag_ids and b in tag_ids:
-                adjacency[a].add(b)
-                adjacency[b].add(a)
+            if a not in tag_ids or b not in tag_ids:
+                continue
+            count = r["co_retrieval_count"]
+            if count < keep_min:
+                continue
+            if prior and count < merge_min:
+                root_a = prior.get(a)
+                if root_a is None or root_a != prior.get(b):
+                    # Too little evidence to fuse groups that were apart —
+                    # or to attach a tag no shelf has held yet.
+                    continue
+            adjacency[a].add(b)
+            adjacency[b].add(a)
 
         visited: set[int] = set()
         components: list[set[int]] = []

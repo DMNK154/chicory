@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 
 TABLES = [
     # -- Schema version tracking --
@@ -976,6 +976,55 @@ TABLES = [
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
     )
     """,
+
+    # -- Wandering librarian: per-errand visit stamps (distributed cursor) --
+    #
+    # memories.swept_at is the same idea with one errand hardcoded into a
+    # column.  This generalises it: the position of every errand lives on
+    # the objects it visits rather than in a pointer, so each errand walks
+    # its own lap, restart-safe, without a checkpoint to lose.  A memory
+    # with no row here has never been visited BY THIS ERRAND and sorts
+    # first, exactly as a NULL swept_at does.
+    """
+    CREATE TABLE IF NOT EXISTS patrol_visits (
+        errand     TEXT NOT NULL,
+        memory_id  TEXT NOT NULL,
+        visited_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        lap        INTEGER NOT NULL DEFAULT 0,
+        verdict    TEXT NOT NULL DEFAULT 'ok',
+        detail     TEXT,
+        PRIMARY KEY (errand, memory_id)
+    )
+    """,
+    # The patrol's ordering index: least-recently-visited first, per errand.
+    "CREATE INDEX IF NOT EXISTS idx_patrol_visits_order "
+    "ON patrol_visits(errand, visited_at)",
+    "CREATE INDEX IF NOT EXISTS idx_patrol_visits_memory "
+    "ON patrol_visits(memory_id)",
+
+    # -- Wandering librarian: what each errand is currently curious about --
+    #
+    # The small centralised half of the state.  Position is distributed
+    # (patrol_visits); this holds the things that have no natural home on
+    # an object: which lap the errand is on, where in the shelf tree it is
+    # working, and the RNG seed — so a walk that chooses randomly can be
+    # replayed exactly rather than merely described.
+    """
+    CREATE TABLE IF NOT EXISTS wander_state (
+        errand        TEXT PRIMARY KEY,
+        lap           INTEGER NOT NULL DEFAULT 0,
+        cursor_hint   TEXT,
+        seed          INTEGER NOT NULL DEFAULT 0,
+        visited_count INTEGER NOT NULL DEFAULT 0,
+        acted_count   INTEGER NOT NULL DEFAULT 0,
+        runs          INTEGER NOT NULL DEFAULT 0,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        last_run_at   TEXT,
+        last_result   TEXT,
+        created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    )
+    """,
 ]
 
 
@@ -1063,6 +1112,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v35_to_v36(db)
             if current_version <= 36:
                 _migrate_v36_to_v37(db)
+            if current_version <= 37:
+                _migrate_v37_to_v38(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1076,7 +1127,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Supersession: non-null claim so UNIQUE actually binds"),
+                (SCHEMA_VERSION, "Wandering librarian: patrol_visits + wander_state"),
             )
 
 
@@ -1819,4 +1870,16 @@ def _migrate_v26_to_v27(db: DatabaseEngine) -> None:
 
 def _migrate_v27_to_v28(db: DatabaseEngine) -> None:
     """Directional canopy tables — all CREATE IF NOT EXISTS, no data migration."""
+    pass
+
+
+def _migrate_v37_to_v38(db: DatabaseEngine) -> None:
+    """Wandering librarian tables.
+
+    Both are CREATE IF NOT EXISTS in TABLES and start empty — there is no
+    back-fill to do.  An existing install's memories.swept_at is NOT copied
+    into patrol_visits: swept_at belongs to LinearSweep's errand, and
+    seeding a different errand's cursor from it would claim coverage the
+    new errand never performed.
+    """
     pass

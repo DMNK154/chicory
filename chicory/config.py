@@ -296,6 +296,24 @@ class ChicoryConfig(BaseModel):
     librarian_sweep_drift_threshold: float = Field(default=0.15)
     subject_min_edge_strength: float = Field(default=0.05)
     subject_min_cluster_size: int = Field(default=3)
+    # Hysteresis on component formation.
+    #
+    # edge_strength is inert as a gate: record_co_retrieval creates every
+    # edge at centroid_edge_ema_alpha (0.15), three times this floor, and
+    # EMA only ever raises it.  Measured on a 124K library, the minimum
+    # edge_strength in the whole table is exactly 0.15 — so *every* edge
+    # that has ever existed is in the graph, and a SINGLE co-retrieval
+    # permanently welds two tags into one component.  200 retrievals
+    # created 1,560 such edges (+0.97% of the graph) and re-partitioned
+    # 70% of the shelf tree, 45 shelves to 65.
+    #
+    # Evidence is the gate that matters, so these are counts, not
+    # strengths, and they are asymmetric: holding two tags together takes
+    # one co-retrieval, merging two previously-separate groups takes
+    # several.  Three matches the bar the demand ledger already uses for
+    # promotion (faq_promote_min_hits, commission_min_hits).
+    subject_edge_keep_min_count: int = Field(default=1)
+    subject_edge_merge_min_count: int = Field(default=3)
     subject_max_name_tags: int = Field(default=3)
     # Stop-tag rule: tags on more than this fraction of live memories are
     # format/hub tags (document, pdf), not topics — excluded from subjects
@@ -350,6 +368,26 @@ class ChicoryConfig(BaseModel):
     penumbra_buried_min_near: int = Field(default=5)
     recall_max_subjects: int = Field(default=4)
 
+    # Wandering librarian — the heartbeat and its errands.
+    #
+    # Every other background phase is traffic-paced: the thread that runs
+    # them is spawned by a retrieval, so an idle library does no work at
+    # all.  The heartbeat gives that thread a clock of its own.  It does
+    # NOT bypass the foreground: it calls the same background pass, which
+    # already yields the DB lock between phases.
+    wander_enabled: bool = Field(default=True)
+    wander_tick_seconds: float = Field(default=30.0)
+    # Consecutive ticks that observed no foreground activity before the
+    # library counts as idle.  Errands marked idle-only wait for this.
+    wander_idle_ticks: int = Field(default=4)
+    wander_batch_size: int = Field(default=50)
+    wander_interval_minutes: float = Field(default=5.0)
+    # Errands the patrol runs, in order.  Names must be registered in
+    # chicory.layer4.wander.ERRANDS; unknown names are logged and skipped.
+    wander_errands: list[str] = Field(
+        default_factory=lambda: ["missing_embedding"]
+    )
+
     # Commons Layer — cross-project signal federation
     commons_enabled: bool = Field(default=False)
     commons_db_path: Path = Field(
@@ -403,6 +441,10 @@ def load_config(**overrides) -> ChicoryConfig:
         # so it belongs in the environment rather than the shipped defaults.
         "CHICORY_GATE_ENFORCE": "librarian_gate_enforce",
         "CHICORY_GATE_THRESHOLD": "librarian_gate_threshold",
+        # The heartbeat runs work while nobody is watching, so whether it
+        # runs at all is a per-install decision like gate enforcement.
+        "CHICORY_WANDER_ENABLED": "wander_enabled",
+        "CHICORY_WANDER_TICK_SECONDS": "wander_tick_seconds",
     }
     for env_key, config_key in mapping.items():
         if env_key in env and env[env_key]:

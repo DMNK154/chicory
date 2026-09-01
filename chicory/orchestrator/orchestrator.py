@@ -51,6 +51,7 @@ from chicory.layer4.librarian import (
 )
 from chicory.layer4.meta_analyzer import MetaAnalyzer
 from chicory.layer4.forest import ForestReorganizer
+from chicory.layer4.wander import Heartbeat, Patrol
 from chicory.layer1.glyph_analyzer import analyze_text, extract_glyph_tags
 from chicory.models.memory import Memory, Tag
 from chicory.models.synchronicity import SynchronicityEvent
@@ -199,6 +200,15 @@ class Orchestrator:
             closure=self._closure,
         )
 
+        # The wandering librarian — errands with their own cursors, and a
+        # clock so they advance when nobody is talking to the library.
+        self._patrol = Patrol(config, self._db, self._memory_store._embedding)
+        self._heartbeat = Heartbeat(
+            config,
+            tick=self._heartbeat_tick,
+            busy=self._foreground_waiting.is_set,
+        )
+
         # Rate limiting for detection — initialise to "now" so the first
         # retrieval isn't blocked by expensive sync/meta detection.
         self._last_sync_check: datetime | None = datetime.utcnow()
@@ -207,6 +217,10 @@ class Orchestrator:
         self._last_demand_check: datetime | None = datetime.utcnow()
         self._last_ingress_check: datetime | None = None  # settle promptly
         self._last_ingress_prune: datetime | None = None
+        # The patrol has its own per-errand intervals, so this only stops
+        # every background pass from re-entering it.
+        self._last_patrol_check: datetime | None = None
+        self._background_idle = False
 
         # Diagnostics — activation trace + context log
         self._prev_trace = None
@@ -669,6 +683,9 @@ class Orchestrator:
 
     def close(self) -> None:
         """Close database connection and signal emitter."""
+        # Stop the clock before the connection goes: a beat landing on a
+        # closed database would log an exception per tick forever.
+        self._heartbeat.stop()
         if self._signal_emitter:
             self._signal_emitter.stop()
         if hasattr(self, "_commons_conn"):
@@ -1290,6 +1307,7 @@ class Orchestrator:
                     },
                     "penumbra": self._penumbra_ledger.stats(),
                     "ingress": self._ingress.stats(),
+                    "wander": self.wander_status(),
                 }
         finally:
             self._foreground_waiting.clear()
@@ -1455,13 +1473,20 @@ class Orchestrator:
         finally:
             self._foreground_waiting.clear()
 
-    def handle_librarian_maintain(self) -> dict[str, Any]:
-        """Manual maintenance: sweep a batch, rebuild subjects, process demand."""
+    def handle_librarian_maintain(self, cold_rebuild: bool = False) -> dict[str, Any]:
+        """Manual maintenance: sweep a batch, rebuild subjects, process demand.
+
+        The roster rebuild is warm by default — it inherits the standing
+        tree's shape so shelf paths stay stable as addresses.  Pass
+        cold_rebuild to re-derive the tree from the geometry instead,
+        which WILL move paths and retire shelves; it is the deliberate
+        escape hatch, not routine maintenance.
+        """
         self._foreground_waiting.set()
         try:
             with self._foreground_db_lock:
                 sweep_stats = self._linear_sweep.run_batch()
-                roster_stats = self._subject_roster.rebuild()
+                roster_stats = self._subject_roster.rebuild(cold=cold_rebuild)
                 # Same guard as the background phase: FAQ promotion does a
                 # live retrieval, and a FAISS rebuild must never happen
                 # while holding the foreground lock.
@@ -3193,7 +3218,7 @@ class Orchestrator:
         )
         thread.start()
 
-    def _sync_detection_background(self) -> None:
+    def _sync_detection_background(self, idle: bool = False) -> None:
         """Run deferred retrieval work, sync detection, and commons in background.
 
         Waits briefly for the foreground lock so we don't write to the
@@ -3208,12 +3233,18 @@ class Orchestrator:
         # the lock independently — if a foreground retrieval arrives, it
         # gets served between phases instead of waiting for the entire
         # background pass to finish.
+        # Whether this pass came from the heartbeat's quiet run or from a
+        # retrieval — read by the patrol, which holds idle-only errands back
+        # while somebody is using the library.
+        self._background_idle = idle
+
         phases = [
             ("deferred retrieval work", self._run_deferred_retrieval_work),
             ("sync detection", self._maybe_run_sync_detection),
             ("linear sweep", self._maybe_run_linear_sweep),
             ("demand processing", self._maybe_run_demand_processing),
             ("ingress settle", self._maybe_settle_ingress),
+            ("patrol", self._maybe_run_patrol),
         ]
         if self._signal_processor:
             phases.append(("commons auto-process", self._commons_auto_process))
@@ -3623,6 +3654,83 @@ class Orchestrator:
                 "Linear sweep: %d memories, findings %s",
                 stats["swept"], stats["findings"],
             )
+
+    # ── The wandering librarian ─────────────────────────────────────
+
+    def _maybe_run_patrol(self) -> None:
+        """Advance the patrol's errands, each on its own cursor.
+
+        Unlike the sweep, this is not one walk with one question: each
+        errand carries its own visit stamps in patrol_visits, so a repair
+        errand emptying its queue and a survey errand walking the whole
+        library do not share a position.
+        """
+        if not self._config.wander_enabled:
+            return
+        now = datetime.utcnow()
+        if (
+            self._last_patrol_check is not None
+            and (now - self._last_patrol_check).total_seconds() < 30
+        ):
+            return
+        self._last_patrol_check = now
+
+        stats = self._patrol.run_due(
+            idle=self._background_idle,
+            # The patrol is the last phase, so it holds the lock longest;
+            # let it drop a batch mid-way when a request arrives rather
+            # than making the patron wait for the whole errand.
+            should_stop=self._foreground_waiting.is_set,
+        )
+        worked = [e for e in stats.get("errands", []) if e.get("examined")]
+        if worked:
+            logging.getLogger(__name__).info("Patrol: %s", worked)
+
+    def _heartbeat_tick(self, idle: bool) -> None:
+        """One beat: run the ordinary background pass on our own clock."""
+        self._sync_detection_background(idle=idle)
+
+    def start_heartbeat(self) -> bool:
+        """Start the background clock.  Idempotent; False if disabled."""
+        return self._heartbeat.start()
+
+    def stop_heartbeat(self) -> None:
+        self._heartbeat.stop()
+
+    def wander_status(self) -> dict:
+        """What the patrol is doing and how far each errand has walked."""
+        from chicory.layer4.wander import ERRANDS
+
+        records = {r.errand: r for r in self._patrol.state.all()}
+        errands = []
+        for name in self._config.wander_errands:
+            errand = ERRANDS.get(name)
+            rec = records.get(name)
+            errands.append({
+                "errand": name,
+                "known": errand is not None,
+                "when": errand.when if errand else None,
+                # Capped: an exact count is a full scan of the memories
+                # table per errand, which a status call cannot afford.
+                "remaining_at_least": (
+                    self._patrol.population_size(errand, cap=1000)
+                    if errand else None
+                ),
+                "lap": rec.lap if rec else 0,
+                "visited": rec.visited_count if rec else 0,
+                "acted": rec.acted_count if rec else 0,
+                "runs": rec.runs if rec else 0,
+                "enabled": rec.enabled if rec else True,
+                "last_run_at": rec.last_run_at if rec else None,
+                "last_result": rec.last_result if rec else None,
+            })
+        return {
+            "enabled": self._config.wander_enabled,
+            "tick_seconds": self._config.wander_tick_seconds,
+            "ticks": self._heartbeat.ticks,
+            "idle": self._heartbeat.idle,
+            "errands": errands,
+        }
 
     def _maybe_settle_ingress(self) -> None:
         """Close dwells whose window has elapsed, and prune old receipts.
