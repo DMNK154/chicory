@@ -448,6 +448,50 @@ CHICORY_TOOLS = [
         },
     },
     {
+        "name": "librarian_tag",
+        "description": (
+            "Attach a tag to memories that already exist. This is the one "
+            "act the gap map licenses and nothing else can perform: the "
+            "map says a concept is discussed in thousands of memories and "
+            "no tag holds it, and this closes that. Pass concept= to take "
+            "the target set from the wandering librarian's own reading "
+            "rather than from a retrieval — retrieval could not find these, "
+            "which is why the concept is a gap. Previews by default."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["preview", "apply"],
+                    "description": (
+                        "preview (default) changes nothing and reports what "
+                        "would be attached. Tagging thousands of memories "
+                        "moves tag centroids, and the shelf tree is derived "
+                        "from those, so this is a considered act."
+                    ),
+                },
+                "tag": {"type": "string", "description": "The tag to attach."},
+                "concept": {
+                    "type": "string",
+                    "description": (
+                        "Take the memories from this recorded concept gap "
+                        "— the ones the walk actually read the term in."
+                    ),
+                },
+                "memory_ids": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Explicit targets, instead of concept.",
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Byline recorded on every attachment.",
+                },
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
         "name": "librarian_closure",
         "description": (
             "Specialist closure — settle what a piece of work overturned. "

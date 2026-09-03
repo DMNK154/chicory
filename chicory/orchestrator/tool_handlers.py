@@ -42,6 +42,7 @@ def dispatch_tool_call(
         "librarian_desk": _handle_librarian_desk,
         "librarian_closure": _handle_librarian_closure,
         "librarian_gaps": _handle_librarian_gaps,
+        "librarian_tag": _handle_librarian_tag,
     }
 
     handler = handlers.get(tool_name)
@@ -257,4 +258,15 @@ def _handle_librarian_gaps(o: "Orchestrator", inp: dict) -> dict:
         subject=inp.get("subject"),
         limit=inp.get("limit", 20),
         min_confirmations=inp.get("min_confirmations", 2),
+    )
+
+
+def _handle_librarian_tag(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_tag(
+        action=inp.get("action", "preview"),
+        tag=inp.get("tag"),
+        concept=inp.get("concept"),
+        memory_ids=inp.get("memory_ids"),
+        author=inp.get("author"),
+        limit=inp.get("limit", 5000),
     )

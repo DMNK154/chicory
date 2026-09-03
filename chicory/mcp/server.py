@@ -985,6 +985,44 @@ def librarian_gaps(
     return _call(ctx, "librarian_gaps", inp)
 
 
+@mcp_server.tool()
+def librarian_tag(
+    ctx: Context,
+    action: Optional[str] = None,
+    tag: Optional[str] = None,
+    concept: Optional[str] = None,
+    memory_ids: Optional[list] = None,
+    author: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """Attach a tag to memories that already exist.
+
+    The one act the gap map licenses and nothing else could perform. The
+    map says a concept is discussed in thousands of memories, names the
+    tags those memories already carry, and reports that no tag holds the
+    concept itself. This closes that — turning something the library
+    talks about into something it can retrieve by.
+
+    concept=... takes the target set from the wandering librarian's own
+    reading rather than from a retrieval. That distinction is the point:
+    retrieval could not find these memories, which is why the concept was
+    a gap in the first place.
+
+    Previews by default and changes nothing. Tagging thousands of
+    memories moves tag centroids, and the shelf tree is derived from
+    those — so it is a considered act, not a cleanup. Follow an apply
+    with librarian_maintain to fold the new tag into the roster.
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("tag", tag), ("concept", concept),
+        ("memory_ids", memory_ids), ("author", author), ("limit", limit),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_tag", inp)
+
+
 # ── Entry point ─────────────────────────────────────────────────────
 
 

@@ -2230,3 +2230,81 @@ class TestFaqGap:
         g = self._orch(stack)._faq_gap("kabbalah", ["m1"])
         assert g["would_complete_it"] == []
         assert "cover this question" in g["verdict"]
+
+
+class TestLibrarianTag:
+    """The one act the gap map licenses and nothing else could perform.
+
+    The map says malchut is discussed in 3,972 memories, every one already
+    tagged kabbalah, and no tag holds it. Reading that and being unable to
+    act on it is exactly where a specialist stopped.
+    """
+
+    def _orch(self, stack):
+        from chicory.orchestrator.orchestrator import Orchestrator
+        from chicory.layer1.tag_manager import TagManager
+        from chicory.layer3.centroid_subgraph import CentroidSubgraph
+        o = Orchestrator.__new__(Orchestrator)
+        o._db = stack["db"]; o._config = stack["config"]
+        o._tag_manager = TagManager(stack["db"])
+        o._centroid_subgraph = CentroidSubgraph(
+            stack["config"], stack["db"], stack["emb"])
+        import threading
+        o._foreground_waiting = threading.Event()
+        o._foreground_db_lock = threading.RLock()
+        return o
+
+    def test_preview_changes_nothing(self, stack):
+        for m in ("m1", "m2"):
+            _insert_memory(stack["db"], m)
+        out = self._orch(stack).handle_librarian_tag(
+            tag="malchut", memory_ids=["m1", "m2"])
+        assert out["would_attach"] == 2
+        assert out["tag_exists"] is False
+        assert "note" in out
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM memory_tags").fetchone()["n"] == 0
+
+    def test_apply_attaches_and_creates_the_tag(self, stack):
+        for m in ("m1", "m2"):
+            _insert_memory(stack["db"], m)
+            stack["emb"].store_cached(m, _basis_vec(0))
+        out = self._orch(stack).handle_librarian_tag(
+            action="apply", tag="malchut", memory_ids=["m1", "m2"],
+            author="specialist:zohar")
+        assert out["status"] == "applied"
+        assert out["tag_now_holds"] == 2
+        assert out["author"] == "specialist:zohar"
+        rows = stack["db"].execute(
+            "SELECT assigned_by FROM memory_tags").fetchall()
+        assert {r["assigned_by"] for r in rows} == {"specialist:zohar"}
+
+    def test_a_tag_without_a_centroid_stays_unreachable(self, stack):
+        """Creating the tag is not enough — the write gate, subject
+        membership and query-side matching all key on the centroid."""
+        for m in ("m1", "m2"):
+            _insert_memory(stack["db"], m)
+            stack["emb"].store_cached(m, _basis_vec(0))
+        out = self._orch(stack).handle_librarian_tag(
+            action="apply", tag="malchut", memory_ids=["m1", "m2"])
+        assert out["centroid_from_memories"] == 2
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM tag_centroids").fetchone()["n"] == 1
+
+    def test_applying_twice_does_not_double_attach(self, stack):
+        _insert_memory(stack["db"], "m1")
+        stack["emb"].store_cached("m1", _basis_vec(0))
+        o = self._orch(stack)
+        o.handle_librarian_tag(action="apply", tag="t", memory_ids=["m1"])
+        second = o.handle_librarian_tag(action="apply", tag="t", memory_ids=["m1"])
+        assert second["already_tagged"] == 1
+        assert second["would_attach"] == 0
+        assert second["tag_now_holds"] == 1
+
+    def test_an_unrecorded_concept_is_refused(self, stack):
+        out = self._orch(stack).handle_librarian_tag(
+            tag="malchut", concept="never-walked")
+        assert "no recorded concept gap" in out["error"]
+
+    def test_a_tag_is_required(self, stack):
+        assert "error" in self._orch(stack).handle_librarian_tag(memory_ids=["m1"])

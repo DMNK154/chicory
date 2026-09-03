@@ -117,6 +117,42 @@ class CentroidSubgraph:
         ).fetchall()
         return {r["tag_id"]: _blob_to_array(r["centroid"]) for r in rows}
 
+    def rebuild_centroid_for_tag(self, tag_id: int) -> int:
+        """Recompute one tag's centroid from the memories now carrying it.
+
+        A tag with no centroid is invisible to everything that matters —
+        the write gate, subject membership, query-side tag matching — so
+        creating a tag without this leaves it as unreachable as the gap it
+        was meant to close.  Targeted rather than a full rebuild, which
+        recomputes every tag in the library.
+        """
+        rows = self._db.execute(
+            "SELECT mt.memory_id FROM memory_tags mt "
+            "JOIN memories m ON m.id = mt.memory_id "
+            "WHERE mt.tag_id = ? AND m.is_archived = 0 "
+            "AND m.ingestion_tier != 'quarantine'",
+            (tag_id,),
+        ).fetchall()
+        if not rows:
+            return 0
+        cached = self._embedding_engine.get_all_cached()
+        vecs = [cached[r["memory_id"]] for r in rows if r["memory_id"] in cached]
+        if not vecs:
+            return 0
+        centroid = np.mean(vecs, axis=0).astype(np.float32)
+        norm = float(np.linalg.norm(centroid))
+        if norm > 0:
+            centroid = centroid / norm
+        self._db.execute(
+            "INSERT INTO tag_centroids (centroid, memory_count, tag_id) "
+            "VALUES (?, ?, ?) ON CONFLICT(tag_id) DO UPDATE SET "
+            "centroid = excluded.centroid, memory_count = excluded.memory_count, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')",
+            (_array_to_blob(centroid), len(vecs), tag_id),
+        )
+        self._db.connection.commit()
+        return len(vecs)
+
     def rebuild_centroids(self) -> int:
         """Full recomputation of all tag centroids from embeddings.
 

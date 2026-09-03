@@ -2174,6 +2174,163 @@ class Orchestrator:
         finally:
             self._foreground_waiting.clear()
 
+    def handle_librarian_tag(
+        self,
+        action: str = "preview",
+        tag: str | None = None,
+        concept: str | None = None,
+        memory_ids: list[str] | None = None,
+        author: str | None = None,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        """Attach a tag to memories that already exist.
+
+        This is the one act the gap map licenses and nothing could
+        perform: the map says `malchut` is discussed in 3,972 memories,
+        every one already tagged kabbalah and hebrew, and no tag holds it.
+        Reading that and being unable to act on it is where a specialist
+        stopped.
+
+        `concept` takes the target set from the walk's own observation
+        rather than from a guess — the memories are the ones the errand
+        actually read the term in, not the ones a retrieval thinks are
+        similar. That distinction is the whole point: retrieval could not
+        find these, which is why the concept is a gap.
+
+        preview is the default and changes nothing, because a tag applied
+        to thousands of memories is not a small act: it moves centroids,
+        and centroids are what the shelf tree is derived from.
+        """
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action not in ("preview", "apply"):
+                    return {"error": f"Unknown action: {action}"}
+                if not tag:
+                    return {"error": "tag is required"}
+
+                targets: list[str] = list(memory_ids or [])
+                source = "explicit"
+                if concept and not targets:
+                    targets = self._memories_discussing(concept, limit)
+                    source = f"concept:{concept}"
+                    if not targets:
+                        return {
+                            "error": (
+                                f"no recorded concept gap for {concept!r} — "
+                                f"run the concept_gaps errand first"
+                            )
+                        }
+                if not targets:
+                    return {"error": "give either concept or memory_ids"}
+
+                existing = self._tag_manager.get_by_name(tag)
+                already = 0
+                if existing is not None:
+                    ph = ",".join("?" * len(targets))
+                    row = self._db.execute(
+                        f"SELECT COUNT(*) AS n FROM memory_tags "
+                        f"WHERE tag_id = ? AND memory_id IN ({ph})",
+                        (existing.id, *targets),
+                    ).fetchone()
+                    already = row["n"] if row else 0
+
+                preview = {
+                    "tag": tag,
+                    "tag_exists": existing is not None,
+                    "source": source,
+                    "memories": len(targets),
+                    "already_tagged": already,
+                    "would_attach": len(targets) - already,
+                    "sample": targets[:5],
+                }
+                if action == "preview":
+                    preview["note"] = (
+                        "nothing changed. Tagging thousands of memories "
+                        "moves tag centroids, and the shelf tree is derived "
+                        "from those — so this is a considered act, not a "
+                        "cleanup. Re-run with action='apply' to commit."
+                    )
+                    return preview
+
+                tag_obj = self._tag_manager.get_or_create(
+                    tag, created_by=author or "librarian:tagged",
+                )
+                self._db.executemany(
+                    "INSERT OR IGNORE INTO memory_tags "
+                    "(memory_id, tag_id, assigned_by) VALUES (?, ?, ?)",
+                    [(mid, tag_obj.id, author or "librarian:tagged")
+                     for mid in targets],
+                )
+                self._db.connection.commit()
+                row = self._db.execute(
+                    "SELECT COUNT(*) AS n FROM memory_tags WHERE tag_id = ?",
+                    (tag_obj.id,),
+                ).fetchone()
+                # The centroid is what makes a tag reachable; without it
+                # the tag exists and retrieval still cannot use it.
+                embedded = self._centroid_subgraph.rebuild_centroid_for_tag(
+                    tag_obj.id,
+                )
+                preview.update({
+                    "status": "applied",
+                    "tag_id": tag_obj.id,
+                    "tag_now_holds": row["n"] if row else 0,
+                    "author": author or "librarian:tagged",
+                    "centroid_from_memories": embedded,
+                    "next": (
+                        "run librarian_maintain to fold the new tag into "
+                        "the shelf roster"
+                    ),
+                })
+                return preview
+        finally:
+            self._foreground_waiting.clear()
+
+    def _memories_discussing(self, concept: str, limit: int) -> list[str]:
+        """The memories the walk actually read this concept in.
+
+        Recovered by re-reading rather than stored, because storing every
+        memory id for 7,847 concepts would dwarf the observations
+        themselves. The observation names the documents; this narrows to
+        those and applies the same test the errand applied.
+        """
+        import json as _json
+        import re as _re
+        from collections import Counter
+        from chicory.layer4.wander import _CONCEPT_RE, _CONCEPT_STOPWORDS
+
+        row = self._db.execute(
+            "SELECT data FROM patrol_observations WHERE kind = 'concept_gap' "
+            "AND subject = ? AND retracted = 0", (concept,),
+        ).fetchone()
+        if row is None:
+            return []
+        try:
+            docs = _json.loads(row["data"]).get("documents", [])
+        except (ValueError, TypeError):
+            docs = []
+        if not docs:
+            return []
+        ph = ",".join("?" * len(docs))
+        rows = self._db.execute(
+            f"SELECT id, content FROM memories WHERE is_archived = 0 "
+            f"AND source_path IN ({ph}) LIMIT ?",
+            (*docs, limit * 4),
+        ).fetchall()
+        needed = self._config.concept_min_mentions
+        out = []
+        for r in rows:
+            hits = Counter(
+                t.lower() for t in _CONCEPT_RE.findall(r["content"] or "")
+                if t.lower() not in _CONCEPT_STOPWORDS
+            )
+            if hits.get(concept.lower(), 0) >= needed:
+                out.append(r["id"])
+            if len(out) >= limit:
+                break
+        return out
+
     def handle_librarian_commissions(
         self,
         action: str = "list",
