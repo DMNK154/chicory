@@ -277,11 +277,24 @@ CHICORY_TOOLS = [
         "description": (
             "Run one librarian maintenance pass now: sweep the next batch "
             "of the shelf-reading patrol, rebuild the subject roster, and "
-            "process the demand ledger (FAQ promotion, commission filing)."
+            "process the demand ledger (FAQ promotion, commission filing). "
+            "The roster rebuild is warm by default, inheriting the standing "
+            "tree's shape so shelf paths stay stable as addresses."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "cold_rebuild": {
+                    "type": "boolean",
+                    "description": (
+                        "Re-derive the subject tree from the geometry "
+                        "instead of inheriting the standing shape. This "
+                        "WILL move shelf paths and retire shelves, "
+                        "orphaning addresses that digests and commissions "
+                        "quote. Deliberate reset only."
+                    ),
+                },
+            },
         },
     },
     {

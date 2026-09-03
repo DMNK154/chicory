@@ -257,12 +257,12 @@ class TestLinearSweep:
 # ── SubjectRoster ───────────────────────────────────────────────────────
 
 
-def _edge(db, a: int, b: int, strength: float = 0.5) -> None:
+def _edge(db, a: int, b: int, strength: float = 0.5, count: int = 1) -> None:
     lo, hi = min(a, b), max(a, b)
     db.execute(
         "INSERT OR REPLACE INTO centroid_edges "
-        "(tag_a_id, tag_b_id, edge_strength, co_retrieval_count) VALUES (?, ?, ?, 1)",
-        (lo, hi, strength),
+        "(tag_a_id, tag_b_id, edge_strength, co_retrieval_count) VALUES (?, ?, ?, ?)",
+        (lo, hi, strength, count),
     )
 
 
@@ -406,10 +406,12 @@ def _mem(mid: str) -> Memory:
 
 
 class _StubStore:
-    """Stub memory_store: DemandLedger only calls retrieve_hybrid."""
+    """Stub memory_store: DemandLedger calls retrieve_hybrid, and reaches
+    for _embedding to recover queries recorded without a vector."""
 
-    def __init__(self, results):
+    def __init__(self, results, embedding=None):
         self.results = results
+        self._embedding = embedding
 
     def retrieve_hybrid(self, query, tags=None, top_k=None):
         return self.results
@@ -725,6 +727,69 @@ class TestReviewFixes:
         ledger.record("popular", _basis_vec(0), 5, 0.8)
         stats2 = ledger.process_batch(allow_retrieval=True)
         assert stats2["faq_candidates"] == 1  # retried, not lost
+
+    def test_deferred_promotion_retries_with_no_new_traffic(self, stack):
+        """The retry above only worked because a new query arrived with it.
+
+        process_batch used to return early on an empty batch, so promotion —
+        the retry path for a cluster deferred while the index was unbuilt —
+        never ran unless fresh traffic happened to arrive.  A cluster
+        deferred just as the library went quiet was never promoted at all.
+        """
+        _insert_memory(stack["db"], "sup1")
+        faq = FaqDesk(stack["config"], stack["db"])
+        commissions = CommissionDesk(stack["config"], stack["db"])
+        ledger = DemandLedger(
+            stack["config"], stack["db"],
+            _StubStore([(_mem("sup1"), 0.9)]),
+            faq, commissions, stack["roster"],
+        )
+        for _i in range(3):
+            ledger.record("popular", _basis_vec(0), 5, 0.8)
+        assert ledger.process_batch(allow_retrieval=False)["faq_candidates"] == 0
+
+        # Nothing new recorded — the library has gone quiet.
+        stats = ledger.process_batch(allow_retrieval=True)
+        assert stats["processed"] == 0
+        assert stats["faq_candidates"] == 1
+
+    def test_query_recorded_without_a_vector_is_recovered(self, stack):
+        ledger = DemandLedger(
+            stack["config"], stack["db"],
+            _StubStore([], embedding=MockEmbeddingEngine(dimension=DIM)),
+            FaqDesk(stack["config"], stack["db"]),
+            CommissionDesk(stack["config"], stack["db"]),
+            stack["roster"],
+        )
+        ledger.record("a question nobody could embed", None, 0, 0.0)
+        stats = ledger.process_batch(allow_retrieval=False)
+        assert stats["recovered_embeddings"] == 1
+        assert stats["dropped_unembeddable"] == 0
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_clusters"
+        ).fetchone()["n"] == 1
+
+    def test_unembeddable_query_is_counted_and_does_not_block(self, stack):
+        """No engine to recover with: the loss must be reported, and the row
+        must still leave the queue or it starves everything behind it."""
+        ledger = DemandLedger(
+            stack["config"], stack["db"], _StubStore([]),
+            FaqDesk(stack["config"], stack["db"]),
+            CommissionDesk(stack["config"], stack["db"]),
+            stack["roster"],
+        )
+        ledger.record("unembeddable", None, 0, 0.0)
+        ledger.record("fine", _basis_vec(0), 5, 0.8)
+        stats = ledger.process_batch(allow_retrieval=False)
+        assert stats["dropped_unembeddable"] == 1
+        assert stats["processed"] == 2
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_history WHERE processed = 0"
+        ).fetchone()["n"] == 0
+        # The healthy query still clustered.
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_clusters"
+        ).fetchone()["n"] == 1
 
     def test_closed_commission_not_refiled_by_demand(self, stack):
         faq = FaqDesk(stack["config"], stack["db"])
@@ -1353,3 +1418,259 @@ class TestFuzzyAddressing:
         res = stack["roster"].resolve("rocket league")
         assert "match" in res, res
         assert tid in res["match"]["member_tag_ids"]
+
+
+class TestComponentHysteresis:
+    """Component formation must not be a knife-edge.
+
+    edge_strength cannot gate this: record_co_retrieval creates every edge
+    at centroid_edge_ema_alpha (0.15), three times subject_min_edge_strength
+    (0.05), so one co-retrieval used to weld two tags together forever.
+    Measured on the real library, 200 retrievals re-partitioned 70% of the
+    shelf tree.  Evidence gates it instead, asymmetrically.
+    """
+
+    def _shelf(self, stack, names: list[str], base: int, count: int = 5):
+        ids = []
+        for i, name in enumerate(names):
+            tid = _insert_tag(stack["db"], name)
+            _insert_centroid(stack["db"], tid, _basis_vec(base), memory_count=10 - i)
+            ids.append(tid)
+        for i in range(len(ids) - 1):
+            _edge(stack["db"], ids[i], ids[i + 1], count=count)
+        return ids
+
+    def _paths(self, stack):
+        return {
+            r["path"]
+            for r in stack["db"].execute(
+                "SELECT path FROM subjects WHERE status = 'active'"
+            ).fetchall()
+        }
+
+    def test_cold_start_forms_a_partition_from_single_co_retrievals(self, stack):
+        """With no prior roster there is nothing to hold still, so a fresh
+        install must still cluster from one-off evidence."""
+        self._shelf(stack, ["physics", "quantum", "energy"], base=0, count=1)
+        self._shelf(stack, ["cooking", "recipes"], base=1, count=1)
+        assert stack["roster"].rebuild()["subjects_active"] == 2
+
+    def test_single_co_retrieval_cannot_merge_established_shelves(self, stack):
+        a = self._shelf(stack, ["physics", "quantum", "energy"], base=0)
+        b = self._shelf(stack, ["cooking", "recipes"], base=1)
+        assert stack["roster"].rebuild()["subjects_active"] == 2
+
+        # One accidental co-retrieval bridging the two shelves.
+        _edge(stack["db"], a[0], b[0], count=1)
+        assert stack["roster"].rebuild()["subjects_active"] == 2
+
+    def test_repeated_co_retrieval_does_merge(self, stack):
+        a = self._shelf(stack, ["physics", "quantum", "energy"], base=0)
+        b = self._shelf(stack, ["cooking", "recipes"], base=1)
+        stack["roster"].rebuild()
+
+        # Seen together often enough to be structure, not noise.
+        _edge(stack["db"], a[0], b[0], count=3)
+        stack["roster"].rebuild()
+        roots = stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM subjects WHERE status = 'active' AND depth = 0"
+        ).fetchone()
+        assert roots["n"] == 1
+
+    def test_established_shelf_survives_on_weak_internal_edges(self, stack):
+        """The keep threshold is the low one: a shelf held together by
+        single co-retrievals must not fragment on the next rebuild."""
+        self._shelf(stack, ["physics", "quantum", "energy"], base=0, count=1)
+        first = stack["roster"].rebuild()
+        assert first["subjects_active"] == 1
+        before = self._paths(stack)
+        assert stack["roster"].rebuild()["subjects_active"] == 1
+        assert self._paths(stack) == before
+
+    def test_new_tag_needs_evidence_to_join_a_shelf(self, stack):
+        ids = self._shelf(stack, ["physics", "quantum", "energy"], base=0)
+        stack["roster"].rebuild()
+        phys = stack["roster"].list_subjects()[0]
+        assert len(phys["member_tag_ids"]) == 3
+
+        newcomer = _insert_tag(stack["db"], "thermodynamics")
+        _insert_centroid(stack["db"], newcomer, _basis_vec(0), memory_count=4)
+        _edge(stack["db"], ids[0], newcomer, count=1)
+        stack["roster"].rebuild()
+        phys = next(
+            s for s in stack["roster"].list_subjects()
+            if s["name"].startswith("physics")
+        )
+        assert newcomer not in phys["member_tag_ids"]
+
+        # Same tag, more evidence — now it belongs.
+        _edge(stack["db"], ids[0], newcomer, count=3)
+        stack["roster"].rebuild()
+        phys = next(
+            s for s in stack["roster"].list_subjects()
+            if s["name"].startswith("physics")
+        )
+        assert newcomer in phys["member_tag_ids"]
+
+    def test_rebuild_stays_idempotent(self, stack):
+        """Hysteresis makes the roster depend on the roster before it; it
+        must still converge rather than oscillate."""
+        self._shelf(stack, ["physics", "quantum", "energy"], base=0)
+        self._shelf(stack, ["cooking", "recipes"], base=1)
+        stack["roster"].rebuild()
+        first = self._paths(stack)
+        stack["roster"].rebuild()
+        second = self._paths(stack)
+        stack["roster"].rebuild()
+        assert first == second == self._paths(stack)
+
+    def test_keep_threshold_can_prune_one_off_edges(self, stack):
+        """Raising the keep bar drops single co-retrievals entirely — the
+        knob that would have made edge_strength meaningful."""
+        stack["config"].subject_edge_keep_min_count = 2
+        self._shelf(stack, ["physics", "quantum", "energy"], base=0, count=1)
+        assert stack["roster"].rebuild()["subjects_active"] == 0
+
+
+class TestSplitInheritance:
+    """The split must inherit the standing tree's shape, not re-derive it.
+
+    k-means++ seeds with an index drawn from the array's LENGTH, so a few
+    new tags reseed the whole clustering — measured, six new tags in a
+    1,020-tag root re-partitioned all three levels below it.  Warm seeding
+    takes its centres from the previous roster's grouping instead.
+    """
+
+    def _tags_in_groups(self, stack, n_groups: int, per_group: int):
+        """n_groups well-separated bundles of tags; returns list of id lists."""
+        out = []
+        for g in range(n_groups):
+            ids = []
+            for i in range(per_group):
+                tid = _insert_tag(stack["db"], f"g{g}t{i}")
+                _insert_centroid(stack["db"], tid, _basis_vec(g), memory_count=5)
+                ids.append(tid)
+            out.append(ids)
+        return out
+
+    def test_warm_centers_need_two_usable_prior_groups(self, stack):
+        groups = self._tags_in_groups(stack, 1, 4)
+        have = groups[0]
+        matrix = np.stack([_basis_vec(0) for _ in have])
+        prior = {t: 99 for t in have}          # all one prior shelf
+        assert stack["roster"]._warm_centers(have, matrix, prior) is None
+
+    def test_prior_groups_below_min_size_are_ignored(self, stack):
+        groups = self._tags_in_groups(stack, 2, 1)   # one tag each
+        have = [t for g in groups for t in g]
+        matrix = np.stack([_basis_vec(i) for i in range(len(have))])
+        prior = {have[0]: 1, have[1]: 2}
+        # min_cluster_size is 2 in this fixture, so neither group qualifies.
+        assert stack["roster"]._warm_centers(have, matrix, prior) is None
+
+    def test_warm_centers_are_the_prior_group_means(self, stack):
+        groups = self._tags_in_groups(stack, 2, 3)
+        have = [t for g in groups for t in g]
+        matrix = np.stack(
+            [_basis_vec(0)] * 3 + [_basis_vec(1)] * 3
+        )
+        prior = {t: 10 for t in groups[0]} | {t: 20 for t in groups[1]}
+        C = stack["roster"]._warm_centers(have, matrix, prior)
+        assert C.shape == (2, DIM)
+        # Each centre is the unit mean of its prior group — here, the basis
+        # vector that group was built from.
+        assert {round(float(np.dot(c, _basis_vec(0))), 3) for c in C} == {0.0, 1.0}
+
+    def test_split_arity_is_inherited_not_recomputed(self, stack):
+        """The observable shape property: k comes from the prior grouping."""
+        groups = self._tags_in_groups(stack, 3, 4)   # 12 tags, 3 prior shelves
+        cluster = {t for g in groups for t in g}
+
+        cold = stack["roster"]._split_in_centroid_space(cluster)
+        assert len(cold) == 2          # sqrt(12/2) rounds to 2
+
+        prior = {}
+        for leaf, g in enumerate(groups, start=1):
+            for t in g:
+                prior[t] = leaf
+        warm = stack["roster"]._split_in_centroid_space(cluster, prior_leaf=prior)
+        assert len(warm) == 3          # inherited from the standing roster
+        assert {frozenset(c) for c in warm} == {frozenset(g) for g in groups}
+
+    def test_new_tags_join_without_reseeding_the_split(self, stack):
+        groups = self._tags_in_groups(stack, 3, 4)
+        cluster = {t for g in groups for t in g}
+        prior = {}
+        for leaf, g in enumerate(groups, start=1):
+            for t in g:
+                prior[t] = leaf
+
+        before = stack["roster"]._split_in_centroid_space(cluster, prior_leaf=prior)
+
+        # Two newcomers with no prior shelf, sitting near group 0.
+        for i in range(2):
+            tid = _insert_tag(stack["db"], f"newcomer{i}")
+            _insert_centroid(stack["db"], tid, _basis_vec(0), memory_count=3)
+            cluster.add(tid)
+
+        after = stack["roster"]._split_in_centroid_space(cluster, prior_leaf=prior)
+        assert len(after) == len(before) == 3
+        # Every originally-grouped tag keeps its companions; only the new
+        # tags moved in.
+        for g in groups:
+            landed = [c for c in after if set(g) & c]
+            assert len(landed) == 1, "a prior group was split across children"
+            assert set(g) <= landed[0]
+
+    def test_inheritance_is_level_aware(self, stack):
+        """Seeding from the roster's leaves flattens the tree; seeding from
+        the next level down preserves it."""
+        roster = stack["roster"]
+        rows = [
+            (1, 0, [10, 11, 12, 13]),      # root
+            (2, 1, [10, 11]),              # its two children
+            (3, 1, [12, 13]),
+            (4, 2, [10]),                  # grandchildren
+            (5, 2, [11]),
+        ]
+        for sid, depth, tags in rows:
+            stack["db"].execute(
+                "INSERT INTO subjects (id, name, member_tag_ids, status, depth) "
+                "VALUES (?, ?, ?, 'active', ?)",
+                (sid, f"n{sid}", json.dumps(tags), depth),
+            )
+        by_depth = roster._prior_by_depth()
+        assert set(by_depth) == {0, 1, 2}
+        # Depth 1 groups the root's tags into the two shelves that level
+        # held — not into the four a leaf-view would produce.
+        assert set(by_depth[1].values()) == {2, 3}
+        assert set(by_depth[2].values()) == {4, 5}
+
+    def test_rebuild_reports_its_mode(self, stack):
+        tid_a = _insert_tag(stack["db"], "physics")
+        tid_b = _insert_tag(stack["db"], "quantum")
+        for t in (tid_a, tid_b):
+            _insert_centroid(stack["db"], t, _basis_vec(0))
+        _edge(stack["db"], tid_a, tid_b, count=5)
+        assert stack["roster"].rebuild()["mode"] == "warm"
+        assert stack["roster"].rebuild(cold=True)["mode"] == "cold"
+
+    def test_cold_rebuild_drops_the_inheritance(self, stack):
+        """Cold ignores the standing roster — including its merge bar."""
+        a = _insert_tag(stack["db"], "physics")
+        b = _insert_tag(stack["db"], "cooking")
+        for t, base in ((a, 0), (b, 1)):
+            _insert_centroid(stack["db"], t, _basis_vec(base))
+        c = _insert_tag(stack["db"], "quantum")
+        _insert_centroid(stack["db"], c, _basis_vec(0))
+        _edge(stack["db"], a, c, count=5)
+        stack["roster"].rebuild()
+
+        # A single weak bridge: warm refuses the merge, cold accepts it.
+        _edge(stack["db"], a, b, count=1)
+        warm_roots = stack["roster"].rebuild()["subjects_active"]
+        cold_roots = stack["roster"].rebuild(cold=True)["subjects_active"]
+        assert warm_roots == 1
+        assert cold_roots == 1  # cooking joins, still one shelf — but merged
+        merged = stack["roster"].list_subjects()[0]
+        assert b in merged["member_tag_ids"]

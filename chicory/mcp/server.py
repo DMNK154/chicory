@@ -147,6 +147,16 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             except Exception:
                 logger.exception("Glyph encoder load failed (will use letter-count fallback)")
 
+        # The heartbeat starts LAST, and inside the warmup thread rather
+        # than beside it.  Its errands embed and retrieve, so starting it
+        # before the model and index are up would have the patrol racing
+        # the warmup for the same cold locks this thread exists to pay off.
+        try:
+            if orchestrator.start_heartbeat():
+                logger.info("Heartbeat running — patrol advances while idle")
+        except Exception:
+            logger.exception("Heartbeat failed to start (library stays traffic-paced)")
+
     import threading
     threading.Thread(
         target=_background_warmup, name="chicory-warmup", daemon=True,
@@ -889,15 +899,22 @@ def librarian_recall(
 
 
 @mcp_server.tool()
-def librarian_maintain(ctx: Context) -> str:
+def librarian_maintain(ctx: Context, cold_rebuild: bool = False) -> str:
     """Run one librarian maintenance pass now: sweep the next batch of
     the shelf-reading patrol and rebuild the subject roster from the
     tag co-retrieval graph.
 
     The sweep also runs automatically in the background on an interval;
     this tool forces a batch immediately.
+
+    The roster rebuild is WARM by default: it inherits the standing tree's
+    component boundaries and split shape, so shelf paths stay stable as
+    addresses across rebuilds.  Pass cold_rebuild=True to re-derive the
+    tree from the geometry instead — that will move paths and retire
+    shelves, orphaning addresses that digests and commissions quote, so
+    it is a deliberate reset rather than routine maintenance.
     """
-    return _call(ctx, "librarian_maintain", {})
+    return _call(ctx, "librarian_maintain", {"cold_rebuild": cold_rebuild})
 
 
 # ── Entry point ─────────────────────────────────────────────────────
