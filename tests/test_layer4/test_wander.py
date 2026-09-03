@@ -850,3 +850,20 @@ def test_counters_accumulate_across_passes(stack):
          if o["subject"] == "malchut"][0]["data"])
     assert data["co"]["chochmah"] == 2      # summed, not overwritten
     assert data["mentions"] == 2
+
+
+def test_a_tabular_chunk_is_skipped_not_paired(stack):
+    """A locale table put 870 language names in one chunk; pairing them
+    emitted a clique that swamped the net."""
+    db, p = stack["db"], stack["patrol"]
+    many = " ".join(f"{w} {w} {w} {w}." for w in
+                    ("Abkhazian", "Achinese", "Acholi", "Adyghe", "Afrikaans",
+                     "Aleut", "Amharic", "Angika", "Arabic", "Aragonese"))
+    _doc_mem(db, "table", many)
+    _doc_mem(db, "prose", "Malchut Malchut Malchut Malchut.")
+    p.run_errand("concept_gaps", batch_size=10)
+    row = db.execute("SELECT verdict, detail FROM patrol_visits "
+                     "WHERE memory_id='table'").fetchone()
+    assert row["verdict"] == "skipped"
+    assert "tabular" in row["detail"]
+    assert [o["subject"] for o in p.observations(kind="concept_gap")] == ["malchut"]

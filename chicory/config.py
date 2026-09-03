@@ -353,6 +353,13 @@ class ChicoryConfig(BaseModel):
     # than something it mentions.  Four was calibrated on this corpus:
     # three admitted 'that' and 'great' alongside malchut and tiferet.
     concept_min_mentions: int = Field(default=4)
+    # A chunk that is "about" more terms than this is a list or a table,
+    # not prose, and its terms all co-occur with each other by layout
+    # rather than by meaning.  One CLDR locale file put 870 language names
+    # in a single chunk and its clique swamped the net.  Measured on this
+    # corpus the honest distribution is median 0, p99 4 — so 8 discards
+    # 0.2% of memories and precisely the tabular ones.
+    concept_max_terms_per_memory: int = Field(default=8)
     # A document raising more gap terms than this is a dump or a save
     # file, not a subject; pairing its terms would emit a dense clique
     # that says nothing (Rocket League telemetry alone contributes
@@ -361,12 +368,17 @@ class ChicoryConfig(BaseModel):
     # Jaccard over document sets: how much of each gap's material the two
     # share, not whether they touched once.
     #
-    # 0.6 is a measured knee, and the failure below it is the one the
-    # shelf tree already taught: at 0.2 everything chains into a single
-    # 1,893-concept blob that says nothing. 0.6 breaks that to a largest
-    # component of 33 with 186 legible clusters, and tightening further
-    # buys almost nothing (6,838 edges at 0.6 against 6,749 at 1.0).
-    gap_edge_min_weight: float = Field(default=0.6)
+    # 0.10, and the number only makes sense against the metric it grades.
+    # It was 0.6 when edges were Jaccard over DOCUMENTS; over MEMORIES the
+    # same relationship scores far lower — malchut and anpin share 756
+    # memories out of ~4,000, which is a strong association and a Jaccard
+    # of 0.19. At 0.6 the entire Kabbalah vocabulary had no edges at all.
+    #
+    # Measured: 0.10 keeps malchut-anpin-binah and yields 456 clusters
+    # that name individual works by their own vocabulary — the Tractatus
+    # in German, Leviathan in 17th-century spelling, the Tibetan corpus.
+    # 0.2 breaks the largest chain but loses those relationships with it.
+    gap_edge_min_weight: float = Field(default=0.10)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the

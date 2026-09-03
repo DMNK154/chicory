@@ -1049,6 +1049,13 @@ def _concept_gaps(
             if term.lower() not in _CONCEPT_STOPWORDS
         )
         about = [t for t, n in hits.items() if n >= config.concept_min_mentions]
+        if len(about) > config.concept_max_terms_per_memory:
+            # A chunk about this many terms is a table, not prose: its
+            # terms co-occur by layout rather than by meaning.  One CLDR
+            # locale file put 870 language names in a single chunk and its
+            # clique swamped the whole net.
+            verdicts[mid] = ("skipped", f"tabular: {len(about)} terms")
+            continue
         memory_tags = tags_by_memory.get(mid, [])
         for term in about:
             seen[term] += 1
