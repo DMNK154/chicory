@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 
 TABLES = [
     # -- Schema version tracking --
@@ -43,7 +43,18 @@ TABLES = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_memories_salience ON memories(salience_composite DESC)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash) WHERE content_hash IS NOT NULL",
+    # Uniqueness is per DOCUMENT, not per library.
+    #
+    # A global unique hash silently shredded every document revision: a
+    # chunk byte-identical to anything already stored was dropped whatever
+    # file it came from, so 57 versions of one paper kept only the passages
+    # that differed from all their predecessors. The final version retained
+    # one chunk of twenty-seven. Nothing marked the survivor as a fragment.
+    #
+    # Scoped this way, re-ingesting a file still dedups against itself,
+    # while text shared with a sibling revision is kept once per document.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_hash "
+    "ON memories(source_path, content_hash) WHERE content_hash IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed)",
     "CREATE INDEX IF NOT EXISTS idx_memories_source_path ON memories(source_path) WHERE source_path IS NOT NULL",
@@ -1173,6 +1184,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v38_to_v39(db)
             if current_version <= 39:
                 _migrate_v39_to_v40(db)
+            if current_version <= 40:
+                _migrate_v40_to_v41(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1186,7 +1199,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Patrol observations: authored deposits from the wandering librarian"),
+                (SCHEMA_VERSION, "Per-document content hashing: stop dedup shredding revisions"),
             )
 
 
@@ -1972,3 +1985,19 @@ def _migrate_v39_to_v40(db: DatabaseEngine) -> None:
     its contents were actually noticed.
     """
     pass
+
+
+def _migrate_v40_to_v41(db: DatabaseEngine) -> None:
+    """Retire the global unique hash index in favour of a per-document one.
+
+    The old index is dropped rather than left alongside: while it exists,
+    a second document containing a passage identical to a first cannot be
+    stored at all, which is the whole defect.
+
+    Nothing is re-ingested here.  Chunks already dropped were never
+    written, so there is nothing in this database to repair — recovering
+    them means reading the source files again, which is a deliberate act,
+    not a migration.
+    """
+    db.execute("DROP INDEX IF EXISTS idx_memories_content_hash")
+    db.connection.commit()

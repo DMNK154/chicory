@@ -86,12 +86,24 @@ def ingest_file(
     # Compute all content hashes up front
     chunk_hashes = [_content_hash(c.text) for c in chunks]
 
-    # Batch dedup: single indexed query instead of per-chunk LIKE scan
+    # Dedup is scoped to THIS document, not the whole library.
+    #
+    # Unscoped, a chunk identical to anything already stored was dropped
+    # whatever file it came from, so successive drafts of the same paper
+    # each kept only their novel passages — 57 revisions of one manuscript,
+    # the final version retaining a single chunk of twenty-seven, and
+    # nothing marking that survivor as a fragment.
+    #
+    # Scoped, re-ingesting a file still skips what it already contributed,
+    # which is what dedup was for; and re-ingesting a shredded document
+    # fills in exactly the chunks that went missing.
+    source_key = path.name
     placeholders = ",".join("?" for _ in chunk_hashes)
     existing_hashes = set()
     rows = orchestrator.db.execute(
-        f"SELECT content_hash FROM memories WHERE content_hash IN ({placeholders})",
-        tuple(chunk_hashes),
+        f"SELECT content_hash FROM memories "
+        f"WHERE source_path = ? AND content_hash IN ({placeholders})",
+        (source_key, *chunk_hashes),
     ).fetchall()
     for row in rows:
         existing_hashes.add(row["content_hash"])
@@ -137,6 +149,12 @@ def ingest_file(
             content_hash=content_hash,
             skip_embedding=True,
             defer_side_effects=True,
+            # The origin was previously recorded only inside the summary
+            # text, which made file-level provenance parseable by eye and
+            # queryable by nothing: 0 of 123,907 memories had this set.
+            # The basename matches what the summary already encodes, and
+            # what the patrol back-filled for legacy rows.
+            source_path=source_key,
         )
         new_ids.append(result["memory_id"])
         existing_hashes.add(content_hash)
