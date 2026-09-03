@@ -1674,3 +1674,145 @@ class TestSplitInheritance:
         assert cold_roots == 1  # cooking joins, still one shelf — but merged
         merged = stack["roster"].list_subjects()[0]
         assert b in merged["member_tag_ids"]
+
+
+class TestFaqDeskSurface:
+    """The FAQ desk as something a person can actually work.
+
+    `list` returned supporting memory *ids*, so judging a draft meant
+    fetching each source yourself.  `show` hydrates the card with what an
+    approver has to read, and names the conditions that should stop an
+    approval outright.
+    """
+
+    def _orch_stub(self, stack):
+        """Minimal stand-in exercising the handler helpers directly."""
+        from chicory.layer4.closure import ClosureLedger
+        from chicory.layer1.tag_manager import TagManager
+        from chicory.orchestrator.orchestrator import Orchestrator
+
+        obj = Orchestrator.__new__(Orchestrator)
+        obj._db = stack["db"]
+        obj._config = stack["config"]
+        obj._closure = ClosureLedger(stack["config"], stack["db"])
+        obj._tag_manager = TagManager(stack["db"])
+        obj._faq_desk = FaqDesk(stack["config"], stack["db"])
+        return obj
+
+    def _card(self, stack, supporting, status="candidate", subject_ids=None):
+        faq = FaqDesk(stack["config"], stack["db"])
+        fid = faq.create_candidate(
+            "what is a sefirah", _basis_vec(0), "- draft line one",
+            supporting, subject_ids or [],
+        )
+        if status != "candidate":
+            stack["db"].execute(
+                "UPDATE faq_entries SET status = ? WHERE id = ?", (status, fid),
+            )
+        return fid
+
+    def test_list_reports_the_tally_across_states(self, stack):
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1")
+        self._card(stack, ["s1"])
+        self._card(stack, ["s1"], status="active")
+        self._card(stack, ["s1"], status="retired")
+        out = o._faq_list("candidate", 20)
+        assert out["counts"] == {
+            "candidate": 1, "active": 1, "stale": 0, "retired": 1,
+        }
+        assert len(out["entries"]) == 1
+        assert out["entries"][0]["supporting_count"] == 1
+
+    def test_empty_queue_still_says_what_exists_elsewhere(self, stack):
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1")
+        self._card(stack, ["s1"], status="stale")
+        out = o._faq_list("candidate", 20)
+        assert out["entries"] == []
+        assert out["counts"]["stale"] == 1
+
+    def test_show_hydrates_the_sources(self, stack):
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1", content="a sefirah is an emanation")
+        fid = self._card(stack, ["s1"])
+        out = o._faq_show(fid)
+        assert out["faq_id"] == fid
+        assert out["mechanical"] is True
+        assert out["total_sources"] == 1
+        assert out["usable_sources"] == 1
+        assert out["supporting"][0]["content"] == "a sefirah is an emanation"
+        assert out["supporting"][0]["usable"] is True
+        assert out["blockers"] == []
+
+    def test_show_blocks_on_an_archived_source(self, stack):
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1")
+        stack["db"].execute("UPDATE memories SET is_archived = 1 WHERE id = 's1'")
+        out = o._faq_show(self._card(stack, ["s1"]))
+        assert out["usable_sources"] == 0
+        assert any("archived" in b for b in out["blockers"])
+
+    def test_show_blocks_on_a_quarantined_source(self, stack):
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1", tier="quarantine")
+        out = o._faq_show(self._card(stack, ["s1"]))
+        assert out["supporting"][0]["usable"] is False
+        assert out["blockers"]
+
+    def test_show_blocks_on_a_superseded_source(self, stack):
+        """The check that matters most: closure refuted it after promotion."""
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1")
+        _insert_memory(stack["db"], "report1")
+        o._closure.supersede(
+            "s1", "report1", actor="specialist:test", claim="the old claim",
+        )
+        out = o._faq_show(self._card(stack, ["s1"]))
+        assert out["supporting"][0]["superseded"] is True
+        assert out["usable_sources"] == 0
+        assert any("superseded" in b for b in out["blockers"])
+        assert out["verdict_hint"].startswith("blocked")
+
+    def test_show_reports_a_vanished_source(self, stack):
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1")
+        fid = self._card(stack, ["s1", "gone-forever"])
+        out = o._faq_show(fid)
+        assert out["supporting_missing"] == ["gone-forever"]
+        assert any("no longer exist" in b for b in out["blockers"])
+
+    def test_show_flags_a_retired_shelf_rather_than_printing_an_id(self, stack):
+        """subject_ids are captured at promotion; the roster moves under them."""
+        o = self._orch_stub(stack)
+        _insert_memory(stack["db"], "s1")
+        stack["db"].execute(
+            "INSERT INTO subjects (id, name, member_tag_ids, status, depth) "
+            "VALUES (7, 'gnosis+hermetica', '[]', 'retired', 0)"
+        )
+        out = o._faq_show(self._card(stack, ["s1"], subject_ids=[7, 999]))
+        by_id = {x["subject_id"]: x for x in out["subjects"]}
+        assert by_id[7]["status"] == "retired"
+        assert by_id[7]["label"] == "gnosis+hermetica"
+        assert by_id[999]["status"] == "gone"
+        assert by_id[999]["label"] is None
+
+    def test_show_on_a_missing_card_is_an_error_not_a_crash(self, stack):
+        assert "error" in self._orch_stub(stack)._faq_show(9999)
+
+    def test_stale_pulls_an_active_card_back(self, stack):
+        stack_db = stack["db"]
+        _insert_memory(stack_db, "s1")
+        faq = FaqDesk(stack["config"], stack_db)
+        fid = self._card(stack, ["s1"], status="active")
+        assert faq.retire_to_stale(fid) is True
+        row = stack_db.execute(
+            "SELECT status FROM faq_entries WHERE id = ?", (fid,)
+        ).fetchone()
+        assert row["status"] == "stale"
+
+    def test_retired_cards_do_not_go_stale(self, stack):
+        _insert_memory(stack["db"], "s1")
+        faq = FaqDesk(stack["config"], stack["db"])
+        fid = self._card(stack, ["s1"], status="retired")
+        assert faq.retire_to_stale(fid) is False

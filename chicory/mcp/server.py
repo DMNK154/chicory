@@ -675,14 +675,23 @@ def librarian_faq(
     status: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> str:
-    """FAQ desk management.
+    """The FAQ desk — crystallized answers, and the drafts awaiting judgment.
 
-    action='list' (default): status='candidate' lists drafts awaiting
-    judgment; status='active'/'stale'/'retired' lists entries.
-    action='approve': activate a candidate (faq_id; optional answer
-    rewrite and author byline). Approval is the judgment step — only
-    approved entries are served on the fast path.
-    action='retire': permanently retire an entry (faq_id).
+    Only 'active' entries are served on the consult fast path. A
+    'candidate' is a mechanical draft the demand ledger promoted because
+    a question kept recurring; nobody has verified it.
+
+    action='list' (default): the queue for one `status`, plus a tally
+    across all four states so an empty queue is legible.
+    action='show': one card (faq_id) hydrated with its supporting
+    memories' text, tags, provenance and custody, the shelves it was
+    filed under, and any blockers — a source archived, quarantined, or
+    superseded by a later report. Judge from this, not from list.
+    action='approve': activate it (faq_id, plus answer and author). The
+    mechanical draft is a list of citations, not prose — rewrite it.
+    action='stale': pull a served card back for rebuilding, when the
+    question still stands but the answer no longer does.
+    action='retire': permanent. Nothing reopens a retired card.
     """
     inp: dict = {}
     for key, val in (

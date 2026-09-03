@@ -1658,15 +1658,19 @@ class Orchestrator:
         try:
             with self._foreground_db_lock:
                 if action == "list":
-                    if status == "candidate":
-                        return {"candidates": self._faq_desk.candidates(limit)}
-                    rows = self._db.execute(
-                        "SELECT id, question_text, answer, status, hit_count, "
-                        "author, last_verified_at FROM faq_entries "
-                        "WHERE status = ? ORDER BY hit_count DESC LIMIT ?",
-                        (status, limit),
-                    ).fetchall()
-                    return {"entries": [dict(r) for r in rows]}
+                    return self._faq_list(status, limit)
+                if action == "show":
+                    if faq_id is None:
+                        return {"error": "show requires faq_id"}
+                    return self._faq_show(faq_id)
+                if action == "stale":
+                    if faq_id is None:
+                        return {"error": "stale requires faq_id"}
+                    ok = self._faq_desk.retire_to_stale(faq_id)
+                    return (
+                        {"status": "stale", "faq_id": faq_id} if ok
+                        else {"error": f"FAQ {faq_id} not found or retired"}
+                    )
                 if action == "approve":
                     if faq_id is None:
                         return {"error": "approve requires faq_id"}
@@ -1686,6 +1690,175 @@ class Orchestrator:
                 return {"error": f"Unknown action: {action}"}
         finally:
             self._foreground_waiting.clear()
+
+    _FAQ_STATUSES = ("candidate", "active", "stale", "retired")
+
+    def _faq_list(self, status: str, limit: int) -> dict[str, Any]:
+        """The desk view: how many cards sit in each state, then one queue.
+
+        The tally rides along with every listing because the states are a
+        pipeline, not independent buckets — a patron looking at an empty
+        candidate queue needs to know whether that means "nothing to judge"
+        or "everything already went stale".
+        """
+        counts = {
+            r["status"]: r["n"]
+            for r in self._db.execute(
+                "SELECT status, COUNT(*) AS n FROM faq_entries GROUP BY status"
+            ).fetchall()
+        }
+        rows = self._db.execute(
+            "SELECT id, question_text, answer, status, hit_count, author, "
+            "supporting_memory_ids, created_at, last_verified_at "
+            "FROM faq_entries WHERE status = ? "
+            "ORDER BY hit_count DESC, created_at ASC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+        entries = []
+        for r in rows:
+            try:
+                supporting = json.loads(r["supporting_memory_ids"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                supporting = []
+            entries.append({
+                "faq_id": r["id"],
+                "question": r["question_text"],
+                "status": r["status"],
+                "hit_count": r["hit_count"],
+                "author": r["author"],
+                "supporting_count": len(supporting),
+                "created_at": r["created_at"],
+                "last_verified_at": r["last_verified_at"],
+                # Enough to recognise a card, never enough to judge one.
+                # Saying so here is deliberate: the draft is a citation
+                # list, and a preview of it reads far more finished than
+                # the card actually is.
+                "draft_preview": (r["answer"] or "")[:180],
+            })
+        return {
+            "counts": {s: counts.get(s, 0) for s in self._FAQ_STATUSES},
+            "listing": status,
+            "entries": entries,
+            "next": (
+                "librarian_faq action=show faq_id=<id> for the full card"
+                if entries else f"nothing in state {status!r}"
+            ),
+        }
+
+    def _faq_show(self, faq_id: int) -> dict[str, Any]:
+        """One card, hydrated with what an approver actually has to read.
+
+        `list` hands back supporting memory *ids*, so judging a draft meant
+        going and fetching each one yourself.  This returns the card with
+        its sources' text, provenance and custody attached, plus the two
+        checks that should block an approval outright: a supporting memory
+        that has gone (archived or quarantined), and one that a later
+        report has superseded.
+        """
+        r = self._db.execute(
+            "SELECT * FROM faq_entries WHERE id = ?", (faq_id,),
+        ).fetchone()
+        if r is None:
+            return {"error": f"FAQ {faq_id} not found"}
+        try:
+            supporting_ids = json.loads(r["supporting_memory_ids"])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            supporting_ids = []
+
+        mems = {}
+        if supporting_ids:
+            ph = ",".join("?" * len(supporting_ids))
+            for m in self._db.execute(
+                f"SELECT id, summary, content, author, ingestion_tier, "
+                f"custody_status, is_archived, salience_composite, source_path "
+                f"FROM memories WHERE id IN ({ph})", tuple(supporting_ids),
+            ).fetchall():
+                mems[m["id"]] = m
+        refuted = self._closure.superseded_among(supporting_ids)
+        tags_map = self._tag_manager.get_tags_for_memories(list(mems))
+
+        supporting, missing = [], []
+        for mid in supporting_ids:
+            m = mems.get(mid)
+            if m is None:
+                missing.append(mid)
+                continue
+            gone = bool(m["is_archived"]) or m["ingestion_tier"] == "quarantine"
+            supporting.append({
+                "memory_id": mid,
+                "summary": m["summary"],
+                "content": m["content"],
+                "source_path": m["source_path"],
+                "tags": tags_map.get(mid, []),
+                "author": m["author"],
+                "tier": m["ingestion_tier"],
+                "custody": m["custody_status"],
+                "salience": round(m["salience_composite"] or 0.0, 3),
+                "archived": bool(m["is_archived"]),
+                "superseded": mid in refuted,
+                "usable": not gone and mid not in refuted,
+            })
+
+        try:
+            subject_ids = json.loads(r["subject_ids"])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            subject_ids = []
+        subjects = []
+        if subject_ids:
+            ph = ",".join("?" * len(subject_ids))
+            found = {
+                row["id"]: row for row in self._db.execute(
+                    f"SELECT id, name, display_name, status, path FROM subjects "
+                    f"WHERE id IN ({ph})", tuple(subject_ids),
+                ).fetchall()
+            }
+            for sid in subject_ids:
+                row = found.get(sid)
+                subjects.append({
+                    "subject_id": sid,
+                    # Shelves are re-derived on every roster rebuild, so an
+                    # id captured at promotion time can name a retired node
+                    # or nothing at all.  Say which, rather than printing a
+                    # number that reads as authoritative.
+                    "label": (
+                        (row["display_name"] or row["name"]) if row else None
+                    ),
+                    "status": row["status"] if row else "gone",
+                })
+
+        blockers = []
+        if missing:
+            blockers.append(f"{len(missing)} supporting memories no longer exist")
+        n_gone = sum(
+            1 for x in supporting if x["archived"] or x["tier"] == "quarantine"
+        )
+        if n_gone:
+            blockers.append(f"{n_gone} archived or quarantined")
+        if refuted:
+            blockers.append(f"{len(refuted)} superseded by a later report")
+
+        return {
+            "faq_id": r["id"],
+            "question": r["question_text"],
+            "status": r["status"],
+            "author": r["author"],
+            "hit_count": r["hit_count"],
+            "created_at": r["created_at"],
+            "last_verified_at": r["last_verified_at"],
+            "draft_answer": r["answer"],
+            "mechanical": r["author"] == "librarian:mechanical",
+            "subjects": subjects,
+            "supporting": supporting,
+            "supporting_missing": missing,
+            "usable_sources": sum(1 for x in supporting if x["usable"]),
+            "total_sources": len(supporting_ids),
+            "blockers": blockers,
+            "verdict_hint": (
+                "blocked — resolve the blockers before approving"
+                if blockers else
+                "approve with a rewritten answer, or retire if unsupported"
+            ),
+        }
 
     def handle_librarian_commissions(
         self,

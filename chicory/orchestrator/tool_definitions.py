@@ -323,22 +323,48 @@ CHICORY_TOOLS = [
     {
         "name": "librarian_faq",
         "description": (
-            "FAQ desk management. list (status candidate/active/stale/"
-            "retired), approve (activate a candidate, optional answer "
-            "rewrite + author byline), retire. Only approved entries are "
-            "served on the consult fast path."
+            "The FAQ desk — the card file of crystallized answers, and the "
+            "queue of drafts waiting on judgment. Only 'active' entries are "
+            "served on the consult fast path; a 'candidate' is a mechanical "
+            "draft nobody has verified yet. Workflow: list to see the queue "
+            "and the tally across states, show to read one card with its "
+            "sources, then approve with a rewritten answer or retire it."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "approve", "retire"],
+                    "enum": ["list", "show", "approve", "retire", "stale"],
+                    "description": (
+                        "list — the queue for one status, plus counts across "
+                        "all four. show — one card hydrated with its "
+                        "supporting memories' text, provenance, custody and "
+                        "any blockers; this is what judgment needs, since "
+                        "list returns ids only. approve — activate it, "
+                        "normally with a rewritten answer and a byline. "
+                        "retire — permanent; nothing reopens it. stale — "
+                        "pull a served card back for rebuilding when the "
+                        "question is still good but the answer is not."
+                    ),
                 },
                 "faq_id": {"type": "integer"},
-                "answer": {"type": "string"},
-                "author": {"type": "string"},
-                "status": {"type": "string"},
+                "answer": {
+                    "type": "string",
+                    "description": (
+                        "The approved answer. The mechanical draft is a "
+                        "citation list, not prose — rewrite it."
+                    ),
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Byline for the approval, e.g. specialist:<subject>.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["candidate", "active", "stale", "retired"],
+                    "description": "Which queue to list. Defaults to candidate.",
+                },
                 "limit": {"type": "integer"},
             },
         },
