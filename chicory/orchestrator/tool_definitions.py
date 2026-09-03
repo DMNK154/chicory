@@ -420,7 +420,7 @@ CHICORY_TOOLS = [
                 "action": {
                     "type": "string",
                     "enum": ["list", "show", "confirm", "retire",
-                             "materialize", "propose"],
+                             "materialize", "propose", "triage"],
                     "description": (
                         "list (default) — the proposal queue. show — one "
                         "charter, its members, and the ring of concepts "

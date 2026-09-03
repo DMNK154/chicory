@@ -1060,6 +1060,10 @@ def meta_shelves(
     action='materialize' (slug): IRREVERSIBLE. Creates a tag per member and
       lets the roster derive the shelf as its own root. Tags thousands of
       memories, and nothing in the package can un-tag them.
+    action='triage': score the queue on whether each group is human prose
+      at all, and set aside what is not — a game's config file, a UI string
+      dump, source code. Those score WELL on concentration, which is why
+      they got this far. Read-only unless add=['apply'].
     action='propose': re-run the assembling pass.
     """
     inp: dict = {}

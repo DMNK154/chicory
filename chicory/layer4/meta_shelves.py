@@ -342,6 +342,57 @@ class MetaShelfProposer:
 
     # ── junk discrimination ─────────────────────────────────────────────
 
+    # English function words.  Deliberately a closed list rather than a
+    # frequency model: their share is a property of the SOURCE (is this
+    # discourse) and must not shift as the library's contents shift.
+    _FUNCTION_WORDS = frozenset(
+        "the of and to in that is it a for as with on by not be are was this "
+        "from or which but they he she we you his her their its at an have "
+        "has had will would there when what all so if no more one out up".split()
+    )
+    _WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019-]*")
+
+    def _prose_ratio(self, nodes: dict[str, dict], group: set[str]) -> float:
+        """Share of tokens that are function words, over the group's sources.
+
+        The gate the other two could not be.  docJ measures CONCENTRATION,
+        and a config file is perfectly concentrated — a League client
+        config scores 0.948 and a UI string dump 1.000, both better than
+        real subjects.  refHi only catches bibliographies.  Neither can say
+        that the material is not written language at all.
+
+        Function-word share can.  Prose in any European language runs a
+        quarter to a half; identifier lists, key/value dumps and UI strings
+        run under a tenth, because they have no grammar to carry.
+
+        Measured across all 93 standing proposals, the largest gap in the
+        entire distribution is 7.09 points wide and falls exactly here.
+        """
+        docs: set[str] = set()
+        for term in group:
+            docs |= nodes[term]["documents"]
+        if not docs:
+            return 0.0
+        sample = sorted(docs)[:6]
+        placeholders = ",".join("?" * len(sample))
+        rows = self._db.execute(
+            f"SELECT content FROM memories WHERE is_archived = 0 "
+            f"AND source_path IN ({placeholders}) LIMIT 40",
+            tuple(sample),
+        ).fetchall()
+        ratios = []
+        for r in rows:
+            words = self._WORD_RE.findall(r["content"] or "")
+            if len(words) < 30:      # too short to have a grammar to measure
+                continue
+            ratios.append(
+                sum(1 for w in words if w.lower() in self._FUNCTION_WORDS)
+                / len(words)
+            )
+        if not ratios:
+            return 0.0
+        return round(sum(ratios) / len(ratios), 4)
+
     def _doc_jaccard(self, nodes: dict[str, dict], group: set[str]) -> float:
         """Mean pairwise overlap of members' document sets.
 
@@ -439,7 +490,13 @@ class MetaShelfProposer:
                 continue
             docj = self._doc_jaccard(nodes, group)
             verdict, rule = "accept", None
-            if len(group) > cfg.meta_shelf_max_size:
+            # Prose first: it is one query and it is the only rule that can
+            # reject material which is not written language, which every
+            # other measure scores highly.
+            prose = self._prose_ratio(nodes, group)
+            if prose < cfg.meta_shelf_min_prose:
+                verdict, rule = "reject", f"not prose (function words {prose})"
+            elif len(group) > cfg.meta_shelf_max_size:
                 verdict, rule = "reject", f"too large ({len(group)})"
             elif docj < cfg.meta_shelf_min_docj:
                 verdict, rule = "reject", f"scattered (docJ {docj})"
@@ -459,6 +516,7 @@ class MetaShelfProposer:
                 "slug": self._slug_for(nodes, group),
                 "members": sorted(group, key=lambda t: -nodes[t]["mentions"]),
                 "docj": docj, "ref_hi": ref_hi, "qualified": qualified,
+                "prose": prose,
                 "arc_mean": arc_mean, "n": len(group), "rule": rule,
             }
             (accepted if verdict == "accept" else rejected).append(record)
@@ -527,10 +585,10 @@ class MetaShelfProposer:
         if row is None:
             self._db.execute(
                 "INSERT INTO meta_shelves (slug, status, origin, seed_json, "
-                "docj, ref_hi, arc_mean, n_core) "
-                "VALUES (?, 'proposed', 'patrol', ?, ?, ?, ?, ?)",
+                "docj, ref_hi, arc_mean, prose, n_core) "
+                "VALUES (?, 'proposed', 'patrol', ?, ?, ?, ?, ?, ?)",
                 (slug, seed, record["docj"], record["ref_hi"],
-                 record["arc_mean"], record["n"]),
+                 record["arc_mean"], record.get("prose"), record["n"]),
             )
             shelf_id = self._db.execute(
                 "SELECT id FROM meta_shelves WHERE slug = ?", (slug,),
@@ -539,10 +597,10 @@ class MetaShelfProposer:
             shelf_id = row["id"]
             self._db.execute(
                 "UPDATE meta_shelves SET seed_json = ?, docj = ?, ref_hi = ?, "
-                "arc_mean = ?, n_core = ?, "
+                "arc_mean = ?, prose = ?, n_core = ?, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
                 (seed, record["docj"], record["ref_hi"], record["arc_mean"],
-                 record["n"], shelf_id),
+                 record.get("prose"), record["n"], shelf_id),
             )
             self._db.execute(
                 "DELETE FROM meta_shelf_members WHERE shelf_id = ? "

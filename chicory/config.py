@@ -449,6 +449,26 @@ class ChicoryConfig(BaseModel):
     # A `co` key held by more than this many concepts says nothing about
     # any of them; it is a stopword of the corpus rather than of English.
     meta_shelf_co_stopword_holders: int = Field(default=400)
+    # Is the source human prose at all?
+    #
+    # The gate the other two could not be.  docJ measures CONCENTRATION,
+    # which a config file aces — a League client config scored 0.948 and a
+    # UI string dump 1.000, both better than real subjects.  What actually
+    # separates them is that they are not discourse.
+    #
+    # Measured as the share of tokens that are English function words,
+    # over a sample of each group's own documents.  Across all 93 standing
+    # proposals the LARGEST gap in the whole distribution is 7.09 points
+    # wide, between 11.35 and 18.44, and it falls exactly on the boundary:
+    # below it sit lodbias, mobilecontentscalefactor, baseeventid,
+    # aliasname, chicoryconfig, apply, authpsynetverbose, array, ffffff and
+    # dipromosikan; above it, nothing but prose.  Real groups run 25.5 to
+    # 44.3.  0.15 sits in the middle of that gap.
+    #
+    # It rejects machine text.  It cannot reject prose nobody wants
+    # shelved — one lab's cellulose vocabulary is genuine discourse — so
+    # it narrows the queue rather than emptying it.
+    meta_shelf_min_prose: float = Field(default=0.15)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the

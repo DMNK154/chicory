@@ -309,3 +309,68 @@ class TestOrthographicBridge:
         nodes = self._nodes(["gevurah"])
         nodes.update(self._nodes(["gevurat"], around={"polymer": 9, "cellulose": 7}))
         assert not _proposer()._ortho_bridges(nodes, set())
+
+
+class TestProseGate:
+    """The gate docJ could not be.
+
+    A config file is perfectly document-concentrated, so docJ scores it
+    ABOVE most real subjects — a League client config measured 0.948 and a
+    UI string dump 1.000. What separates them is that they are not written
+    language, and function-word share sees that at a distance: across 93
+    real proposals the largest gap in the whole distribution was 7.09
+    points wide and fell exactly on the boundary.
+    """
+
+    PROSE = (
+        "And it is said that on the left the smoke rose in his nostrils, "
+        "for the world does not exist save by the wind, which is the "
+        "central column, because the wind represents existence on all of "
+        "the sides that are included in it."
+    )
+    CONFIG = (
+        "lodBias=0 maxLodSize=0 mobileEnableMSAA=false aniso=16 "
+        "baseEventId=1024 curMeterMode=2 authPsyNetVerbose=true "
+        "toggleFadePressed onedriveSaving buttonFontMarkupString=none"
+    )
+
+    def _proposer(self, db, cfg):
+        from chicory.layer4.meta_shelves import MetaShelfProposer
+        return MetaShelfProposer(cfg, db)
+
+    def _seed(self, db, path: str, text: str, n: int = 4) -> None:
+        for i in range(n):
+            db.execute(
+                "INSERT OR IGNORE INTO memories (id, content, source_model, "
+                "source_path, ingestion_tier) VALUES (?, ?, 'test', ?, 'critical')",
+                (f"{path}-{i}", text, path))
+        db.connection.commit()
+
+    def test_prose_scores_far_above_the_gate(self, stack):
+        db, cfg = stack["db"], stack["config"]
+        self._seed(db, "zohar.pdf", self.PROSE)
+        nodes = {"smoke": {"documents": {"zohar.pdf"}}}
+        got = self._proposer(db, cfg)._prose_ratio(nodes, {"smoke"})
+        assert got > cfg.meta_shelf_min_prose, got
+
+    def test_a_config_file_falls_below_it(self, stack):
+        db, cfg = stack["db"], stack["config"]
+        self._seed(db, "settings.ini", self.CONFIG)
+        nodes = {"lodbias": {"documents": {"settings.ini"}}}
+        got = self._proposer(db, cfg)._prose_ratio(nodes, {"lodbias"})
+        assert got < cfg.meta_shelf_min_prose, got
+
+    def test_concentration_does_not_rescue_machine_text(self, stack):
+        """Both sit in exactly one document; only one is a subject."""
+        db, cfg = stack["db"], stack["config"]
+        self._seed(db, "zohar.pdf", self.PROSE)
+        self._seed(db, "settings.ini", self.CONFIG)
+        p = self._proposer(db, cfg)
+        nodes = {"smoke": {"documents": {"zohar.pdf"}},
+                 "lodbias": {"documents": {"settings.ini"}}}
+        assert p._doc_jaccard(nodes, {"smoke"}) == p._doc_jaccard(nodes, {"lodbias"})
+        assert p._prose_ratio(nodes, {"smoke"}) > p._prose_ratio(nodes, {"lodbias"})
+
+    def test_no_content_scores_zero_rather_than_passing(self, stack):
+        p = self._proposer(stack["db"], stack["config"])
+        assert p._prose_ratio({"x": {"documents": set()}}, {"x"}) == 0.0

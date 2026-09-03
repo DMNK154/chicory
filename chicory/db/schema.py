@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 44
+SCHEMA_VERSION = 45
 
 TABLES = [
     # -- Schema version tracking --
@@ -1155,6 +1155,7 @@ TABLES = [
         docj          REAL,
         ref_hi        REAL,
         arc_mean      REAL,
+        prose         REAL,
         n_core        INTEGER,
         confirmed_by  TEXT,
         confirmed_at  TEXT,
@@ -1286,6 +1287,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v42_to_v43(db)
             if current_version <= 43:
                 _migrate_v43_to_v44(db)
+            if current_version <= 44:
+                _migrate_v44_to_v45(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1299,7 +1302,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Meta-shelf charters: an authored subject the roster derives"),
+                (SCHEMA_VERSION, "Is the source prose at all: the gate docJ could not be"),
             )
 
 
@@ -2120,6 +2123,17 @@ def _migrate_v41_to_v42(db: DatabaseEngine) -> None:
 def _migrate_v42_to_v43(db: DatabaseEngine) -> None:
     """observation_edges is derived and rebuildable; nothing to migrate."""
     pass
+
+
+def _migrate_v44_to_v45(db: DatabaseEngine) -> None:
+    """Record each charter's prose score, so triage is reviewable."""
+    if not _has_table(db, "meta_shelves"):
+        return
+    cols = {r["name"] for r in db.execute(
+        "PRAGMA table_info(meta_shelves)").fetchall()}
+    if "prose" not in cols:
+        db.execute("ALTER TABLE meta_shelves ADD COLUMN prose REAL")
+    db.connection.commit()
 
 
 def _migrate_v43_to_v44(db: DatabaseEngine) -> None:

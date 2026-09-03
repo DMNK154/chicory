@@ -2100,6 +2100,7 @@ class Orchestrator:
         adds from.
 
         list        — the proposal queue
+        triage      — score the queue and set aside what is not prose
         show        — one proposal, its members, and the ring around it
         confirm     — assert that these concepts are one subject
         retire      — this is not a subject
@@ -2114,6 +2115,9 @@ class Orchestrator:
                     return MetaShelfProposer(self._config, self._db).propose()
                 if action == "list":
                     return self._meta_shelf_list(limit)
+                if action == "triage":
+                    return self._meta_shelf_triage(
+                        apply=bool(add), author=author)
                 if action == "show":
                     if not slug:
                         return {"error": "show requires slug"}
@@ -2176,6 +2180,91 @@ class Orchestrator:
                 "much they look like a bibliography.  Both are advisory — a "
                 "game's config file scores better than a real subject does."
             ) if out else "no proposals yet — run action='propose'",
+        }
+
+    def _meta_shelf_triage(
+        self, apply: bool = False, author: str | None = None,
+    ) -> dict[str, Any]:
+        """Sort the queue by how much of it a person actually has to judge.
+
+        Ninety-odd proposals is too many to read, and most of the reading is
+        wasted: a large share are not written language at all — a game's
+        config file, a UI string dump, this package's own source. They score
+        WELL on every measure the pass already had, because docJ rewards
+        concentration and a config file is perfectly concentrated.
+
+        Function-word share separates them, and not marginally. Across the
+        93 standing proposals the largest gap in the entire distribution is
+        7.09 points wide and lands exactly on the boundary.
+
+        What it CANNOT do is decide whether prose that is genuinely one
+        source's vocabulary deserves a shelf — one lab's cellulose
+        vocabulary is real discourse and still not a subject anybody wants.
+        So this narrows the queue; it does not empty it, and it never
+        confirms anything.
+
+        Read-only unless ``apply`` is set, in which case failing charters
+        are RETIRED — reversible, unlike materialization: a later pass will
+        re-propose anything that should not have gone.
+        """
+        from chicory.layer4.meta_shelves import MetaShelfProposer
+
+        proposer = MetaShelfProposer(self._config, self._db)
+        nodes = proposer._load_nodes()
+        gate = self._config.meta_shelf_min_prose
+
+        rows = self._db.execute(
+            "SELECT s.id, s.slug, s.docj, s.ref_hi, s.prose, "
+            "GROUP_CONCAT(m.concept, char(10)) AS names "
+            "FROM meta_shelves s JOIN meta_shelf_members m ON m.shelf_id = s.id "
+            "WHERE s.status = 'proposed' GROUP BY s.id"
+        ).fetchall()
+
+        keep, cut, unknown = [], [], []
+        for r in rows:
+            members = [n for n in (r["names"] or "").split("\n") if n]
+            known = {m for m in members if m in nodes}
+            if not known:
+                unknown.append({"slug": r["slug"], "members": len(members),
+                                "why": "no gap observation carries its members"})
+                continue
+            prose = proposer._prose_ratio(nodes, known)
+            self._db.execute(
+                "UPDATE meta_shelves SET prose = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
+                (prose, r["id"]))
+            rec = {"slug": r["slug"], "prose": prose, "docj": r["docj"],
+                   "members": len(members), "sample": members[:6]}
+            (cut if prose < gate else keep).append(rec)
+        self._db.connection.commit()
+
+        cut.sort(key=lambda x: x["prose"])
+        keep.sort(key=lambda x: -x["members"])
+        retired = 0
+        if apply and cut:
+            self._db.executemany(
+                "UPDATE meta_shelves SET status = 'retired', "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+                "WHERE slug = ? AND status = 'proposed'",
+                [(c["slug"],) for c in cut])
+            self._db.connection.commit()
+            retired = len(cut)
+
+        return {
+            "gate": gate,
+            "prose": len(keep),
+            "not_prose": len(cut),
+            "unscored": unknown,
+            "retired": retired,
+            "set_aside": cut,
+            "to_review": keep[:40],
+            "note": (
+                "Nothing was changed; pass add=['apply'] to retire the "
+                "not-prose set." if not apply else
+                f"{retired} retired. A later pass re-proposes anything that "
+                f"should not have gone — this is reversible, unlike "
+                f"materialization."
+            ),
         }
 
     def _meta_shelf_show(self, slug: str, limit: int) -> dict[str, Any]:
