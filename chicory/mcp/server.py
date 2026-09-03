@@ -674,6 +674,7 @@ def librarian_faq(
     author: Optional[str] = None,
     status: Optional[str] = None,
     limit: Optional[int] = None,
+    supporting_memory_ids: Optional[list] = None,
 ) -> str:
     """The FAQ desk — crystallized answers, and the drafts awaiting judgment.
 
@@ -697,6 +698,7 @@ def librarian_faq(
     for key, val in (
         ("action", action), ("faq_id", faq_id), ("answer", answer),
         ("author", author), ("status", status), ("limit", limit),
+        ("supporting_memory_ids", supporting_memory_ids),
     ):
         if val is not None:
             inp[key] = val

@@ -1460,27 +1460,41 @@ class FaqDesk:
         ]
 
     def approve(
-        self, faq_id: int, answer: str | None = None, author: str | None = None,
+        self,
+        faq_id: int,
+        answer: str | None = None,
+        author: str | None = None,
+        supporting_memory_ids: list[str] | None = None,
     ) -> bool:
-        """Judgment: candidate (or stale) entry becomes servable."""
+        """Judgment: candidate (or stale) entry becomes servable.
+
+        `supporting_memory_ids` re-grounds the card.  The mechanical draft
+        is built from whatever the promotion retrieval happened to return,
+        and an approver who rewrites the answer from a better retrieval
+        must be able to move the provenance with it — otherwise the served
+        card cites one set of memories in its text while `serve` verifies
+        another, and a source the answer never used could stale a card
+        that is perfectly sound.  Omit it to keep the existing sources.
+        """
         row = self._db.execute(
             "SELECT status FROM faq_entries WHERE id = ?", (faq_id,)
         ).fetchone()
         if row is None or row["status"] == "retired":
             return False
         now = datetime.utcnow().isoformat()
+        sets = ["status = 'active'", "author = ?", "last_verified_at = ?"]
+        params: list = [author or "librarian:approved", now]
         if answer is not None:
-            self._db.execute(
-                "UPDATE faq_entries SET status = 'active', answer = ?, "
-                "author = ?, last_verified_at = ? WHERE id = ?",
-                (answer, author or "librarian:approved", now, faq_id),
-            )
-        else:
-            self._db.execute(
-                "UPDATE faq_entries SET status = 'active', "
-                "author = ?, last_verified_at = ? WHERE id = ?",
-                (author or "librarian:approved", now, faq_id),
-            )
+            sets.insert(1, "answer = ?")
+            params.insert(0, answer)
+        if supporting_memory_ids is not None:
+            sets.append("supporting_memory_ids = ?")
+            params.append(json.dumps(supporting_memory_ids))
+        params.append(faq_id)
+        self._db.execute(
+            f"UPDATE faq_entries SET {', '.join(sets)} WHERE id = ?",
+            tuple(params),
+        )
         return True
 
     def retire_to_stale(self, faq_id: int) -> bool:

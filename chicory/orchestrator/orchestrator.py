@@ -1648,6 +1648,7 @@ class Orchestrator:
         author: str | None = None,
         status: str = "candidate",
         limit: int = 20,
+        supporting_memory_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """FAQ desk management: list candidates/entries, approve, retire.
 
@@ -1674,11 +1675,17 @@ class Orchestrator:
                 if action == "approve":
                     if faq_id is None:
                         return {"error": "approve requires faq_id"}
-                    ok = self._faq_desk.approve(faq_id, answer=answer, author=author)
-                    return (
-                        {"status": "approved", "faq_id": faq_id} if ok
-                        else {"error": f"FAQ {faq_id} not found or retired"}
+                    ok = self._faq_desk.approve(
+                        faq_id, answer=answer, author=author,
+                        supporting_memory_ids=supporting_memory_ids,
                     )
+                    if not ok:
+                        return {"error": f"FAQ {faq_id} not found or retired"}
+                    return {
+                        "status": "approved",
+                        "faq_id": faq_id,
+                        "regrounded": supporting_memory_ids is not None,
+                    }
                 if action == "retire":
                     if faq_id is None:
                         return {"error": "retire requires faq_id"}

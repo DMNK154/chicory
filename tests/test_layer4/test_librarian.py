@@ -1816,3 +1816,75 @@ class TestFaqDeskSurface:
         faq = FaqDesk(stack["config"], stack["db"])
         fid = self._card(stack, ["s1"], status="retired")
         assert faq.retire_to_stale(fid) is False
+
+
+class TestApproveRegrounding:
+    """Approving with a rewritten answer must be able to move the sources.
+
+    The mechanical draft rests on whatever the promotion retrieval
+    returned. An approver who rewrites the answer from a better retrieval
+    and cannot move the provenance leaves a card citing one set of
+    memories in its text while serve() verifies another.
+    """
+
+    def _card(self, stack, supporting):
+        return FaqDesk(stack["config"], stack["db"]).create_candidate(
+            "zohar separation", _basis_vec(0), "- draft", supporting, [],
+        )
+
+    def test_approve_can_reground_the_card(self, stack):
+        for m in ("old1", "old2", "new1", "new2"):
+            _insert_memory(stack["db"], m)
+        faq = FaqDesk(stack["config"], stack["db"])
+        fid = self._card(stack, ["old1", "old2"])
+        assert faq.approve(
+            fid, answer="a real answer", author="specialist:zohar",
+            supporting_memory_ids=["new1", "new2"],
+        ) is True
+        row = stack["db"].execute(
+            "SELECT status, answer, author, supporting_memory_ids, "
+            "last_verified_at FROM faq_entries WHERE id = ?", (fid,),
+        ).fetchone()
+        assert row["status"] == "active"
+        assert row["answer"] == "a real answer"
+        assert row["author"] == "specialist:zohar"
+        assert json.loads(row["supporting_memory_ids"]) == ["new1", "new2"]
+        assert row["last_verified_at"] is not None
+
+    def test_approve_without_ids_keeps_the_existing_sources(self, stack):
+        for m in ("old1", "old2"):
+            _insert_memory(stack["db"], m)
+        faq = FaqDesk(stack["config"], stack["db"])
+        fid = self._card(stack, ["old1", "old2"])
+        faq.approve(fid, answer="an answer", author="someone")
+        row = stack["db"].execute(
+            "SELECT supporting_memory_ids FROM faq_entries WHERE id = ?", (fid,),
+        ).fetchone()
+        assert json.loads(row["supporting_memory_ids"]) == ["old1", "old2"]
+
+    def test_regrounded_card_serves_against_its_new_sources(self, stack):
+        """The point of moving provenance: serve() must verify what the
+        answer actually rests on."""
+        for m in ("old1", "new1"):
+            _insert_memory(stack["db"], m)
+        faq = FaqDesk(stack["config"], stack["db"])
+        fid = self._card(stack, ["old1"])
+        faq.approve(fid, answer="grounded", author="x",
+                    supporting_memory_ids=["new1"])
+        # Archiving the ABANDONED source must not stale the card.
+        stack["db"].execute("UPDATE memories SET is_archived = 1 WHERE id = 'old1'")
+        assert faq.serve(_basis_vec(0)) is not None
+        # Archiving the source it actually rests on must.
+        stack["db"].execute("UPDATE memories SET is_archived = 1 WHERE id = 'new1'")
+        assert faq.serve(_basis_vec(0)) is None
+        row = stack["db"].execute(
+            "SELECT status FROM faq_entries WHERE id = ?", (fid,),
+        ).fetchone()
+        assert row["status"] == "stale"
+
+    def test_retired_card_cannot_be_regrounded(self, stack):
+        _insert_memory(stack["db"], "m1")
+        faq = FaqDesk(stack["config"], stack["db"])
+        fid = self._card(stack, ["m1"])
+        faq.retire(fid)
+        assert faq.approve(fid, answer="x", supporting_memory_ids=["m1"]) is False

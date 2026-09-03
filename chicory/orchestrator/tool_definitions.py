@@ -360,6 +360,17 @@ CHICORY_TOOLS = [
                     "type": "string",
                     "description": "Byline for the approval, e.g. specialist:<subject>.",
                 },
+                "supporting_memory_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Re-ground the card on approve. The draft rests on "
+                        "whatever the promotion retrieval returned; if you "
+                        "rewrote the answer from better sources, pass them "
+                        "here so the served card's provenance matches its "
+                        "text and serve verifies the right memories."
+                    ),
+                },
                 "status": {
                     "type": "string",
                     "enum": ["candidate", "active", "stale", "retired"],
