@@ -16,7 +16,12 @@ from chicory.layer1.salience import SalienceScorer
 from chicory.layer1.memory_store import MemoryStore
 from chicory.layer1.tag_manager import TagManager
 from chicory.layer3.centroid_subgraph import CentroidSubgraph, _array_to_blob
-from chicory.layer4.librarian import LinearSweep, SubjectRoster, WriteGate
+from chicory.layer4.librarian import (
+    LinearSweep,
+    SubjectRoster,
+    WriteGate,
+    actor_allowed,
+)
 from tests.conftest import MockEmbeddingEngine
 
 DIM = 32
@@ -2030,3 +2035,41 @@ class TestRetrievalAttribution:
             led.record("gathering sources for a card", _basis_vec(0), 5, 0.99,
                        actor="research")
         assert led.process_batch(allow_retrieval=True)["faq_candidates"] == 0
+
+
+class TestActorNamespaces:
+    """Allow-lists take a name or a namespace.
+
+    Subjects are derived and renameable — a shelf renamed mid-session
+    already forked one specialist byline — so listing specialists
+    individually would go stale at the next roster rebuild.
+    """
+
+    def test_exact_name_matches(self):
+        assert actor_allowed("patron", ["patron"]) is True
+        assert actor_allowed("research", ["patron"]) is False
+
+    def test_trailing_colon_matches_the_namespace(self):
+        assert actor_allowed("specialist:zohar", ["specialist:"]) is True
+        assert actor_allowed("specialist:lab-data+lab", ["specialist:"]) is True
+        assert actor_allowed("patron", ["specialist:"]) is False
+
+    def test_a_bare_namespace_name_is_not_a_prefix(self):
+        """Without the colon it is a name, not a class — otherwise
+        'patron' would silently match 'patron-impersonator'."""
+        assert actor_allowed("specialist:zohar", ["specialist"]) is False
+
+    def test_empty_list_is_no_filter(self):
+        assert actor_allowed("anyone at all", []) is True
+
+    def test_specialists_are_on_neither_default_list(self, stack):
+        """A shift reads on the library's behalf: not patron demand, and
+        not licensed to reshape the shelf it is reading."""
+        cfg = stack["config"]
+        assert actor_allowed("specialist:zohar", cfg.demand_actors) is False
+        assert actor_allowed("specialist:zohar", cfg.geometry_actors) is False
+        assert actor_allowed("patron", cfg.demand_actors) is True
+
+    def test_a_namespace_can_be_opted_in_wholesale(self, stack):
+        stack["config"].demand_actors = ["patron", "specialist:"]
+        assert actor_allowed("specialist:zohar", stack["config"].demand_actors) is True

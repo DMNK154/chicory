@@ -395,6 +395,17 @@ class ChicoryConfig(BaseModel):
     # it is; nothing verifies the claim. That is worth stating plainly —
     # it makes traffic separable and auditable, which is all it can do.
     retrieval_default_actor: str = Field(default="patron")
+    # Both lists take a plain name (exact match) or a namespace written
+    # with a trailing colon: "specialist:" covers specialist:zohar and
+    # every other shift. Subjects are derived and renameable, so listing
+    # them individually would go stale at the next roster rebuild.
+    #
+    # A specialist is deliberately on NEITHER list. Its reading is research
+    # on the library's own behalf: it should not register as patron demand,
+    # and a shift that reads a shelf should not reshape the shelf it reads.
+    # Its judgments are still attributed — through memories.author, on what
+    # it writes, which is where a specialist's authority belongs.
+    #
     # Whose queries count as demand (FAQ promotion, commission filing).
     # Everything is still recorded; only these are clustered.
     demand_actors: list[str] = Field(default_factory=lambda: ["patron"])

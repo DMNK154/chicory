@@ -10,6 +10,8 @@ The FAQ is the only text this library serves *before* retrieval. `librarian_cons
 
 If the Chicory MCP tools are unavailable, say so and stop.
 
+**Attribute your reading.** Every retrieval you make while working the desk — checking a draft against the shelves, gathering better sources for a rewrite — passes `actor="specialist:<subject>"` (or `actor="research"` if no subject fits). Retrieval records demand and reweights the shelf geometry; unattributed, the queries you type to *answer* a card come back as new cards of their own. The patron's own questions, if you relay any, stay unattributed.
+
 ## What the states mean
 
 | state | meaning |

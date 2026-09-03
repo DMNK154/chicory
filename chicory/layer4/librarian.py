@@ -54,6 +54,29 @@ def _unit(vec: np.ndarray) -> np.ndarray:
 CUSTODY_STATES = ("unswept", "clean", "flagged", "quarantined", "certified")
 
 
+def actor_allowed(actor: str, allow: list[str]) -> bool:
+    """Whether this actor is on an allow-list.
+
+    Two forms.  A plain name matches exactly.  A name ending in a colon
+    matches the whole namespace beneath it, so "specialist:" covers
+    specialist:zohar and every other shift without enumerating subjects —
+    which matters because subjects are derived and renameable, so a list
+    of them would go stale the next time the roster rebuilt.
+
+    An empty list means "no filter", which is how a caller opts out of
+    attribution entirely.
+    """
+    if not allow:
+        return True
+    for entry in allow:
+        if entry.endswith(":"):
+            if actor.startswith(entry):
+                return True
+        elif actor == entry:
+            return True
+    return False
+
+
 def record_custody_transition(
     db: DatabaseEngine,
     memory_id: str,
@@ -1720,9 +1743,8 @@ class DemandLedger:
         recovered = 0
         dropped = 0
         not_demand = 0
-        demand_actors = set(self._config.demand_actors)
         for r in rows:
-            if demand_actors and r["actor"] not in demand_actors:
+            if not actor_allowed(r["actor"], self._config.demand_actors):
                 # Recorded, marked processed, never clustered: an agent's
                 # research must not become the library's demand.
                 not_demand += 1

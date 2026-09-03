@@ -39,6 +39,7 @@ from chicory.layer4.desk import DeskReport
 from chicory.layer4.ingress import IngressBuffer
 from chicory.layer4.librarian import (
     CommissionDesk,
+    actor_allowed,
     DemandLedger,
     FaqDesk,
     LinearSweep,
@@ -3688,8 +3689,7 @@ class Orchestrator:
         # centroids that SubjectRoster.rebuild derives the shelf tree from,
         # so an automated reader left out of geometry_actors can walk the
         # library without rewriting it.
-        geometry_actors = set(self._config.geometry_actors)
-        may_reshape = (not geometry_actors) or (actor in geometry_actors)
+        may_reshape = actor_allowed(actor, self._config.geometry_actors)
         if self._config.centroid_inhibition_enabled and may_reshape:
             all_tag_ids_flat: list[int] = []
             for tids in tag_ids_map.values():
