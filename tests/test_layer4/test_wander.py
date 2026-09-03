@@ -669,3 +669,77 @@ def test_a_complete_document_is_observed_as_complete(stack):
     obs = p.observations(kind="document_coverage")[0]
     assert obs["weight"] == 1.0
     assert "complete" in obs["detail"]
+
+
+# ── The concept_gaps errand ─────────────────────────────────────────────
+
+
+def _content_memory(db, mid, text):
+    db.execute("INSERT INTO memories (id, content, summary, source_model) "
+               "VALUES (?, ?, 'x', 'test')", (mid, text))
+
+
+def test_a_recurring_capitalised_term_with_no_tag_is_recorded(stack):
+    """The finding this exists for: zohar holds 15,205 memories and
+    tiferet holds none — the material is here and unfindable."""
+    db, p = stack["db"], stack["patrol"]
+    _content_memory(db, "m1", "Tiferet is the centre. Tiferet balances. "
+                              "Above Tiferet sits Binah, and Tiferet again.")
+    p.run_errand("concept_gaps", batch_size=10)
+    obs = p.observations(kind="concept_gap")
+    assert [o["subject"] for o in obs] == ["tiferet"]
+    assert "cannot retrieve by it" in obs[0]["detail"]
+    assert obs[0]["weight"] == 0.0
+
+
+def test_a_term_mentioned_once_is_not_a_concept(stack):
+    db, p = stack["db"], stack["patrol"]
+    _content_memory(db, "m1", "Tiferet appears here only the one time.")
+    p.run_errand("concept_gaps", batch_size=10)
+    assert p.observations(kind="concept_gap") == []
+
+
+def test_capitalised_common_words_are_not_concepts(stack):
+    """Sentence-initial 'Great' is indistinguishable from 'Malchut' to a
+    regex; only the stop-list separates them."""
+    db, p = stack["db"], stack["patrol"]
+    _content_memory(db, "m1", "Great things. Great works. Great again. "
+                              "Great once more. Which is which. Which again.")
+    p.run_errand("concept_gaps", batch_size=10)
+    assert p.observations(kind="concept_gap") == []
+
+
+def test_a_well_held_tag_is_not_a_gap(stack):
+    db, p = stack["db"], stack["patrol"]
+    from chicory.layer1.tag_manager import TagManager
+    tags = TagManager(db)
+    t = tags.get_or_create("kabbalah", created_by="test")
+    for i in range(25):
+        _content_memory(db, f"pad{i}", "x")
+        db.execute("INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) "
+                   "VALUES (?, ?, 'test')", (f"pad{i}", t.id))
+    _content_memory(db, "m1", "Kabbalah says. Kabbalah teaches. "
+                              "Kabbalah holds. Kabbalah again.")
+    p.run_errand("concept_gaps", batch_size=50)
+    assert [o["subject"] for o in p.observations(kind="concept_gap")] == []
+
+
+def test_seeing_a_concept_again_confirms_it(stack):
+    """Recurrence across passes is what separates a concept from noise."""
+    db, p = stack["db"], stack["patrol"]
+    for i in (1, 2):
+        _content_memory(db, f"m{i}", "Malchut and Malchut and Malchut, Malchut.")
+    p.run_errand("concept_gaps", batch_size=1)
+    p.run_errand("concept_gaps", batch_size=1)
+    obs = p.observations(kind="concept_gap")
+    assert len(obs) == 1
+    assert obs[0]["confirmations"] == 2
+
+
+def test_the_survey_waits_for_quiet(stack):
+    from chicory.layer4.wander import ERRANDS
+    assert ERRANDS["concept_gaps"].when == "idle"
+    stack["patrol"]._config.wander_errands = ["concept_gaps"]
+    _content_memory(stack["db"], "m1", "Malchut Malchut Malchut Malchut.")
+    assert stack["patrol"].run_due(idle=False)["errands"] == []
+    assert stack["patrol"].run_due(idle=True)["errands"][0]["examined"] == 1

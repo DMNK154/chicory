@@ -803,6 +803,130 @@ register(Errand(
 ))
 
 
+# ── Errand: the concepts this library discusses but cannot find ─────────
+
+_CONCEPT_RE = re.compile(r"\b([A-Z][a-zA-Z]{4,})\b")
+
+# Capitalised common words, which a capitalisation heuristic cannot tell
+# from proper nouns.  Sentence-initial "Great" and "Lord" look exactly
+# like "Malchut" to a regex.
+_CONCEPT_STOPWORDS = frozenset("""
+    the this that these those when where which while what whom whose
+    their there they then thus here however because since although also
+    and but for not from with without into onto upon each every some
+    such only very just like both other another same over under above
+    below after before how why who one two three four five first second
+    third next last chapter section figure table page note see may might
+    must shall will would could should can cannot have has had been being
+    were was are its his her him she you your our they them all any more
+    most much many few less least own said say says according great good
+    better best long high low new old well even still yet lord supreme
+    thou thee hath unto come came therefore whereas within among between
+    during through against about across part parts case cases form forms
+    kind kinds way ways time times thing things world worlds life man men
+    people place places point points work works right left style guide
+    release english
+""".split())
+
+
+def _concept_gaps(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Build a dictionary of what the library discusses but cannot find.
+
+    A retrieval score tells you a question was answered badly.  It cannot
+    tell you why, and there are two why's that call for opposite responses:
+    the shelves do not hold the material, or they hold it and nothing can
+    reach it.  On this library `zohar` carries 15,205 memories while
+    `tiferet` carries none — the Zohar is here, and Tiferet is unfindable
+    inside it.
+
+    Only the walk can notice that, because it is the only thing that reads
+    the CONTENT rather than the index.  A term a memory returns to four or
+    more times is something that memory is about; if no tag holds it, the
+    library is discussing a concept it cannot retrieve by.
+
+    The heuristic is capitalisation, which is why the stop-list above is
+    long and the threshold is four: sentence-initial "Great" is
+    indistinguishable from "Malchut" to a regex, and only recurrence
+    separates them.
+    """
+    from collections import Counter
+
+    verdicts: dict[str, tuple[str, str | None]] = {}
+    seen: Counter = Counter()
+
+    for mid in memory_ids:
+        if should_stop is not None and should_stop():
+            break
+        row = db.execute(
+            "SELECT content FROM memories WHERE id = ?", (mid,),
+        ).fetchone()
+        if row is None:
+            verdicts[mid] = ("skipped", "memory gone")
+            continue
+        hits = Counter(
+            term.lower()
+            for term in _CONCEPT_RE.findall(row["content"] or "")
+            if term.lower() not in _CONCEPT_STOPWORDS
+        )
+        about = [t for t, n in hits.items() if n >= config.concept_min_mentions]
+        for term in about:
+            seen[term] += 1
+        verdicts[mid] = ("ok", f"concepts={len(about)}")
+
+    deposited = 0
+    for term, mentions in seen.items():
+        row = db.execute(
+            "SELECT t.id, COUNT(mt.memory_id) AS n FROM tags t "
+            "LEFT JOIN memory_tags mt ON mt.tag_id = t.id "
+            "WHERE t.name = ? GROUP BY t.id",
+            (term,),
+        ).fetchone()
+        held = row["n"] if row else 0
+        if held >= config.faq_gap_thin_tag_memories:
+            continue  # findable; not a gap
+        patrol.observe(
+            errand="concept_gaps",
+            kind="concept_gap",
+            subject=term,
+            detail=(
+                f"discussed in {mentions} memories on this pass; "
+                + ("no tag holds it" if row is None else f"its tag holds {held}")
+                + " — the library talks about this and cannot retrieve by it"
+            ),
+            # Findability, so the ASC ordering surfaces the least findable
+            # first; ties break on confirmations, which is how a concept
+            # seen on many passes outranks a one-off.
+            weight=0.0 if row is None else round(
+                min(1.0, held / max(config.faq_gap_thin_tag_memories, 1)), 4,
+            ),
+            lap=state.lap,
+        )
+        deposited += 1
+    if deposited:
+        _log.info("Concept gaps: %d recorded this pass", deposited)
+    return verdicts
+
+
+register(Errand(
+    name="concept_gaps",
+    description="Record concepts the library discusses but holds no tag for",
+    run=_concept_gaps,
+    # A whole-library survey that reads content, so it waits for quiet.
+    # This is the first user of the idle slot, which existed for exactly
+    # this: work that should not compete with a patron's question.
+    when="idle",
+))
+
+
 # ── Heartbeat ───────────────────────────────────────────────────────────
 
 

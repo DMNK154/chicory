@@ -348,6 +348,11 @@ class ChicoryConfig(BaseModel):
     # Below this many memories, a tag exists but the library does not
     # meaningfully hold the subject — counted as a gap, not as coverage.
     faq_gap_thin_tag_memories: int = Field(default=20)
+    # How often a capitalised term must recur WITHIN one memory before the
+    # concept errand treats it as something that memory is about rather
+    # than something it mentions.  Four was calibrated on this corpus:
+    # three admitted 'that' and 'great' alongside malchut and tiferet.
+    concept_min_mentions: int = Field(default=4)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the
@@ -485,7 +490,9 @@ class ChicoryConfig(BaseModel):
     # Errands the patrol runs, in order.  Names must be registered in
     # chicory.layer4.wander.ERRANDS; unknown names are logged and skipped.
     wander_errands: list[str] = Field(
-        default_factory=lambda: ["missing_embedding", "source_provenance"]
+        default_factory=lambda: [
+            "missing_embedding", "source_provenance", "concept_gaps",
+        ]
     )
     # Only one process patrols a library at a time.  Every MCP client
     # session spawns its own server against the same SQLite file — 14 were
