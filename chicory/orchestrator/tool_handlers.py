@@ -173,6 +173,7 @@ def _handle_librarian_consult(o: "Orchestrator", inp: dict) -> dict:
 
 def _handle_librarian_faq(o: "Orchestrator", inp: dict) -> dict:
     return o.handle_librarian_faq(
+        demote=inp.get("demote", False),
         action=inp.get("action", "list"),
         faq_id=inp.get("faq_id"),
         answer=inp.get("answer"),

@@ -684,6 +684,7 @@ def librarian_faq(
     status: Optional[str] = None,
     limit: Optional[int] = None,
     supporting_memory_ids: Optional[list] = None,
+    demote: Optional[bool] = None,
 ) -> str:
     """The FAQ desk — crystallized answers, and the drafts awaiting judgment.
 
@@ -699,6 +700,10 @@ def librarian_faq(
     superseded by a later report. Judge from this, not from list.
     action='approve': activate it (faq_id, plus answer and author). The
     mechanical draft is a list of citations, not prose — rewrite it.
+    action='audit': check every live card against the promotion bar as
+    it stands now — tuning that bar leaves earlier cards serving under
+    rules they would not pass today. Pass demote=True to return those
+    to candidate.
     action='stale': pull a served card back for rebuilding, when the
     question still stands but the answer no longer does.
     action='retire': permanent. Nothing reopens a retired card.
@@ -708,6 +713,7 @@ def librarian_faq(
         ("action", action), ("faq_id", faq_id), ("answer", answer),
         ("author", author), ("status", status), ("limit", limit),
         ("supporting_memory_ids", supporting_memory_ids),
+        ("demote", demote),
     ):
         if val is not None:
             inp[key] = val

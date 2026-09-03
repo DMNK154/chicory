@@ -353,7 +353,7 @@ CHICORY_TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "show", "approve", "retire", "stale"],
+                    "enum": ["list", "show", "audit", "approve", "retire", "stale"],
                     "description": (
                         "list — the queue for one status, plus counts across "
                         "all four. show — one card hydrated with its "
@@ -361,6 +361,10 @@ CHICORY_TOOLS = [
                         "any blockers; this is what judgment needs, since "
                         "list returns ids only. approve — activate it, "
                         "normally with a rewritten answer and a byline. "
+                        "audit — check every live card against the promotion bar as it "
+                        "stands now, since tuning the bar leaves earlier "
+                        "cards behind; pass demote to return the ones "
+                        "below it to candidate. "
                         "retire — permanent; nothing reopens it. stale — "
                         "pull a served card back for rebuilding when the "
                         "question is still good but the answer is not."

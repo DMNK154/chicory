@@ -2073,3 +2073,84 @@ class TestActorNamespaces:
     def test_a_namespace_can_be_opted_in_wholesale(self, stack):
         stack["config"].demand_actors = ["patron", "specialist:"]
         assert actor_allowed("specialist:zohar", stack["config"].demand_actors) is True
+
+
+class TestFaqAudit:
+    """Tuning the promotion bar leaves the existing table behind.
+
+    Cards promoted under a looser rule keep serving under a stricter one,
+    with nothing recording that they would not be admitted today. On this
+    library the bar moved three times in one session and left eleven
+    active cards below it.
+    """
+
+    def _orch(self, stack):
+        from chicory.orchestrator.orchestrator import Orchestrator
+        from chicory.layer4.closure import ClosureLedger
+        from chicory.layer1.tag_manager import TagManager
+        o = Orchestrator.__new__(Orchestrator)
+        o._db = stack["db"]; o._config = stack["config"]
+        o._closure = ClosureLedger(stack["config"], stack["db"])
+        o._tag_manager = TagManager(stack["db"])
+        o._faq_desk = FaqDesk(stack["config"], stack["db"])
+        o._demand_ledger = DemandLedger(
+            stack["config"], stack["db"], _StubStore([]), o._faq_desk,
+            CommissionDesk(stack["config"], stack["db"]), stack["roster"],
+        )
+        return o
+
+    def _cluster(self, stack, vec, hits, score):
+        stack["db"].execute(
+            "INSERT INTO query_clusters (centroid, representative_query, "
+            "hit_count, mean_top_score) VALUES (?, 'q', ?, ?)",
+            (_array_to_blob(vec), hits, score),
+        )
+
+    def _card(self, stack, vec, status="active"):
+        fid = FaqDesk(stack["config"], stack["db"]).create_candidate(
+            "q", vec, "draft", ["m1"], [])
+        stack["db"].execute("UPDATE faq_entries SET status=? WHERE id=?", (status, fid))
+        return fid
+
+    def test_a_conforming_card_passes(self, stack):
+        _insert_memory(stack["db"], "m1")
+        self._cluster(stack, _basis_vec(0), hits=1, score=0.99)   # needs 0.95
+        self._card(stack, _basis_vec(0))
+        out = self._orch(stack)._faq_audit()
+        assert out["conforming"] == 1
+        assert out["below_bar"] == []
+
+    def test_a_card_below_todays_bar_is_reported(self, stack):
+        _insert_memory(stack["db"], "m1")
+        self._cluster(stack, _basis_vec(0), hits=1, score=0.80)   # needs 0.95
+        fid = self._card(stack, _basis_vec(0))
+        out = self._orch(stack)._faq_audit()
+        assert out["conforming"] == 0
+        assert [e["faq_id"] for e in out["below_bar"]] == [fid]
+        assert out["below_bar"][0]["required"] == 0.95
+        assert out["demoted"] == []            # reporting only, by default
+
+    def test_demote_returns_it_to_candidate_not_retired(self, stack):
+        """The question stands; only its licence to serve has lapsed."""
+        _insert_memory(stack["db"], "m1")
+        self._cluster(stack, _basis_vec(0), hits=1, score=0.80)
+        fid = self._card(stack, _basis_vec(0))
+        out = self._orch(stack)._faq_audit(demote=True)
+        assert out["demoted"] == [fid]
+        row = stack["db"].execute(
+            "SELECT status FROM faq_entries WHERE id=?", (fid,)).fetchone()
+        assert row["status"] == "candidate"
+
+    def test_demote_leaves_candidates_alone(self, stack):
+        _insert_memory(stack["db"], "m1")
+        self._cluster(stack, _basis_vec(0), hits=1, score=0.80)
+        fid = self._card(stack, _basis_vec(0), status="candidate")
+        out = self._orch(stack)._faq_audit(demote=True)
+        assert out["demoted"] == []            # it already serves nothing
+        assert len(out["below_bar"]) == 1
+
+    def test_audit_declines_when_there_is_nothing_to_judge_against(self, stack):
+        _insert_memory(stack["db"], "m1")
+        self._card(stack, _basis_vec(0))
+        out = self._orch(stack)._faq_audit()
+        assert "error" in out                  # no clusters; guessing is worse

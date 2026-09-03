@@ -1672,6 +1672,7 @@ class Orchestrator:
         status: str = "candidate",
         limit: int = 20,
         supporting_memory_ids: list[str] | None = None,
+        demote: bool = False,
     ) -> dict[str, Any]:
         """FAQ desk management: list candidates/entries, approve, retire.
 
@@ -1687,6 +1688,8 @@ class Orchestrator:
                     if faq_id is None:
                         return {"error": "show requires faq_id"}
                     return self._faq_show(faq_id)
+                if action == "audit":
+                    return self._faq_audit(demote=bool(demote))
                 if action == "stale":
                     if faq_id is None:
                         return {"error": "stale requires faq_id"}
@@ -1722,6 +1725,81 @@ class Orchestrator:
             self._foreground_waiting.clear()
 
     _FAQ_STATUSES = ("candidate", "active", "stale", "retired")
+
+    def _faq_audit(self, demote: bool = False) -> dict[str, Any]:
+        """Check every card against the promotion bar as it stands NOW.
+
+        Promotion thresholds are tuned over time, and each change leaves
+        the existing table behind: cards promoted under a looser rule keep
+        serving under a stricter one, with nothing recording that they
+        would not be admitted today.  On this library the bar moved three
+        times in one session and left eleven active cards below it.
+
+        `demote` returns those cards to `candidate`.  Deliberately not
+        `retire` — the question was legitimately asked and may clear the
+        bar again on the next ask; what lapsed is the licence to serve it
+        ahead of the shelves, not the question's right to exist.
+        """
+        import numpy as np
+
+        rows = self._db.execute(
+            "SELECT id, question_text, question_centroid, status, author "
+            "FROM faq_entries WHERE status IN ('candidate', 'active')"
+        ).fetchall()
+        clusters = self._db.execute(
+            "SELECT centroid, hit_count, mean_top_score FROM query_clusters"
+        ).fetchall()
+        if not rows:
+            return {"checked": 0, "note": "no live cards"}
+        if not clusters:
+            # Without the demand behind them there is nothing to judge
+            # against, and guessing would be worse than declining.
+            return {"checked": len(rows), "error": "no query clusters to judge against"}
+
+        def unit(blob):
+            a = np.frombuffer(blob, dtype=np.float32)
+            n = float(np.linalg.norm(a))
+            return a / n if n else a
+
+        cl = [(unit(c["centroid"]), c["hit_count"], c["mean_top_score"])
+              for c in clusters]
+        conforming, below = [], []
+        for r in rows:
+            qc = unit(r["question_centroid"])
+            _, hits, score = max(cl, key=lambda x: float(np.dot(qc, x[0])))
+            required = self._demand_ledger._required_score(hits)
+            entry = {
+                "faq_id": r["id"],
+                "question": r["question_text"],
+                "status": r["status"],
+                "author": r["author"],
+                "hits": hits,
+                "score": round(score, 3),
+                "required": required,
+            }
+            if required is not None and score >= required:
+                conforming.append(entry)
+            else:
+                below.append(entry)
+
+        demoted = []
+        if demote:
+            for e in below:
+                if e["status"] != "active":
+                    continue
+                self._db.execute(
+                    "UPDATE faq_entries SET status = 'candidate' WHERE id = ?",
+                    (e["faq_id"],),
+                )
+                demoted.append(e["faq_id"])
+
+        return {
+            "checked": len(rows),
+            "tiers": self._config.faq_promote_tiers,
+            "conforming": len(conforming),
+            "below_bar": below,
+            "demoted": demoted,
+        }
 
     def _faq_list(self, status: str, limit: int) -> dict[str, Any]:
         """The desk view: how many cards sit in each state, then one queue.
