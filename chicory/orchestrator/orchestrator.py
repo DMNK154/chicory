@@ -2272,12 +2272,14 @@ class Orchestrator:
                 embedded = self._centroid_subgraph.rebuild_centroid_for_tag(
                     tag_obj.id,
                 )
+                seeded = self._seed_tag_edges(tag_obj.id, targets)
                 preview.update({
                     "status": "applied",
                     "tag_id": tag_obj.id,
                     "tag_now_holds": row["n"] if row else 0,
                     "author": author or "librarian:tagged",
                     "centroid_from_memories": embedded,
+                    "edges_seeded": seeded,
                     "next": (
                         "run librarian_maintain to fold the new tag into "
                         "the shelf roster"
@@ -2286,6 +2288,92 @@ class Orchestrator:
                 return preview
         finally:
             self._foreground_waiting.clear()
+
+    def _seed_tag_edges(self, tag_id: int, memory_ids: list[str]) -> int:
+        """Give a newly attached tag the edges it needs to join a shelf.
+
+        A tag with a centroid and no edges is retrievable and homeless.
+        SubjectRoster builds components from centroid_edges, which only
+        form through co-RETRIEVAL, so a tag nobody has queried yet is an
+        isolated node, falls below subject_min_cluster_size, and is
+        dropped. Observed exactly that: malchut, 993 memories, its own
+        centroid, and no shelf.
+
+        The hysteresis rule that excludes it is right about noise and
+        wrong here — a tag a specialist attached after the librarian read
+        the whole library is evidence, not an accident. Rather than grant
+        it an exemption, this derives the edge from the material: tags
+        that co-occur with it ON THE SAME MEMORIES. That is the same
+        memory-level co-occurrence the gap net uses, and a stronger signal
+        than co-retrieval, since it comes from the text rather than from
+        who happened to search.
+
+        Written into centroid_edges because that is what the roster reads.
+        The column is named co_retrieval_count and this is co-OCCURRENCE,
+        which is a stretch worth naming: the count is honest about how
+        many memories carry both, but it did not come from retrieval.
+        """
+        if not memory_ids:
+            return 0
+        total_row = self._db.execute(
+            "SELECT COUNT(*) AS n FROM memories WHERE is_archived = 0"
+        ).fetchone()
+        library = max(total_row["n"] if total_row else 1, 1)
+        hub_cap = self._config.subject_hub_tag_max_fraction * library
+
+        ph = ",".join("?" * len(memory_ids))
+        rows = self._db.execute(
+            f"SELECT mt.tag_id, t.name, COUNT(*) AS shared "
+            f"FROM memory_tags mt JOIN tags t ON t.id = mt.tag_id "
+            f"WHERE mt.memory_id IN ({ph}) AND mt.tag_id != ? "
+            f"GROUP BY mt.tag_id HAVING shared >= ?",
+            (*memory_ids, tag_id, self._config.subject_edge_merge_min_count),
+        ).fetchall()
+
+        pairs = []
+        for r in rows:
+            name = r["name"]
+            # The same exclusions subject membership already applies:
+            # temporal stamps and single letters carry no subject, and a
+            # hub tag on a fifth of the library connects everything to
+            # everything.
+            if len(name) < 2 or name.startswith(("day-", "month-", "minute-", "year-")):
+                continue
+            held = self._db.execute(
+                "SELECT COUNT(*) AS n FROM memory_tags WHERE tag_id = ?",
+                (r["tag_id"],),
+            ).fetchone()
+            n_held = held["n"] if held else 0
+            if n_held > hub_cap:
+                continue
+            # CONTAINMENT, not Jaccard: what share of the NEW tag's
+            # material also carries this one. Jaccard divides by the other
+            # tag's whole extent, so `kabbalah` — which covers all 993 of
+            # malchut's memories and is obviously where it belongs —
+            # scored 0.062 against `teacher` at 0.093 on 178 shared, and
+            # the roster duly filed a Kabbalah term under Vedanta. The
+            # question here is where this tag belongs, and that is asked
+            # by looking at its own memories, not at the other tag's size.
+            strength = round(r["shared"] / len(memory_ids), 4)
+            if strength < self._config.subject_min_edge_strength:
+                continue
+            a, b = sorted((tag_id, r["tag_id"]))
+            pairs.append((a, b, strength, r["shared"]))
+
+        if pairs:
+            self._db.executemany(
+                "INSERT INTO centroid_edges "
+                "(tag_a_id, tag_b_id, edge_strength, co_retrieval_count) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(tag_a_id, tag_b_id) DO UPDATE SET "
+                "edge_strength = MAX(centroid_edges.edge_strength, excluded.edge_strength), "
+                "co_retrieval_count = centroid_edges.co_retrieval_count "
+                "+ excluded.co_retrieval_count, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')",
+                pairs,
+            )
+            self._db.connection.commit()
+        return len(pairs)
 
     def _memories_discussing(self, concept: str, limit: int) -> list[str]:
         """The memories the walk actually read this concept in.

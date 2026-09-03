@@ -2308,3 +2308,128 @@ class TestLibrarianTag:
 
     def test_a_tag_is_required(self, stack):
         assert "error" in self._orch(stack).handle_librarian_tag(memory_ids=["m1"])
+
+
+class TestTagEdgeSeeding:
+    """A tag with a centroid and no edges is retrievable and homeless.
+
+    SubjectRoster builds components from centroid_edges, which form
+    through co-retrieval — so a tag nobody has queried is an isolated
+    node, falls below subject_min_cluster_size, and gets no shelf.
+    Observed on the live library: malchut, 993 memories, own centroid,
+    zero shelves.
+    """
+
+    def _orch(self, stack):
+        from chicory.orchestrator.orchestrator import Orchestrator
+        from chicory.layer1.tag_manager import TagManager
+        from chicory.layer3.centroid_subgraph import CentroidSubgraph
+        import threading
+        o = Orchestrator.__new__(Orchestrator)
+        o._db = stack["db"]; o._config = stack["config"]
+        o._tag_manager = TagManager(stack["db"])
+        o._centroid_subgraph = CentroidSubgraph(
+            stack["config"], stack["db"], stack["emb"])
+        o._foreground_waiting = threading.Event()
+        o._foreground_db_lock = threading.RLock()
+        return o
+
+    def _tagged_memories(self, stack, n, *tags):
+        from chicory.layer1.tag_manager import TagManager
+        tm = TagManager(stack["db"])
+        ids = []
+        for i in range(n):
+            mid = f"m{i}"
+            _insert_memory(stack["db"], mid)
+            stack["emb"].store_cached(mid, _basis_vec(0))
+            for name in tags:
+                t = tm.get_or_create(name, created_by="test")
+                stack["db"].execute(
+                    "INSERT OR IGNORE INTO memory_tags "
+                    "(memory_id, tag_id, assigned_by) VALUES (?, ?, 'test')",
+                    (mid, t.id))
+            ids.append(mid)
+        return ids
+
+    def test_edges_are_seeded_from_the_memories(self, stack):
+        ids = self._tagged_memories(stack, 6, "kabbalah", "hebrew")
+        out = self._orch(stack).handle_librarian_tag(
+            action="apply", tag="malchut", memory_ids=ids)
+        assert out["edges_seeded"] == 2         # kabbalah and hebrew
+        tag = stack["db"].execute(
+            "SELECT id FROM tags WHERE name='malchut'").fetchone()["id"]
+        n = stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM centroid_edges "
+            "WHERE tag_a_id = ? OR tag_b_id = ?", (tag, tag)).fetchone()["n"]
+        assert n == 2
+
+    def test_temporal_tags_are_not_seeded(self, stack):
+        """Every memory carries a date stamp; an edge to it means nothing."""
+        ids = self._tagged_memories(stack, 6, "kabbalah", "day-2026-07-17")
+        out = self._orch(stack).handle_librarian_tag(
+            action="apply", tag="malchut", memory_ids=ids)
+        assert out["edges_seeded"] == 1
+
+    def test_too_few_shared_memories_seeds_nothing(self, stack):
+        """Below the merge bar the evidence is not there, and seeding it
+        anyway would be granting an exemption rather than deriving one."""
+        ids = self._tagged_memories(stack, 2, "kabbalah")
+        out = self._orch(stack).handle_librarian_tag(
+            action="apply", tag="malchut", memory_ids=ids)
+        assert out["edges_seeded"] == 0
+
+    def test_preview_seeds_nothing(self, stack):
+        ids = self._tagged_memories(stack, 6, "kabbalah")
+        out = self._orch(stack).handle_librarian_tag(tag="malchut", memory_ids=ids)
+        assert "edges_seeded" not in out
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM centroid_edges").fetchone()["n"] == 0
+
+
+def test_edge_strength_is_containment_not_jaccard(stack):
+    """Jaccard asks how alike two tags are; placing a new tag asks what
+    share of ITS material another tag covers. On the live library the
+    difference filed a Kabbalah term under Vedanta."""
+    from chicory.layer1.tag_manager import TagManager
+    from chicory.layer3.centroid_subgraph import CentroidSubgraph
+    from chicory.orchestrator.orchestrator import Orchestrator
+    import threading
+    tm = TagManager(stack["db"])
+    broad = tm.get_or_create("kabbalah", created_by="test")   # covers all of them
+    narrow = tm.get_or_create("teacher", created_by="test")   # covers a few
+    ids = []
+    for i in range(10):
+        mid = f"m{i}"
+        _insert_memory(stack["db"], mid)
+        stack["emb"].store_cached(mid, _basis_vec(0))
+        stack["db"].execute("INSERT OR IGNORE INTO memory_tags "
+                            "(memory_id, tag_id, assigned_by) VALUES (?, ?, 't')",
+                            (mid, broad.id))
+        if i < 3:
+            stack["db"].execute("INSERT OR IGNORE INTO memory_tags "
+                                "(memory_id, tag_id, assigned_by) VALUES (?, ?, 't')",
+                                (mid, narrow.id))
+        ids.append(mid)
+    # give the broad tag a much larger extent elsewhere
+    for i in range(200):
+        other = f"pad{i}"
+        _insert_memory(stack["db"], other)
+        stack["db"].execute("INSERT OR IGNORE INTO memory_tags "
+                            "(memory_id, tag_id, assigned_by) VALUES (?, ?, 't')",
+                            (other, broad.id))
+    o = Orchestrator.__new__(Orchestrator)
+    o._db = stack["db"]; o._config = stack["config"]
+    o._tag_manager = tm
+    o._centroid_subgraph = CentroidSubgraph(stack["config"], stack["db"], stack["emb"])
+    o._foreground_waiting = threading.Event(); o._foreground_db_lock = threading.RLock()
+    o.handle_librarian_tag(action="apply", tag="malchut", memory_ids=ids)
+    new_tag = tm.get_by_name("malchut")
+    strengths = {}
+    for r in stack["db"].execute(
+        "SELECT t.name, e.edge_strength FROM centroid_edges e JOIN tags t ON t.id = "
+        "CASE WHEN e.tag_a_id = ? THEN e.tag_b_id ELSE e.tag_a_id END "
+        "WHERE e.tag_a_id = ? OR e.tag_b_id = ?",
+        (new_tag.id, new_tag.id, new_tag.id)).fetchall():
+        strengths[r["name"]] = r["edge_strength"]
+    assert strengths["kabbalah"] == 1.0          # covers all of malchut
+    assert strengths["kabbalah"] > strengths["teacher"]
