@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
@@ -363,29 +363,55 @@ class ChicoryConfig(BaseModel):
     faq_promote_min_hits: int = Field(default=1)
     # Fallback quality bar, used only when faq_promote_tiers is empty.
     faq_promote_min_score: float = Field(default=0.70)
-    # Repetition and quality trade against each other, so the bar is a
-    # ladder rather than one number: (minimum asks, minimum score),
-    # evaluated from the most asks down, first match wins.
+    # Flat at 0.70, and the flatness is the point.
     #
-    # The single-ask rung was 0.95 and that was too tight, set from the
-    # top of the distribution rather than from where answers stop being
-    # answers.  Measured on the live library, retrieval scores 0.66-0.80
-    # on questions the shelves CAN answer and 0.48-0.56 on ones they
-    # cannot; single-ask candidates then run continuously from 0.752 to
-    # 0.931 with no natural gap, and below 0.75 nothing further is
-    # admitted except known duds.  0.75 is therefore the last cut that
-    # separates on evidence rather than on taste.
+    # The rungs were tuned one at a time and drifted into incoherence:
+    # (3, 0.70), (2, 0.80), (1, 0.75) demanded MORE of a question asked
+    # twice than of the same question asked once or three times.  A bar
+    # that RISES with evidence has the idea backwards — repetition is
+    # evidence of demand, so it can only ever lower what quality must
+    # prove, never raise it.  The validator below now refuses that shape
+    # instead of letting it be configured silently.
     #
-    # Two asks sits at 0.80 — that tier is bimodal on real data, two
-    # clusters near 0.98 and a clean gap down to the duds, so anything
-    # from 0.65 to 0.82 selects the same three.  Three asks is
-    # demonstrably wanted, so a merely good answer will do (0.70).
+    # 0.70 is where the evidence sits: retrieval scores 0.66-0.80 on
+    # questions these shelves CAN answer and 0.48-0.56 on ones they
+    # cannot, so it clears the noise floor with room and admits every
+    # genuine candidate.  The two it still excludes scored 0.483 and
+    # 0.627 — measured failures, not marginal calls.
+    #
+    # Kept as a ladder rather than collapsed to one number because the
+    # SHAPE is worth being able to express; it simply has no reason to be
+    # stepped on this corpus yet.
     #
     # An empty list disables the ladder and falls back to the flat
     # faq_promote_min_hits / faq_promote_min_score pair above.
     faq_promote_tiers: list[tuple[int, float]] = Field(
-        default_factory=lambda: [(3, 0.70), (2, 0.80), (1, 0.75)]
+        default_factory=lambda: [(3, 0.70), (2, 0.70), (1, 0.70)]
     )
+
+    @field_validator("faq_promote_tiers")
+    @classmethod
+    def _tiers_must_not_rise_with_evidence(
+        cls, tiers: list[tuple[int, float]],
+    ) -> list[tuple[int, float]]:
+        """More asks must never demand a higher score.
+
+        Repetition and quality are evidence for the same conclusion, so a
+        question asked more often can be admitted on a weaker answer —
+        never held to a stricter one.  This shape was configured by
+        accident once, by tuning rungs independently, and nothing caught
+        it: a card asked twice was refused at 0.79 while a card asked once
+        passed at 0.76.
+        """
+        ordered = sorted(tiers, key=lambda t: t[0])
+        for (h1, s1), (h2, s2) in zip(ordered, ordered[1:]):
+            if s2 > s1:
+                raise ValueError(
+                    f"faq_promote_tiers must not rise with hit count: "
+                    f"{h2} asks requires {s2} but {h1} asks only {s1}"
+                )
+        return tiers
+
     commission_min_hits: int = Field(default=3)
     commission_weak_score: float = Field(default=0.30)
     consult_subject_threshold: float = Field(default=0.30)
