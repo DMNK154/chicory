@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 39
+SCHEMA_VERSION = 40
 
 TABLES = [
     # -- Schema version tracking --
@@ -1013,6 +1013,50 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_patrol_visits_memory "
     "ON patrol_visits(memory_id)",
 
+    # -- Wandering librarian: what the patrol noticed, authored not derived --
+    #
+    # A footstep in patrol_visits records that a memory was visited and how
+    # it went.  It records nothing about what was SEEN.  The first errand
+    # walked 2,399 memories and the whole observational residue was a chunk
+    # count, because a repair errand has nothing to notice and nowhere
+    # durable to put it if it did.
+    #
+    # This is that place, and it is deliberately NOT one of the derived
+    # caches.  cooccurrence_edges, canopy_observations and the relational
+    # tensor all have decay-and-prune lifecycles, so an observation
+    # deposited there is eaten by the same maintenance the patrol runs
+    # beside.  Same argument closure.py makes for supersessions: a thing
+    # somebody noticed must not quietly age out.
+    #
+    # UNIQUE(errand, kind, subject) with a confirmations counter means
+    # seeing the same thing on a later lap strengthens the observation
+    # rather than duplicating it — which is what makes a point of
+    # reference accumulate weight instead of noise.
+    """
+    CREATE TABLE IF NOT EXISTS patrol_observations (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        errand        TEXT NOT NULL,
+        kind          TEXT NOT NULL,
+        subject       TEXT NOT NULL,
+        detail        TEXT,
+        weight        REAL NOT NULL DEFAULT 0.0,
+        memory_ids    TEXT NOT NULL DEFAULT '[]',
+        lap           INTEGER NOT NULL DEFAULT 0,
+        actor         TEXT NOT NULL DEFAULT 'patrol',
+        confirmations INTEGER NOT NULL DEFAULT 1,
+        retracted     INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        UNIQUE(errand, kind, subject)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_patrol_obs_kind "
+    "ON patrol_observations(kind, weight) WHERE retracted = 0",
+    "CREATE INDEX IF NOT EXISTS idx_memories_source_path "
+    "ON memories(source_path) WHERE source_path IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_patrol_obs_errand "
+    "ON patrol_observations(errand)",
+
     # -- Wandering librarian: what each errand is currently curious about --
     #
     # The small centralised half of the state.  Position is distributed
@@ -1127,6 +1171,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v37_to_v38(db)
             if current_version <= 38:
                 _migrate_v38_to_v39(db)
+            if current_version <= 39:
+                _migrate_v39_to_v40(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1140,7 +1186,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Retrieval attribution: actor on retrieval_events + query_history"),
+                (SCHEMA_VERSION, "Patrol observations: authored deposits from the wandering librarian"),
             )
 
 
@@ -1915,3 +1961,14 @@ def _migrate_v38_to_v39(db: DatabaseEngine) -> None:
                 f"ALTER TABLE {table} ADD COLUMN actor TEXT NOT NULL DEFAULT 'patron'"
             )
     db.connection.commit()
+
+
+def _migrate_v39_to_v40(db: DatabaseEngine) -> None:
+    """patrol_observations is CREATE IF NOT EXISTS and starts empty.
+
+    Nothing is back-filled.  An observation is a record that somebody
+    looked and saw something; synthesising one for a walk that never
+    happened would be the first lie in a table whose whole value is that
+    its contents were actually noticed.
+    """
+    pass

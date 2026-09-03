@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import threading
 from dataclasses import dataclass
@@ -416,6 +417,56 @@ class Patrol:
             return row is not None
         return head_lap is not None and head_lap >= lap
 
+    # ── Deposits ────────────────────────────────────────────────────────
+
+    def observe(
+        self,
+        errand: str,
+        kind: str,
+        subject: str,
+        detail: str,
+        weight: float = 0.0,
+        memory_ids: list[str] | None = None,
+        lap: int = 0,
+    ) -> None:
+        """Write down something the walk noticed.
+
+        Authored, not derived: this survives the maintenance that prunes
+        the co-occurrence, canopy and tensor caches, because a thing
+        somebody looked at and saw must not quietly age out.
+
+        Seeing the same subject again on a later lap CONFIRMS it — the row
+        is updated in place and its confirmation count rises — so a point
+        of reference gains weight by being seen repeatedly rather than
+        accumulating duplicates.
+        """
+        self._db.execute(
+            "INSERT INTO patrol_observations "
+            "(errand, kind, subject, detail, weight, memory_ids, lap, actor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(errand, kind, subject) DO UPDATE SET "
+            "detail = excluded.detail, weight = excluded.weight, "
+            "memory_ids = excluded.memory_ids, lap = excluded.lap, "
+            "confirmations = patrol_observations.confirmations + 1, "
+            "retracted = 0, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')",
+            (errand, kind, subject, detail, weight,
+             json.dumps(sorted(memory_ids or [])), lap, f"patrol:{errand}"),
+        )
+
+    def observations(
+        self, kind: str | None = None, limit: int = 50,
+    ) -> list[dict]:
+        """What the patrol has noticed, heaviest first."""
+        sql = ("SELECT * FROM patrol_observations WHERE retracted = 0")
+        params: list = []
+        if kind:
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY weight ASC, confirmations DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self._db.execute(sql, tuple(params)).fetchall()]
+
     # ── Running ─────────────────────────────────────────────────────────
 
     def run_errand(
@@ -448,6 +499,7 @@ class Patrol:
                 memory_ids=memory_ids,
                 state=record,
                 should_stop=should_stop,
+                patrol=self,
             )
             self.record_visits(name, record.lap, verdicts)
 
@@ -626,6 +678,126 @@ register(Errand(
     run=_repair_missing_embedding,
     population=(
         "NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.memory_id = m.id)"
+    ),
+    when="always",
+))
+
+
+# ── Errand: recover source provenance, and notice what the shelves hold ──
+
+_CHUNK_RE = re.compile(r"^(?P<doc>.+?)\s*\[(?P<n>\d+)/(?P<total>\d+)\]")
+
+
+def _source_provenance(
+    *,
+    db: DatabaseEngine,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Backfill source_path from the summary, and observe each document.
+
+    Every document-derived memory in this library carries its origin in
+    its summary — ``filename.pdf [327/546]`` — and nowhere else.  Not one
+    of 123,907 memories had source_path set, so file-level provenance was
+    parseable by eye and unqueryable by anything.  That is an open
+    commission the patron filed, not a defect this errand invented.
+
+    The repair is mechanical.  The OBSERVATION is the point: once a
+    document's chunks are queryable, the walk can see the document whole —
+    how many chunks it holds, over what range, and which are missing.
+    That is a fact about the library that nothing previously recorded, and
+    a wanderer is the only thing positioned to notice it, because it is
+    the only thing that reads everything.
+    """
+    verdicts: dict[str, tuple[str, str | None]] = {}
+    touched: set[str] = set()
+
+    for mid in memory_ids:
+        if should_stop is not None and should_stop():
+            break
+        row = db.execute(
+            "SELECT summary FROM memories WHERE id = ?", (mid,),
+        ).fetchone()
+        if row is None:
+            verdicts[mid] = ("skipped", "memory gone")
+            continue
+        m = _CHUNK_RE.match(row["summary"] or "")
+        if m is None:
+            # A summary with no chunk prefix carries no derivable origin.
+            # Recorded so it leaves the queue rather than being re-read
+            # every lap for a provenance it will never have.
+            verdicts[mid] = ("skipped", "no chunk prefix in summary")
+            continue
+        doc = m.group("doc").strip()
+        try:
+            db.execute(
+                "UPDATE memories SET source_path = ? WHERE id = ?", (doc, mid),
+            )
+        except Exception as exc:  # noqa: BLE001
+            verdicts[mid] = ("failed", str(exc)[:200])
+            continue
+        touched.add(doc)
+        verdicts[mid] = ("acted", f"source_path={doc[:60]}")
+
+    for doc in touched:
+        _observe_document(db, patrol, doc, state.lap)
+    return verdicts
+
+
+def _observe_document(
+    db: DatabaseEngine, patrol: "Patrol", doc: str, lap: int,
+) -> None:
+    """Record how completely this library holds one source document."""
+    rows = db.execute(
+        "SELECT summary FROM memories WHERE source_path = ? AND is_archived = 0",
+        (doc,),
+    ).fetchall()
+    seen, total = set(), 0
+    for r in rows:
+        m = _CHUNK_RE.match(r["summary"] or "")
+        if m is None:
+            continue
+        seen.add(int(m.group("n")))
+        total = max(total, int(m.group("total")))
+    if not seen or total <= 0:
+        return
+    missing = sorted(set(range(1, total + 1)) - seen)
+    coverage = len(seen) / total
+    # "Located", not "held".  Coverage is computed over memories this walk
+    # has already stamped with a source_path, so mid-lap a document looks
+    # incomplete when the rest of it simply has not been reached yet.  The
+    # upsert corrects the record as the walk proceeds, and only a gap that
+    # survives a completed lap is a real gap — so the wording must not
+    # claim more than the walk has actually established.
+    detail = f"{len(seen)}/{total} chunks located"
+    if not missing:
+        detail += " — complete"
+    else:
+        shown = ", ".join(str(x) for x in missing[:10])
+        more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+        detail += f"; not yet located: {shown}{more}"
+    patrol.observe(
+        errand="source_provenance",
+        kind="document_coverage",
+        subject=doc,
+        detail=detail,
+        # Weight is coverage, and the index orders ASCENDING: the least
+        # complete document is the one worth a person's attention.
+        weight=round(coverage, 4),
+        lap=lap,
+    )
+
+
+register(Errand(
+    name="source_provenance",
+    description="Backfill source_path from summaries; observe document coverage",
+    run=_source_provenance,
+    population=(
+        "(m.source_path IS NULL OR m.source_path = '') "
+        "AND m.summary LIKE '%[%/%]%'"
     ),
     when="always",
 ))

@@ -560,3 +560,112 @@ def test_empty_geometry_actors_lets_everyone_reshape(stack):
     stack["config"].geometry_actors = []
     geometry = set(stack["config"].geometry_actors)
     assert (not geometry) or ("anyone" in geometry)
+
+
+# ── Authored deposits ───────────────────────────────────────────────────
+
+
+def test_observation_is_written_and_readable(stack):
+    p = stack["patrol"]
+    p.observe(errand="e", kind="document_coverage", subject="book.pdf",
+              detail="8/10 chunks held; missing 3, 7", weight=0.8)
+    obs = p.observations(kind="document_coverage")
+    assert len(obs) == 1
+    assert obs[0]["subject"] == "book.pdf"
+    assert obs[0]["confirmations"] == 1
+    assert obs[0]["actor"] == "patrol:e"
+
+
+def test_seeing_it_again_confirms_rather_than_duplicates(stack):
+    """A point of reference gains weight by recurrence, not by piling up."""
+    p = stack["patrol"]
+    for _ in range(3):
+        p.observe(errand="e", kind="document_coverage", subject="book.pdf",
+                  detail="8/10", weight=0.8)
+    obs = p.observations()
+    assert len(obs) == 1
+    assert obs[0]["confirmations"] == 3
+
+
+def test_a_later_lap_updates_the_finding(stack):
+    p = stack["patrol"]
+    p.observe(errand="e", kind="document_coverage", subject="book.pdf",
+              detail="8/10", weight=0.8, lap=0)
+    p.observe(errand="e", kind="document_coverage", subject="book.pdf",
+              detail="10/10", weight=1.0, lap=1)
+    obs = p.observations()[0]
+    assert obs["detail"] == "10/10"
+    assert obs["weight"] == 1.0
+    assert obs["lap"] == 1
+
+
+def test_least_complete_documents_come_first(stack):
+    p = stack["patrol"]
+    for subj, w in (("whole.pdf", 1.0), ("gappy.pdf", 0.4), ("half.pdf", 0.5)):
+        p.observe(errand="e", kind="document_coverage", subject=subj,
+                  detail="x", weight=w)
+    assert [o["subject"] for o in p.observations()] == [
+        "gappy.pdf", "half.pdf", "whole.pdf",
+    ]
+
+
+def test_observations_survive_independently_of_visits(stack):
+    """The point of an authored table: it is not a derived cache."""
+    p = stack["patrol"]
+    p.observe(errand="e", kind="k", subject="s", detail="d")
+    stack["db"].execute("DELETE FROM patrol_visits")
+    assert len(p.observations()) == 1
+
+
+# ── The source_provenance errand ────────────────────────────────────────
+
+
+def _doc_memory(db, mid, doc, n, total):
+    db.execute(
+        "INSERT INTO memories (id, content, summary, source_model) "
+        "VALUES (?, 'body', ?, 'test')",
+        (mid, f"{doc} [{n}/{total}]"),
+    )
+
+
+def test_source_path_is_recovered_from_the_summary(stack):
+    db, p = stack["db"], stack["patrol"]
+    _doc_memory(db, "m1", "book.pdf", 1, 3)
+    result = p.run_errand("source_provenance")
+    assert result["acted"] == 1
+    row = db.execute("SELECT source_path FROM memories WHERE id='m1'").fetchone()
+    assert row["source_path"] == "book.pdf"
+
+
+def test_a_summary_with_no_chunk_prefix_is_skipped_not_retried(stack):
+    db, p = stack["db"], stack["patrol"]
+    db.execute("INSERT INTO memories (id, content, summary, source_model) "
+               "VALUES ('m1', 'body', 'desktop.ini [1/2]', 'test')")
+    db.execute("UPDATE memories SET summary = 'desktop.ini' WHERE id='m1'")
+    # population requires the bracket form, so it is not even selected
+    errand = ERRANDS["source_provenance"]
+    assert p.select(errand, 10) == []
+
+
+def test_the_walk_observes_document_coverage(stack):
+    """The observation, not the repair, is the point."""
+    db, p = stack["db"], stack["patrol"]
+    for n in (1, 2, 4):                     # chunk 3 never ingested
+        _doc_memory(db, f"m{n}", "gappy.pdf", n, 4)
+    p.run_errand("source_provenance", batch_size=10)
+    obs = p.observations(kind="document_coverage")
+    assert len(obs) == 1
+    assert obs[0]["subject"] == "gappy.pdf"
+    assert obs[0]["weight"] == 0.75
+    assert "3/4 chunks located" in obs[0]["detail"]
+    assert "not yet located: 3" in obs[0]["detail"]
+
+
+def test_a_complete_document_is_observed_as_complete(stack):
+    db, p = stack["db"], stack["patrol"]
+    for n in (1, 2, 3):
+        _doc_memory(db, f"m{n}", "whole.pdf", n, 3)
+    p.run_errand("source_provenance", batch_size=10)
+    obs = p.observations(kind="document_coverage")[0]
+    assert obs["weight"] == 1.0
+    assert "complete" in obs["detail"]

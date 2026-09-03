@@ -448,7 +448,7 @@ class ChicoryConfig(BaseModel):
     # Errands the patrol runs, in order.  Names must be registered in
     # chicory.layer4.wander.ERRANDS; unknown names are logged and skipped.
     wander_errands: list[str] = Field(
-        default_factory=lambda: ["missing_embedding"]
+        default_factory=lambda: ["missing_embedding", "source_provenance"]
     )
     # Only one process patrols a library at a time.  Every MCP client
     # session spawns its own server against the same SQLite file — 14 were
