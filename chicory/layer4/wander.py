@@ -968,6 +968,11 @@ register(Errand(
 
 _CONCEPT_RE = re.compile(r"\b([A-Z][a-zA-Z]{4,})\b")
 
+# Ingestion stamps and format labels: true of the memory, not of the
+# concept, and identical across everything imported in the same minute.
+_STRUCTURAL_TAG_PREFIXES = ("month-", "day-", "minute-", "hour-",
+                            "week-", "year-")
+
 # Capitalised common words, which a capitalisation heuristic cannot tell
 # from proper nouns.  Sentence-initial "Great" and "Lord" look exactly
 # like "Malchut" to a regex.
@@ -1068,7 +1073,14 @@ def _concept_gaps(
             # unfindable concept back into the index that cannot find it.
             near = around.setdefault(term, Counter())
             for tag in memory_tags:
-                if len(tag) > 1:      # letter tags carry no subject
+                # Letter tags carry no subject, and neither does the clock.
+                # This counter is capped at twelve keys on deposit, and on
+                # the live library six of chochmah's fourteen were stamps
+                # like `day-2026-07-17` and `minute-2026-07-17t19-30` — so
+                # half the width was spent recording an import batch.
+                # Worse, similarity computed over them measures WHEN two
+                # concepts were ingested rather than what they are about.
+                if len(tag) > 1 and not tag.startswith(_STRUCTURAL_TAG_PREFIXES):
                     near[tag] += 1
         verdicts[mid] = ("ok", f"concepts={len(about)}")
 
@@ -1082,7 +1094,20 @@ def _concept_gaps(
         ).fetchone()
         held = row["n"] if row else 0
         if held >= config.faq_gap_thin_tag_memories:
-            continue  # findable; not a gap
+            # Findable now — so retract the standing observation instead of
+            # merely declining to refresh it.  Skipping leaves the old row
+            # at retracted=0 with frozen counts, which is how `malchut`
+            # ended up still listed as a gap at mentions=3,948 while its
+            # tag held 993 memories: a live node in the net, carrying stale
+            # numbers, re-proposed forever and never leaving the desk.
+            db.execute(
+                "UPDATE patrol_observations SET retracted = 1, "
+                "detail = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+                "WHERE kind = 'concept_gap' AND subject = ? AND retracted = 0",
+                (f"closed: a tag now holds {held} memories", term),
+            )
+            continue
         term_docs = sorted(docs.get(term, set()))
         # Spread, not recurrence.  Recurrence within a memory cannot tell a
         # concept from a citation convention: on this corpus "Press",
@@ -1119,6 +1144,58 @@ def _concept_gaps(
     if deposited:
         _log.info("Concept gaps: %d recorded this pass", deposited)
     return verdicts
+
+
+def _meta_shelf_proposals(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Assemble the gap net into candidate subjects, once per lap.
+
+    A whole-net pass rather than a per-memory one, so it ignores the batch
+    it was handed and reports the walk's own footsteps as visited.  It runs
+    at most once per lap: the net only changes when concept_gaps has
+    deposited more, and re-running it inside a lap re-derives the same
+    groups at real cost.
+
+    Nothing here decides anything.  Every group lands as a PROPOSAL for the
+    meta_shelves desk, because the junk filter provably cannot finish the
+    job — a game's config file scores docJ 0.948 against a real subject's
+    0.55.
+    """
+    from chicory.layer4.meta_shelves import MetaShelfProposer
+
+    marker = f"lap{state.lap}"
+    if (state.cursor_hint or "") == marker:
+        return {mid: ("skipped", "already proposed this lap")
+                for mid in memory_ids}
+    result = MetaShelfProposer(config, db).propose()
+    db.execute(
+        "UPDATE wander_state SET cursor_hint = ?, "
+        "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE errand = ?",
+        (marker, "meta_shelf_proposals"),
+    )
+    db.connection.commit()
+    _log.info("Meta-shelf proposals: %d accepted of %d groups",
+              result.get("accepted", 0), result.get("groups", 0))
+    return {mid: ("ok", f"proposed={result.get('proposed', 0)}")
+            for mid in memory_ids}
+
+
+register(Errand(
+    name="meta_shelf_proposals",
+    description="Assemble concept gaps into candidate subjects for the desk",
+    run=_meta_shelf_proposals,
+    # Reads content for the bibliography guard and walks the whole net, so
+    # it waits for quiet like the errand whose output it consumes.
+    when="idle",
+))
 
 
 register(Errand(

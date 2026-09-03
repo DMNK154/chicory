@@ -1023,6 +1023,56 @@ def librarian_tag(
     return _call(ctx, "librarian_tag", inp)
 
 
+@mcp_server.tool()
+def meta_shelves(
+    ctx: Context,
+    action: Optional[str] = None,
+    slug: Optional[str] = None,
+    name: Optional[str] = None,
+    display_name: Optional[str] = None,
+    rationale: Optional[str] = None,
+    add: Optional[list] = None,
+    drop: Optional[list] = None,
+    author: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """The desk where a subject the library cannot retrieve by becomes a shelf.
+
+    The gap net finds concepts the shelves discuss constantly and hold no
+    tag for, then groups the ones that belong together — the Kabbalah
+    vocabulary, the Tractatus in German, Leviathan in 17th-century spelling.
+    Each group is filed as a PROPOSAL, never promoted on its own.
+
+    That is not caution for its own sake. Measured on this library, a
+    League client config scores docJ 0.948 and one lab's cellulose
+    vocabulary 0.785 — both genuinely a single source's vocabulary, and
+    neither a subject anyone wants shelved. The filter is right and the
+    outcome is still wrong, so the confirming reader is the discriminator.
+
+    action='list' (default): the proposal queue.
+    action='show' (slug=...): one charter, its members, and the RING —
+      concepts the material puts beside them that the grouping could not
+      reach. Mutual top-k drops a concept whose neighbours are busy, which
+      is why five of the twelve sefirot grouped and seven did not.
+    action='confirm' (slug, add=[...], display_name=..., rationale=...):
+      assert that these are one subject, and complete the group by hand.
+    action='retire' (slug): this is not a subject.
+    action='materialize' (slug): IRREVERSIBLE. Creates a tag per member and
+      lets the roster derive the shelf as its own root. Tags thousands of
+      memories, and nothing in the package can un-tag them.
+    action='propose': re-run the assembling pass.
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("slug", slug), ("name", name),
+        ("display_name", display_name), ("rationale", rationale),
+        ("add", add), ("drop", drop), ("author", author), ("limit", limit),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "meta_shelves", inp)
+
+
 # ── Entry point ─────────────────────────────────────────────────────
 
 

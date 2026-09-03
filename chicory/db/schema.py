@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 43
+SCHEMA_VERSION = 44
 
 TABLES = [
     # -- Schema version tracking --
@@ -1123,6 +1123,68 @@ TABLES = [
         updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
     )
     """,
+
+    # -- Meta-shelves: a subject the library discusses but cannot retrieve --
+    #
+    # The gap net finds concepts the shelves talk about constantly and have
+    # no tag for.  Singly they are a nuisance; grouped they are a SUBJECT —
+    # the sefirot were shattered across six fragments and four isolates, and
+    # no amount of geometry reassembled them, because `gevurah` and `gvurah`
+    # share literally zero memories.
+    #
+    # A charter is the assertion that some concepts are one subject.  The net
+    # PROPOSES it and a person CONFIRMS it, because the discriminator
+    # measurably cannot be automated: a League client config scores docJ
+    # 0.948 and a lab's cellulose vocabulary 0.785 — both genuinely one
+    # source's vocabulary, neither one a shelf anybody wants.  The filter is
+    # right and the outcome is still wrong, so a reviewer is load-bearing
+    # rather than a nicety.
+    #
+    # Only MEMBERSHIP and NAME are authored.  Centroid, memory count,
+    # description and routing are re-derived every rebuild, so a charter
+    # cannot drift away from the library it claims to describe.
+    """
+    CREATE TABLE IF NOT EXISTS meta_shelves (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        slug          TEXT NOT NULL UNIQUE,
+        display_name  TEXT,
+        rationale     TEXT,
+        status        TEXT NOT NULL DEFAULT 'proposed',
+        origin        TEXT NOT NULL DEFAULT 'patrol',
+        seed_json     TEXT,
+        docj          REAL,
+        ref_hi        REAL,
+        arc_mean      REAL,
+        n_core        INTEGER,
+        confirmed_by  TEXT,
+        confirmed_at  TEXT,
+        created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        -- The slug becomes subjects.name verbatim, and a derived name is a
+        -- '+'-join of member tags.  A slug holding '+' could collide with one,
+        -- and _persist_node resolves collisions with a ~2 suffix — silently
+        -- moving the permanent address this table exists to make stable.
+        CHECK (slug NOT LIKE '%+%'),
+        CHECK (status IN ('proposed', 'confirmed', 'materialized', 'retired'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS meta_shelf_members (
+        shelf_id   INTEGER NOT NULL REFERENCES meta_shelves(id) ON DELETE CASCADE,
+        concept    TEXT NOT NULL,
+        -- NULL until materialized.  This is what makes materialization
+        -- resumable per member: a run that dies halfway leaves the finished
+        -- ones stamped and the rest still NULL.
+        tag_id     INTEGER,
+        role       TEXT NOT NULL DEFAULT 'core',
+        variant_of TEXT,
+        added_by   TEXT,
+        added_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (shelf_id, concept)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_msm_tag ON meta_shelf_members(tag_id)",
+    "CREATE INDEX IF NOT EXISTS idx_meta_shelves_status ON meta_shelves(status)",
 ]
 
 
@@ -1222,6 +1284,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v41_to_v42(db)
             if current_version <= 42:
                 _migrate_v42_to_v43(db)
+            if current_version <= 43:
+                _migrate_v43_to_v44(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1235,7 +1299,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "The net of what is missing: edges between observations"),
+                (SCHEMA_VERSION, "Meta-shelf charters: an authored subject the roster derives"),
             )
 
 
@@ -2055,4 +2119,14 @@ def _migrate_v41_to_v42(db: DatabaseEngine) -> None:
 
 def _migrate_v42_to_v43(db: DatabaseEngine) -> None:
     """observation_edges is derived and rebuildable; nothing to migrate."""
+    pass
+
+
+def _migrate_v43_to_v44(db: DatabaseEngine) -> None:
+    """Meta-shelf charters are new tables; the TABLES loop creates them.
+
+    Deliberately additive-only.  No ALTER and no new column on ``subjects``:
+    a charter changes what DERIVES, not what survives the retirement sweep,
+    so the derived view stays exactly as it already is.
+    """
     pass

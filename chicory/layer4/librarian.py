@@ -537,8 +537,25 @@ class SubjectRoster:
         total_memories = max(total_row["n"] or 0, 1)
 
         min_size = self._config.subject_min_cluster_size
+        # A chartered shelf is WITHHELD from component-finding rather than
+        # exempted from retirement.  Its tags are reserved before the walk,
+        # so the sweep at the end of this method stays the plain rule it has
+        # always been — not derived this run, therefore retired.
+        #
+        # Reserving rather than un-writing the edges is deliberate: a sefirot
+        # tag gets an edge at strength exactly 1.0 to `mysticism` and
+        # `kabbalah` from _seed_tag_edges, both of which sit inside the
+        # 1,021-tag giant, so absorption is otherwise structurally certain.
+        # Deleting those edges would make the tag an island for retrieval,
+        # the canopy and centroid reweighting too.  This way the edges exist
+        # everywhere else and only the roster's component pass declines to
+        # walk through them.
+        charters, charter_notes = self._charters(topical_ids, min_size)
+        reserved: set[int] = set()
+        for _display, tags in charters.values():
+            reserved |= tags
         roots = [
-            c for c in self._connected_components(topical_ids, cold=cold)
+            c for c in self._connected_components(topical_ids - reserved, cold=cold)
             if len(c) >= min_size
         ]
 
@@ -553,6 +570,13 @@ class SubjectRoster:
             # seeded from the previous roster and not from this one.
             "prior_by_depth": {} if cold else self._prior_by_depth(),
         }
+        # Charters first, so an authored name claims the slot before any
+        # derived name can take it — the '~2' suffix then falls on the
+        # derived node, which is free to move, instead of on the address a
+        # charter exists to hold still.
+        for slug, (display, tags) in charters.items():
+            self._persist_node(tags, None, 0, "", state,
+                               forced_name=slug, display_name=display)
         for cluster in roots:
             self._persist_node(cluster, None, 0, "", state)
 
@@ -569,12 +593,76 @@ class SubjectRoster:
                 )
                 retired += 1
 
-        return {
+        result = {
             "subjects_active": len(state["active_paths"]),
             "subjects_retired": retired,
             "max_depth": state["max_depth_seen"],
             "mode": "cold" if cold else "warm",
         }
+        if charters:
+            result["charters"] = {s: len(tg) for s, (_d, tg) in charters.items()}
+        # Surfaced, never swallowed.  A charter whose members fall below
+        # min_size stops deriving and its path retires through the ordinary
+        # sweep — which would otherwise look exactly like a shelf silently
+        # disappearing.
+        if charter_notes:
+            result["charter_warnings"] = charter_notes
+        return result
+
+    def _charters(
+        self, topical_ids: set[int], min_size: int,
+    ) -> tuple[dict[str, tuple[str | None, set[int]]], list[str]]:
+        """Materialized charters, as slug -> (display name, member tag ids).
+
+        Membership is the authored part and it is intersected with
+        ``topical_ids`` here, so a member that has been deactivated, merged,
+        or pushed over the hub cap simply stops counting — but says so, in
+        the returned notes, rather than thinning the shelf in silence.
+
+        Overlap is resolved by lowest charter id, not by refusing the run.
+        Two charters claiming one tag would produce non-partitioning roots,
+        and the roster is not the right place to discover that: an exception
+        here would abort the whole maintain — sweep, roster and demand
+        ledger together — over a data problem the desk should have caught.
+        """
+        notes: list[str] = []
+        try:
+            rows = self._db.execute(
+                "SELECT s.id, s.slug, s.display_name, m.concept, m.tag_id "
+                "FROM meta_shelves s JOIN meta_shelf_members m "
+                "  ON m.shelf_id = s.id "
+                "WHERE s.status = 'materialized' AND m.tag_id IS NOT NULL "
+                "ORDER BY s.id ASC"
+            ).fetchall()
+        except Exception:
+            return {}, notes           # pre-v44 database; nothing chartered
+
+        claimed: dict[int, str] = {}
+        grouped: dict[str, tuple[str | None, set[int]]] = {}
+        for r in rows:
+            slug, tag_id = r["slug"], r["tag_id"]
+            owner = claimed.get(tag_id)
+            if owner is not None and owner != slug:
+                notes.append(
+                    f"{slug}: tag {tag_id} ({r['concept']}) already claimed "
+                    f"by {owner}; left with the earlier charter"
+                )
+                continue
+            claimed[tag_id] = slug
+            display, tags = grouped.setdefault(slug, (r["display_name"], set()))
+            if tag_id in topical_ids:
+                tags.add(tag_id)
+
+        out: dict[str, tuple[str | None, set[int]]] = {}
+        for slug, (display, tags) in grouped.items():
+            if len(tags) < min_size:
+                notes.append(
+                    f"{slug}: only {len(tags)} of its members are eligible "
+                    f"tags (needs {min_size}); shelf not derived this run"
+                )
+                continue
+            out[slug] = (display, tags)
+        return out, notes
 
     def _persist_node(
         self,
@@ -583,17 +671,44 @@ class SubjectRoster:
         depth: int,
         parent_path: str,
         state: dict,
+        forced_name: str | None = None,
+        display_name: str | None = None,
     ) -> None:
-        """Write one node, then recurse into its children if it is too big."""
+        """Write one node, then recurse into its children if it is too big.
+
+        ``forced_name`` overrides only the NAME, for a chartered meta-shelf.
+        Everything else — description, centroid, memory count, routing
+        eligibility — stays fully derived from the live data, so a charter
+        can assert what belongs together but cannot assert what it is like.
+
+        The name matters enough to author because it is the UPSERT conflict
+        key AND the address.  A derived name is the top three member tags
+        joined with '+', so it moves the instant their ranking changes:
+        ``malchut+binah+yesod`` becomes a different row the moment binah's
+        memory count overtakes yesod's, retiring the old row and orphaning
+        its display name.  Four retired rows in the live library already
+        carry display names that are now unreachable that way.
+        """
         name, description, centroid, memory_count = self._describe(
             cluster, state.get("tag_members"),
         )
         if name is None:
             return
+        if forced_name:
+            name = forced_name
 
         # Names stay globally unique (the column's constraint); the path is
         # the address a specialist is dispatched to.
         if name in state["used_names"]:
+            if forced_name:
+                # Charters are persisted before derived roots and slugs are
+                # unique, so this cannot happen from the roster's own names.
+                # If it ever does, suffixing would silently move the one
+                # address that is supposed to be permanent — refuse instead.
+                raise ValueError(
+                    f"chartered shelf {forced_name!r} collides with an "
+                    f"already-persisted node; refusing to rename it"
+                )
             suffix = 2
             while f"{name}~{suffix}" in state["used_names"]:
                 suffix += 1
@@ -606,8 +721,9 @@ class SubjectRoster:
         self._db.execute(
             """
             INSERT INTO subjects (name, description, centroid, member_tag_ids,
-                                  memory_count, status, parent_id, depth, path)
-            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                                  memory_count, status, parent_id, depth, path,
+                                  display_name)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 description = excluded.description,
                 centroid = excluded.centroid,
@@ -621,7 +737,8 @@ class SubjectRoster:
             """,
             (name, description,
              _array_to_blob(centroid) if centroid is not None else None,
-             json.dumps(sorted(cluster)), memory_count, parent_id, depth, path),
+             json.dumps(sorted(cluster)), memory_count, parent_id, depth, path,
+             display_name),
         )
         row = self._db.execute(
             "SELECT id FROM subjects WHERE name = ?", (name,),

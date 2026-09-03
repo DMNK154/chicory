@@ -42,6 +42,7 @@ def dispatch_tool_call(
         "librarian_desk": _handle_librarian_desk,
         "librarian_closure": _handle_librarian_closure,
         "librarian_gaps": _handle_librarian_gaps,
+        "meta_shelves": _handle_meta_shelves,
         "librarian_tag": _handle_librarian_tag,
     }
 
@@ -269,4 +270,18 @@ def _handle_librarian_tag(o: "Orchestrator", inp: dict) -> dict:
         memory_ids=inp.get("memory_ids"),
         author=inp.get("author"),
         limit=inp.get("limit", 5000),
+    )
+
+
+def _handle_meta_shelves(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_meta_shelves(
+        action=inp.get("action", "list"),
+        slug=inp.get("slug"),
+        name=inp.get("name"),
+        display_name=inp.get("display_name"),
+        rationale=inp.get("rationale"),
+        add=inp.get("add"),
+        drop=inp.get("drop"),
+        author=inp.get("author"),
+        limit=inp.get("limit", 20),
     )

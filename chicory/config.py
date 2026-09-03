@@ -379,6 +379,76 @@ class ChicoryConfig(BaseModel):
     # in German, Leviathan in 17th-century spelling, the Tibetan corpus.
     # 0.2 breaks the largest chain but loses those relationships with it.
     gap_edge_min_weight: float = Field(default=0.10)
+
+    # ── Meta-shelf charters ────────────────────────────────────────────
+    #
+    # Direct co-occurrence Jaccard cannot assemble a subject, and the
+    # ceiling is arithmetic rather than a tuning failure: Jaccard is bounded
+    # above by min(m_a, m_b) / max(m_a, m_b), and the sefirot span 66 to
+    # 3,948 mentions, so 17 of their 78 pairs CANNOT reach 0.10 however
+    # perfectly they correlate.  Two second-order signals do work.
+    #
+    # arc — cosine over the `around` tag counters, after applying the
+    # roster's own topical rule.  "Do these live in the same material."
+    # Reusing _topical_tag_ids is load-bearing: unfiltered, every
+    # component's top three around-tags are document / pdf / month-2026-05,
+    # and the resulting similarity measures the import batch.
+    #
+    # sc — cosine over the raw `co` counters.  Scale-free, so it is immune
+    # to the frequency ceiling above.  Measured: sefirot mean 0.436 against
+    # a null of 0.0042.
+    meta_shelf_arc_min: float = Field(default=0.90)
+    meta_shelf_sc_min: float = Field(default=0.25)
+    # Mutual top-k, not a threshold — the anti-chaining device, and not
+    # optional.  Single linkage on any one signal blows up: document
+    # Jaccard at 0.2 gives a 5,821-of-6,159 blob, and raw arc >= 0.97 gives
+    # 480 nodes, which is simply "the Zohar".
+    meta_shelf_mutual_k: int = Field(default=8)
+    # A component too big to be one subject is re-clustered on its own
+    # members at a stricter sc, recursively.  This is what separates the
+    # Idra vocabulary from the Torah-portion vocabulary inside the
+    # 450-node Zohar component.
+    meta_shelf_split_cap: int = Field(default=100)
+    meta_shelf_sc_step: float = Field(default=0.05)
+    meta_shelf_sc_ceiling: float = Field(default=0.75)
+    # Junk guards.  docJ is mean pairwise Jaccard of members' document
+    # sets: a real vocabulary's terms share files, a citation convention's
+    # terms each sit in a different reference list.  refHi is the fraction
+    # of members appearing mostly in citation context — the only rule that
+    # catches a bibliography that IS document-concentrated, i.e. one lab
+    # where everyone cites everyone.
+    #
+    # Neither is sufficient and that is not a defect to tune away.
+    # Measured on real groups: a League client config scores docJ 0.948 and
+    # a lab's cellulose vocabulary 0.785 — both genuinely one source's
+    # vocabulary, and neither a shelf anyone wants.  The filter is right
+    # and the outcome is still wrong, which is why charters are confirmed
+    # by a person rather than promoted automatically.
+    meta_shelf_min_docj: float = Field(default=0.25)
+    meta_shelf_max_ref_hi: float = Field(default=0.15)
+    meta_shelf_min_size: int = Field(default=5)
+    # A charter is persisted as a root and then offered to _should_split
+    # like any other node.  Below this it is always a single leaf — its own
+    # tight shelf, which is the geometry that avoids the measured breadth
+    # bias.  Above it a charter could be split into children and stop being
+    # one address, so confirm refuses it instead.
+    #
+    # A backstop, deliberately not a filter.  _should_split triggers at
+    # subject_max_component_fraction of eligible tags — 0.25 of 1,855, so
+    # 463 — and at 0.15 of the library by memory.  Set to 80 this rejected
+    # the Upanishad vocabulary (99 members, docJ 0.812) and the
+    # Torah-portion vocabulary (91), both real subjects nowhere near
+    # splitting.  150 leaves a wide margin under the true threshold while
+    # still refusing a "subject" that is really a whole corpus.
+    meta_shelf_max_size: int = Field(default=150)
+    # Transliteration and plural variants: `gevurah` and `gvurah` share
+    # ZERO memories, so no co-occurrence signal of any strength reaches
+    # them.  Only the spelling does, at ratio 0.923.
+    meta_shelf_variant_ratio: float = Field(default=0.80)
+    meta_shelf_ring_max: int = Field(default=60)
+    # A `co` key held by more than this many concepts says nothing about
+    # any of them; it is a stopword of the corpus rather than of English.
+    meta_shelf_co_stopword_holders: int = Field(default=400)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the

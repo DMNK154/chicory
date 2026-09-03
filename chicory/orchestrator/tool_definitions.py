@@ -403,6 +403,65 @@ CHICORY_TOOLS = [
         },
     },
     {
+        "name": "meta_shelves",
+        "description": (
+            "The desk where a subject the library cannot retrieve by becomes "
+            "a shelf. The gap net groups concepts that belong together — the "
+            "Kabbalah vocabulary, the Tractatus in German, Leviathan in "
+            "period spelling — and files each group as a PROPOSAL. A person "
+            "confirms, because the discriminator cannot be automated: a "
+            "game's config file scores better on every available measure "
+            "than a real subject does. Confirming can also COMPLETE a group "
+            "the grouping could not reach, from the ring that 'show' lists."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "show", "confirm", "retire",
+                             "materialize", "propose"],
+                    "description": (
+                        "list (default) — the proposal queue. show — one "
+                        "charter, its members, and the ring of concepts "
+                        "around it that could be added. confirm — assert "
+                        "these concepts are one subject. retire — this is "
+                        "not a subject. materialize — IRREVERSIBLE: creates "
+                        "a tag per member so the roster derives the shelf; "
+                        "there is no un-tag path. propose — re-run the pass."
+                    ),
+                },
+                "slug": {"type": "string", "description": "Which charter."},
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Rename the charter's permanent address at confirm "
+                        "time. No '+' or '/'."
+                    ),
+                },
+                "display_name": {"type": "string"},
+                "rationale": {
+                    "type": "string",
+                    "description": (
+                        "Why these are one subject — the part only a person "
+                        "knows, which the corpus does not encode anywhere."
+                    ),
+                },
+                "add": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": (
+                        "Concepts to add. Each must sit in the same material "
+                        "and either share memories with the core or be a "
+                        "spelling variant of a member."
+                    ),
+                },
+                "drop": {"type": "array", "items": {"type": "string"}},
+                "author": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
         "name": "librarian_gaps",
         "description": (
             "The net of what this library is MISSING. Every other graph "

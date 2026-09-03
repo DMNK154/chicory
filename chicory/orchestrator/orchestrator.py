@@ -2071,6 +2071,378 @@ class Orchestrator:
             ),
         }
 
+    def handle_meta_shelves(
+        self,
+        action: str = "list",
+        slug: str | None = None,
+        name: str | None = None,
+        display_name: str | None = None,
+        rationale: str | None = None,
+        add: list[str] | None = None,
+        drop: list[str] | None = None,
+        author: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """The desk where a missing subject becomes a shelf.
+
+        The gap net can find that a set of concepts belongs together; it
+        cannot decide that the set deserves a shelf.  That is not a gap in
+        the implementation.  Measured on this library, a League client
+        config scores docJ 0.948 and one lab's cellulose vocabulary 0.785 —
+        both genuinely a single source's vocabulary, and neither one a
+        subject anybody wants shelved.  The filter is correct and the
+        outcome is still wrong, so the confirming reader is load-bearing.
+
+        It is also the only thing that can COMPLETE a group.  The net puts
+        five of the twelve sefirot together and cannot reach the rest,
+        because each one's eight nearest neighbours are filled with other
+        Zohar vocabulary.  The ring shown by ``show`` is what that reader
+        adds from.
+
+        list        — the proposal queue
+        show        — one proposal, its members, and the ring around it
+        confirm     — assert that these concepts are one subject
+        retire      — this is not a subject
+        materialize — IRREVERSIBLE: create the tags, let the roster derive
+        propose     — re-run the pass that builds the queue
+        """
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action == "propose":
+                    from chicory.layer4.meta_shelves import MetaShelfProposer
+                    return MetaShelfProposer(self._config, self._db).propose()
+                if action == "list":
+                    return self._meta_shelf_list(limit)
+                if action == "show":
+                    if not slug:
+                        return {"error": "show requires slug"}
+                    return self._meta_shelf_show(slug, limit)
+                if action == "confirm":
+                    if not slug:
+                        return {"error": "confirm requires slug"}
+                    return self._meta_shelf_confirm(
+                        slug, name, display_name, rationale, add, drop, author)
+                if action == "retire":
+                    if not slug:
+                        return {"error": "retire requires slug"}
+                    n = self._db.execute(
+                        "UPDATE meta_shelves SET status = 'retired', "
+                        "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+                        "WHERE slug = ? AND status != 'materialized'", (slug,),
+                    ).rowcount
+                    self._db.connection.commit()
+                    return {"slug": slug, "retired": bool(n),
+                            "note": None if n else
+                            "not found, or already materialized — retire the "
+                            "shelf itself through librarian_subjects instead"}
+                if action == "materialize":
+                    if not slug:
+                        return {"error": "materialize requires slug"}
+                    return self._materialize_charter(slug, author)
+                return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
+    def _meta_shelf_list(self, limit: int) -> dict[str, Any]:
+        rows = self._db.execute(
+            "SELECT s.id, s.slug, s.display_name, s.status, s.docj, s.ref_hi, "
+            "s.arc_mean, s.n_core, s.confirmed_by, "
+            "COUNT(m.concept) AS members, "
+            "SUM(CASE WHEN m.tag_id IS NOT NULL THEN 1 ELSE 0 END) AS tagged "
+            "FROM meta_shelves s LEFT JOIN meta_shelf_members m "
+            "  ON m.shelf_id = s.id "
+            "WHERE s.status != 'retired' "
+            "GROUP BY s.id ORDER BY "
+            "  CASE s.status WHEN 'materialized' THEN 0 WHEN 'confirmed' "
+            "  THEN 1 ELSE 2 END, members DESC LIMIT ?", (limit,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            sample = [x["concept"] for x in self._db.execute(
+                "SELECT concept FROM meta_shelf_members WHERE shelf_id = ? "
+                "LIMIT 8", (r["id"],))]
+            out.append({
+                "slug": r["slug"], "display_name": r["display_name"],
+                "status": r["status"], "members": r["members"],
+                "tagged": r["tagged"] or 0, "docj": r["docj"],
+                "ref_hi": r["ref_hi"], "sample": sample,
+                "confirmed_by": r["confirmed_by"],
+            })
+        return {
+            "shelves": out,
+            "note": (
+                "docJ is how much the members share documents; ref_hi how "
+                "much they look like a bibliography.  Both are advisory — a "
+                "game's config file scores better than a real subject does."
+            ) if out else "no proposals yet — run action='propose'",
+        }
+
+    def _meta_shelf_show(self, slug: str, limit: int) -> dict[str, Any]:
+        row = self._db.execute(
+            "SELECT * FROM meta_shelves WHERE slug = ?", (slug,)).fetchone()
+        if row is None:
+            return {"error": f"no charter {slug!r}"}
+        members = [dict(r) for r in self._db.execute(
+            "SELECT concept, role, variant_of, tag_id FROM meta_shelf_members "
+            "WHERE shelf_id = ? ORDER BY role, concept", (row["id"],))]
+        names = [m["concept"] for m in members]
+        return {
+            "slug": row["slug"], "display_name": row["display_name"],
+            "status": row["status"], "rationale": row["rationale"],
+            "docj": row["docj"], "ref_hi": row["ref_hi"],
+            "arc_mean": row["arc_mean"],
+            "members": members,
+            "ring": self._meta_shelf_ring(names, limit),
+            "note": (
+                "The ring is what the material puts next to these and the "
+                "grouping could not reach — mutual top-k drops a concept "
+                "whose neighbours are busy, which is why five of the twelve "
+                "sefirot grouped and seven did not.  Add from it with "
+                "action='confirm', add=[...]."
+            ),
+        }
+
+    def _meta_shelf_ring(self, members: list[str], limit: int) -> list[dict]:
+        """Concepts that would pass the confirm guard but were not grouped."""
+        from chicory.layer4.meta_shelves import MetaShelfProposer, _cosine
+        proposer = MetaShelfProposer(self._config, self._db)
+        nodes = proposer._load_nodes()
+        core = [m for m in members if m in nodes]
+        if not core:
+            return []
+        arc_min = self._config.meta_shelf_arc_min
+        sc_min = self._config.meta_shelf_sc_min
+        ring = []
+        for name, n in nodes.items():
+            if name in members:
+                continue
+            arc = max(_cosine(n["around"], nodes[c]["around"]) for c in core)
+            if arc < arc_min:
+                continue
+            sc = max(_cosine(n["co"], nodes[c]["co"]) for c in core)
+            if sc < sc_min:
+                continue
+            ring.append({"concept": name, "arc": round(arc, 4),
+                         "sc": round(sc, 4), "mentions": n["mentions"]})
+        ring.sort(key=lambda r: -r["sc"])
+        return ring[:limit]
+
+    def _meta_shelf_confirm(
+        self, slug: str, name: str | None, display_name: str | None,
+        rationale: str | None, add: list[str] | None,
+        drop: list[str] | None, author: str | None,
+    ) -> dict[str, Any]:
+        row = self._db.execute(
+            "SELECT id, status FROM meta_shelves WHERE slug = ?", (slug,)
+        ).fetchone()
+        if row is None:
+            return {"error": f"no charter {slug!r}"}
+        if row["status"] == "materialized":
+            return {"error": f"{slug!r} is already materialized"}
+        shelf_id = row["id"]
+
+        if name and ("+" in name or "/" in name):
+            return {"error": "a shelf name cannot contain '+' or '/' — those "
+                             "belong to derived names and to paths"}
+
+        for concept in (drop or []):
+            self._db.execute(
+                "DELETE FROM meta_shelf_members WHERE shelf_id = ? "
+                "AND concept = ? AND tag_id IS NULL", (shelf_id, concept))
+
+        # The guard on additions: a person may COMPLETE a group the net
+        # could not reach, but not invent one.  Every addition must sit in
+        # the same material (arc) and either share memories with the core
+        # (sc) or be a spelling variant of something already in it.
+        rejected = []
+        if add:
+            from difflib import SequenceMatcher
+
+            from chicory.layer4.meta_shelves import MetaShelfProposer, _cosine
+            proposer = MetaShelfProposer(self._config, self._db)
+            nodes = proposer._load_nodes()
+            existing = [r["concept"] for r in self._db.execute(
+                "SELECT concept FROM meta_shelf_members WHERE shelf_id = ?",
+                (shelf_id,))]
+            core = [c for c in existing if c in nodes]
+            for concept in add:
+                if concept in existing:
+                    continue
+                n = nodes.get(concept)
+                if n is None:
+                    rejected.append({"concept": concept,
+                                     "why": "no gap observation carries it"})
+                    continue
+                arc = max((_cosine(n["around"], nodes[c]["around"])
+                           for c in core), default=0.0)
+                sc = max((_cosine(n["co"], nodes[c]["co"])
+                          for c in core), default=0.0)
+                variant = next(
+                    (c for c in core
+                     if SequenceMatcher(None, concept, c).ratio()
+                     >= self._config.meta_shelf_variant_ratio), None)
+                if arc < self._config.meta_shelf_arc_min:
+                    rejected.append({"concept": concept, "arc": round(arc, 4),
+                                     "why": "different material"})
+                    continue
+                if sc < self._config.meta_shelf_sc_min and variant is None:
+                    rejected.append({"concept": concept, "sc": round(sc, 4),
+                                     "why": "shares no memories with the core"})
+                    continue
+                self._db.execute(
+                    "INSERT OR IGNORE INTO meta_shelf_members "
+                    "(shelf_id, concept, role, variant_of, added_by) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (shelf_id, concept, "variant" if variant else "added",
+                     variant, author or "librarian:confirm"))
+                # An addition joins the core immediately, so later entries in
+                # the same call can anchor to it.  Without this, completing a
+                # group in one call depends on nothing in it depending on
+                # anything else in it — and `gevurah` can only enter as a
+                # variant of `gvurah`, which is itself being added here.
+                existing.append(concept)
+                if concept in nodes:
+                    core.append(concept)
+
+        total = self._db.execute(
+            "SELECT COUNT(*) AS n FROM meta_shelf_members WHERE shelf_id = ?",
+            (shelf_id,)).fetchone()["n"]
+        if total > self._config.meta_shelf_max_size:
+            self._db.connection.rollback()
+            return {"error": f"{total} members exceeds meta_shelf_max_size "
+                             f"({self._config.meta_shelf_max_size}); a charter "
+                             f"that large would be split into children and "
+                             f"stop being one address"}
+
+        sets, params = ["status = 'confirmed'"], []
+        if display_name:
+            sets.append("display_name = ?")
+            params.append(display_name)
+        if rationale:
+            sets.append("rationale = ?")
+            params.append(rationale)
+        if name and name != slug:
+            sets.append("slug = ?")
+            params.append(name)
+        sets += ["confirmed_by = ?",
+                 "confirmed_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')",
+                 "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')"]
+        params.append(author or "librarian:confirm")
+        params.append(shelf_id)
+        self._db.execute(
+            f"UPDATE meta_shelves SET {', '.join(sets)} WHERE id = ?", params)
+        self._db.connection.commit()
+
+        return {
+            "slug": name or slug, "status": "confirmed", "members": total,
+            "rejected": rejected,
+            "next": (
+                "action='materialize' creates a tag per member and lets the "
+                "roster derive the shelf.  That tags thousands of memories "
+                "and there is no un-tag path anywhere in the package — "
+                "confirm is the last reversible step."
+            ),
+        }
+
+    def _materialize_charter(
+        self, slug: str, author: str | None = None,
+    ) -> dict[str, Any]:
+        """Turn a confirmed charter into tags the roster can derive from.
+
+        This is the irreversible step and it is deliberately separate from
+        confirm.  There is no un-tag path anywhere in the package — the only
+        DELETE FROM memory_tags lives inside TagManager.merge_tags, which no
+        handler and no tool reaches — so retiring a charter afterwards
+        un-shelves it but leaves every memory tagged.
+
+        Order matters and is not cosmetic.  _seed_tag_edges writes strength
+        as shared/len(memory_ids), which is DIRECTIONAL containment, so each
+        pair only gets the later tag's view of the earlier one.  Measured on
+        the sefirot: largest-first yields 40 intra-group edges and a single
+        14-node cluster; smallest-first yields 20 edges, an 11-node cluster
+        and four isolates.  Descending by size it is.
+
+        Resumable by construction: a member is skipped once it has a tag_id,
+        so a run that dies halfway can simply be run again.
+        """
+        row = self._db.execute(
+            "SELECT id, slug, display_name, status FROM meta_shelves "
+            "WHERE slug = ?", (slug,),
+        ).fetchone()
+        if row is None:
+            return {"error": f"no charter {slug!r}"}
+        if row["status"] == "proposed":
+            return {"error": f"{slug!r} has not been confirmed yet"}
+        shelf_id = row["id"]
+
+        pending = [r["concept"] for r in self._db.execute(
+            "SELECT concept FROM meta_shelf_members "
+            "WHERE shelf_id = ? AND tag_id IS NULL", (shelf_id,))]
+        if not pending:
+            self._db.execute(
+                "UPDATE meta_shelves SET status = 'materialized', "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+                "WHERE id = ?", (shelf_id,))
+            self._db.connection.commit()
+            return {"slug": slug, "status": "materialized",
+                    "note": "every member already had a tag"}
+
+        sized = sorted(
+            ((c, len(self._memories_discussing(c, 20000))) for c in pending),
+            key=lambda x: -x[1],
+        )
+        who = author or "librarian:meta-shelf"
+        applied, skipped = [], []
+        for concept, n in sized:
+            if n == 0:
+                skipped.append({"concept": concept,
+                                "why": "no memories recoverable for it"})
+                continue
+            result = self.handle_librarian_tag(
+                action="apply", tag=concept, concept=concept, author=who)
+            tag_id = result.get("tag_id")
+            if tag_id is None:
+                skipped.append({"concept": concept,
+                                "why": result.get("error", "tagging failed")})
+                continue
+            self._db.execute(
+                "UPDATE meta_shelf_members SET tag_id = ? "
+                "WHERE shelf_id = ? AND concept = ?",
+                (tag_id, shelf_id, concept))
+            self._db.execute(
+                "UPDATE patrol_observations SET retracted = 1, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+                "WHERE kind = 'concept_gap' AND subject = ?", (concept,))
+            self._db.connection.commit()
+            applied.append({"concept": concept, "tag_id": tag_id,
+                            "memories": result.get("tag_now_holds", n)})
+
+        done = self._db.execute(
+            "SELECT COUNT(*) AS n FROM meta_shelf_members "
+            "WHERE shelf_id = ? AND tag_id IS NOT NULL", (shelf_id,)
+        ).fetchone()["n"]
+        status = "materialized" if done >= self._config.meta_shelf_min_size \
+            else "confirmed"
+        self._db.execute(
+            "UPDATE meta_shelves SET status = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
+            (status, shelf_id))
+        self._db.connection.commit()
+
+        return {
+            "slug": slug, "status": status, "tagged": applied,
+            "skipped": skipped, "members_with_tags": done,
+            "next": (
+                "run librarian_maintain — the roster will reserve these tags "
+                "and derive the shelf as its own root"
+            ) if status == "materialized" else (
+                f"only {done} members got tags, below meta_shelf_min_size "
+                f"({self._config.meta_shelf_min_size}); the shelf will not "
+                f"derive until more do"
+            ),
+        }
+
     def handle_librarian_gaps(
         self,
         action: str = "clusters",
