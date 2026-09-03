@@ -361,9 +361,23 @@ class ChicoryConfig(BaseModel):
     # crystallized; and a candidate serves nothing until a person approves
     # it, so the cost of a wrong one is a reader's time.
     faq_promote_min_hits: int = Field(default=1)
-    # 0.70 sits in the gap the data shows between answerable and not: every
-    # card worth reading scored >= 0.83, both duds scored 0.48 and 0.63.
+    # Fallback quality bar, used only when faq_promote_tiers is empty.
     faq_promote_min_score: float = Field(default=0.70)
+    # Repetition and quality trade against each other, so the bar is a
+    # ladder rather than one number: (minimum asks, minimum score),
+    # evaluated from the most asks down, first match wins.
+    #
+    # A question asked once has to answer itself convincingly (0.95).
+    # Asked three times it is demonstrably wanted, so a merely good answer
+    # will do (0.70).  Two sits between (0.80) — and on the live library
+    # that tier is bimodal, two clusters near 0.98 and a clean gap down to
+    # the duds, so anything from 0.65 to 0.82 selects the same three.
+    #
+    # An empty list disables the ladder and falls back to the flat
+    # faq_promote_min_hits / faq_promote_min_score pair above.
+    faq_promote_tiers: list[tuple[int, float]] = Field(
+        default_factory=lambda: [(3, 0.70), (2, 0.80), (1, 0.95)]
+    )
     commission_min_hits: int = Field(default=3)
     commission_weak_score: float = Field(default=0.30)
     consult_subject_threshold: float = Field(default=0.30)

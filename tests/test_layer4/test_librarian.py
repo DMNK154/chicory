@@ -1888,3 +1888,64 @@ class TestApproveRegrounding:
         fid = self._card(stack, ["m1"])
         faq.retire(fid)
         assert faq.approve(fid, answer="x", supporting_memory_ids=["m1"]) is False
+
+
+class TestPromotionTiers:
+    """The bar is a ladder: repetition and quality trade against each other.
+
+    Requiring a fixed amount of both is what got these gates calibrated
+    backwards — three asks filtering hard while 0.45 filtered nothing.
+    """
+
+    def _ledger(self, stack, **cfg):
+        for k, v in cfg.items():
+            setattr(stack["config"], k, v)
+        return DemandLedger(
+            stack["config"], stack["db"], _StubStore([]),
+            FaqDesk(stack["config"], stack["db"]),
+            CommissionDesk(stack["config"], stack["db"]), stack["roster"],
+        )
+
+    def test_default_ladder(self, stack):
+        led = self._ledger(stack)
+        assert led._required_score(1) == 0.95
+        assert led._required_score(2) == 0.80
+        assert led._required_score(3) == 0.70
+        assert led._required_score(50) == 0.70   # more asks never raise it
+
+    def test_a_single_ask_needs_a_convincing_answer(self, stack):
+        led = self._ledger(stack)
+        assert 0.94 < led._required_score(1)     # 0.94 is refused
+        assert 0.96 > led._required_score(1)     # 0.96 passes
+
+    def test_below_the_lowest_rung_is_refused(self, stack):
+        led = self._ledger(stack, faq_promote_tiers=[(3, 0.70), (2, 0.80)])
+        assert led._required_score(2) == 0.80
+        assert led._required_score(1) is None    # no rung for a single ask
+
+    def test_unsorted_tiers_still_evaluate_high_to_low(self, stack):
+        led = self._ledger(stack, faq_promote_tiers=[(1, 0.95), (3, 0.70), (2, 0.80)])
+        assert led._required_score(3) == 0.70
+
+    def test_empty_ladder_falls_back_to_the_flat_pair(self, stack):
+        led = self._ledger(
+            stack, faq_promote_tiers=[],
+            faq_promote_min_hits=2, faq_promote_min_score=0.55,
+        )
+        assert led._required_score(1) is None
+        assert led._required_score(2) == 0.55
+
+    def test_the_ladder_gates_actual_promotion(self, stack):
+        """A single ask scoring 0.80 promoted under a flat 0.70 bar; under
+        the ladder it must not, because one ask needs 0.95."""
+        _insert_memory(stack["db"], "sup1")
+        led = self._ledger(stack)
+        led._faq = FaqDesk(stack["config"], stack["db"])
+        led._memory_store = _StubStore([(_mem("sup1"), 0.9)])
+        led.record("asked once, answered decently", _basis_vec(0), 5, 0.80)
+        assert led.process_batch(allow_retrieval=True)["faq_candidates"] == 0
+
+        # Same question, same score, asked twice more — now it clears 0.70.
+        for _ in range(2):
+            led.record("asked once, answered decently", _basis_vec(0), 5, 0.80)
+        assert led.process_batch(allow_retrieval=True)["faq_candidates"] == 1

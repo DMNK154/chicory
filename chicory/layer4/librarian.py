@@ -1803,6 +1803,25 @@ class DemandLedger:
             for r in rows
         }
 
+    def _required_score(self, hits: int) -> float | None:
+        """The quality bar this many asks must clear, or None to refuse.
+
+        Repetition is evidence of demand and score is evidence of an
+        answer; requiring a fixed amount of both is what got the gates
+        calibrated backwards. The ladder trades them off instead — asked
+        once, a question has to answer itself convincingly; asked
+        repeatedly, a merely good answer earns a card.
+        """
+        tiers = self._config.faq_promote_tiers
+        if not tiers:
+            if hits < self._config.faq_promote_min_hits:
+                return None
+            return self._config.faq_promote_min_score
+        for min_hits, min_score in sorted(tiers, key=lambda t: -t[0]):
+            if hits >= min_hits:
+                return min_score
+        return None
+
     def _promote(
         self,
         clusters: dict[int, tuple[np.ndarray, int, float]],
@@ -1819,9 +1838,10 @@ class DemandLedger:
                 continue
             question = rep_row["representative_query"]
 
+            required = self._required_score(hits)
             if (
-                hits >= self._config.faq_promote_min_hits
-                and mean_score >= self._config.faq_promote_min_score
+                required is not None
+                and mean_score >= required
                 and allow_retrieval
                 and not self._faq.has_similar(
                     centroid, self._config.demand_cluster_threshold,
