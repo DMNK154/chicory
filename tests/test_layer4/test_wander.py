@@ -689,7 +689,9 @@ def test_a_recurring_capitalised_term_with_no_tag_is_recorded(stack):
     obs = p.observations(kind="concept_gap")
     assert [o["subject"] for o in obs] == ["tiferet"]
     assert "cannot retrieve by it" in obs[0]["detail"]
-    assert obs[0]["weight"] == 0.0
+    # Weight is SPREAD now: one document, one memory -> 1.0. Concentration
+    # only becomes meaningful once the term recurs across memories.
+    assert obs[0]["weight"] == 1.0
 
 
 def test_a_term_mentioned_once_is_not_a_concept(stack):
@@ -743,3 +745,40 @@ def test_the_survey_waits_for_quiet(stack):
     _content_memory(stack["db"], "m1", "Malchut Malchut Malchut Malchut.")
     assert stack["patrol"].run_due(idle=False)["errands"] == []
     assert stack["patrol"].run_due(idle=True)["errands"][0]["examined"] == 1
+
+
+def test_a_term_spread_across_documents_ranks_below_a_concentrated_one(stack):
+    """The fix for the first dictionary: 'Press' and 'University' recur in
+    every bibliography and topped a list built on recurrence alone. What
+    separates vocabulary from a concept is how far it ranges."""
+    db, p = stack["db"], stack["patrol"]
+    # a concept: many mentions, one document
+    for i in range(4):
+        db.execute("INSERT INTO memories (id, content, summary, source_model, source_path) "
+                   "VALUES (?, 'Malchut Malchut Malchut Malchut.', 'x', 't', 'zohar.pdf')",
+                   (f"c{i}",))
+    # furniture: same mentions, spread over four documents
+    for i in range(4):
+        db.execute("INSERT INTO memories (id, content, summary, source_model, source_path) "
+                   "VALUES (?, 'Cambridge Cambridge Cambridge Cambridge.', 'x', 't', ?)",
+                   (f"v{i}", f"book{i}.pdf"))
+    p.run_errand("concept_gaps", batch_size=20)
+    obs = {o["subject"]: o for o in p.observations(kind="concept_gap")}
+    assert obs["malchut"]["weight"] < obs["cambridge"]["weight"]
+    # and the ordering puts the concept first
+    assert p.observations(kind="concept_gap")[0]["subject"] == "malchut"
+
+
+def test_documents_accumulate_across_passes(stack):
+    """A walk sees a batch at a time, so corpus-wide spread must carry."""
+    import json
+    db, p = stack["db"], stack["patrol"]
+    for i, doc in enumerate(("a.pdf", "b.pdf")):
+        db.execute("INSERT INTO memories (id, content, summary, source_model, source_path) "
+                   "VALUES (?, 'Tiferet Tiferet Tiferet Tiferet.', 'x', 't', ?)",
+                   (f"m{i}", doc))
+    p.run_errand("concept_gaps", batch_size=1)
+    p.run_errand("concept_gaps", batch_size=1)
+    obs = p.observations(kind="concept_gap")[0]
+    assert json.loads(obs["data"])["documents"] == ["a.pdf", "b.pdf"]
+    assert obs["confirmations"] == 2

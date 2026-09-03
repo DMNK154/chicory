@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 42
 
 TABLES = [
     # -- Schema version tracking --
@@ -1054,6 +1054,11 @@ TABLES = [
         memory_ids    TEXT NOT NULL DEFAULT '[]',
         lap           INTEGER NOT NULL DEFAULT 0,
         actor         TEXT NOT NULL DEFAULT 'patrol',
+        -- Structured state the observation accumulates across passes.
+        -- A walk sees a batch at a time, so anything measured over the
+        -- whole corpus — how many distinct documents mention a term —
+        -- has to be carried here rather than recomputed from scratch.
+        data          TEXT NOT NULL DEFAULT '{}',
         confirmations INTEGER NOT NULL DEFAULT 1,
         retracted     INTEGER NOT NULL DEFAULT 0,
         created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
@@ -1186,6 +1191,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v39_to_v40(db)
             if current_version <= 40:
                 _migrate_v40_to_v41(db)
+            if current_version <= 41:
+                _migrate_v41_to_v42(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1199,7 +1206,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Per-document content hashing: stop dedup shredding revisions"),
+                (SCHEMA_VERSION, "Observation state: accumulate corpus-wide measures across passes"),
             )
 
 
@@ -2000,4 +2007,18 @@ def _migrate_v40_to_v41(db: DatabaseEngine) -> None:
     not a migration.
     """
     db.execute("DROP INDEX IF EXISTS idx_memories_content_hash")
+    db.connection.commit()
+
+
+def _migrate_v41_to_v42(db: DatabaseEngine) -> None:
+    """Add the accumulator column to patrol_observations."""
+    if not _has_table(db, "patrol_observations"):
+        return
+    cols = {r["name"] for r in db.execute(
+        "PRAGMA table_info(patrol_observations)").fetchall()}
+    if "data" not in cols:
+        db.execute(
+            "ALTER TABLE patrol_observations "
+            "ADD COLUMN data TEXT NOT NULL DEFAULT '{}'"
+        )
     db.connection.commit()

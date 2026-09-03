@@ -428,6 +428,7 @@ class Patrol:
         weight: float = 0.0,
         memory_ids: list[str] | None = None,
         lap: int = 0,
+        data: dict | None = None,
     ) -> None:
         """Write down something the walk noticed.
 
@@ -440,18 +441,40 @@ class Patrol:
         of reference gains weight by being seen repeatedly rather than
         accumulating duplicates.
         """
+        merged = dict(data or {})
+        if data:
+            # A walk sees a batch at a time, so a measure taken over the
+            # whole corpus has to accumulate here rather than be recomputed.
+            # List values union; everything else takes the newer reading.
+            row = self._db.execute(
+                "SELECT data FROM patrol_observations "
+                "WHERE errand = ? AND kind = ? AND subject = ?",
+                (errand, kind, subject),
+            ).fetchone()
+            if row and row["data"]:
+                try:
+                    prior = json.loads(row["data"])
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    prior = {}
+                for k, v in prior.items():
+                    if isinstance(v, list) and isinstance(merged.get(k), list):
+                        merged[k] = sorted(set(v) | set(merged[k]))
+                    elif k not in merged:
+                        merged[k] = v
         self._db.execute(
             "INSERT INTO patrol_observations "
-            "(errand, kind, subject, detail, weight, memory_ids, lap, actor) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "(errand, kind, subject, detail, weight, memory_ids, lap, actor, data) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(errand, kind, subject) DO UPDATE SET "
             "detail = excluded.detail, weight = excluded.weight, "
             "memory_ids = excluded.memory_ids, lap = excluded.lap, "
+            "data = excluded.data, "
             "confirmations = patrol_observations.confirmations + 1, "
             "retracted = 0, "
             "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')",
             (errand, kind, subject, detail, weight,
-             json.dumps(sorted(memory_ids or [])), lap, f"patrol:{errand}"),
+             json.dumps(sorted(memory_ids or [])), lap, f"patrol:{errand}",
+             json.dumps(merged, sort_keys=True)),
         )
 
     def observations(
@@ -862,12 +885,13 @@ def _concept_gaps(
 
     verdicts: dict[str, tuple[str, str | None]] = {}
     seen: Counter = Counter()
+    docs: dict[str, set] = {}
 
     for mid in memory_ids:
         if should_stop is not None and should_stop():
             break
         row = db.execute(
-            "SELECT content FROM memories WHERE id = ?", (mid,),
+            "SELECT content, source_path FROM memories WHERE id = ?", (mid,),
         ).fetchone()
         if row is None:
             verdicts[mid] = ("skipped", "memory gone")
@@ -880,6 +904,7 @@ def _concept_gaps(
         about = [t for t, n in hits.items() if n >= config.concept_min_mentions]
         for term in about:
             seen[term] += 1
+            docs.setdefault(term, set()).add(row["source_path"] or "(unfiled)")
         verdicts[mid] = ("ok", f"concepts={len(about)}")
 
     deposited = 0
@@ -893,21 +918,28 @@ def _concept_gaps(
         held = row["n"] if row else 0
         if held >= config.faq_gap_thin_tag_memories:
             continue  # findable; not a gap
+        term_docs = sorted(docs.get(term, set()))
+        # Spread, not recurrence.  Recurrence within a memory cannot tell a
+        # concept from a citation convention: on this corpus "Press",
+        # "University" and "Cambridge" recur four-plus times per chunk in
+        # every bibliography and topped the first dictionary built that
+        # way.  What separates them is how far they range — vocabulary
+        # appears across the whole library, a concept concentrates in the
+        # few documents that are about it.  Low is concentrated, so the
+        # ASC ordering surfaces concepts and buries furniture.
+        spread = round(len(term_docs) / max(mentions, 1), 4)
         patrol.observe(
             errand="concept_gaps",
             kind="concept_gap",
             subject=term,
             detail=(
-                f"discussed in {mentions} memories on this pass; "
+                f"discussed in {mentions} memories across {len(term_docs)} "
+                f"document(s) this pass; "
                 + ("no tag holds it" if row is None else f"its tag holds {held}")
                 + " — the library talks about this and cannot retrieve by it"
             ),
-            # Findability, so the ASC ordering surfaces the least findable
-            # first; ties break on confirmations, which is how a concept
-            # seen on many passes outranks a one-off.
-            weight=0.0 if row is None else round(
-                min(1.0, held / max(config.faq_gap_thin_tag_memories, 1)), 4,
-            ),
+            weight=spread,
+            data={"documents": term_docs},
             lap=state.lap,
         )
         deposited += 1
