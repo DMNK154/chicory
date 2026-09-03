@@ -1913,15 +1913,18 @@ class TestPromotionTiers:
 
     def test_default_ladder(self, stack):
         led = self._ledger(stack)
-        assert led._required_score(1) == 0.95
+        assert led._required_score(1) == 0.75
         assert led._required_score(2) == 0.80
         assert led._required_score(3) == 0.70
         assert led._required_score(50) == 0.70   # more asks never raise it
 
-    def test_a_single_ask_needs_a_convincing_answer(self, stack):
-        led = self._ledger(stack)
-        assert 0.94 < led._required_score(1)     # 0.94 is refused
-        assert 0.96 > led._required_score(1)     # 0.96 passes
+    def test_a_single_ask_still_needs_a_real_answer(self, stack):
+        """The rung sits above the measured noise floor (0.48-0.56 on
+        questions the shelves cannot answer), not at the top of the
+        distribution."""
+        led = self._ledger(stack, faq_promote_tiers=[(1, 0.75)])
+        assert led._required_score(1) == 0.75
+        assert led._required_score(1) > 0.60
 
     def test_below_the_lowest_rung_is_refused(self, stack):
         led = self._ledger(stack, faq_promote_tiers=[(3, 0.70), (2, 0.80)])
@@ -1947,12 +1950,12 @@ class TestPromotionTiers:
         led = self._ledger(stack)
         led._faq = FaqDesk(stack["config"], stack["db"])
         led._memory_store = _StubStore([(_mem("sup1"), 0.9)])
-        led.record("asked once, answered decently", _basis_vec(0), 5, 0.80)
+        led.record("asked once, answered thinly", _basis_vec(0), 5, 0.72)
         assert led.process_batch(allow_retrieval=True)["faq_candidates"] == 0
 
         # Same question, same score, asked twice more — now it clears 0.70.
         for _ in range(2):
-            led.record("asked once, answered decently", _basis_vec(0), 5, 0.80)
+            led.record("asked once, answered thinly", _basis_vec(0), 5, 0.72)
         assert led.process_batch(allow_retrieval=True)["faq_candidates"] == 1
 
 
@@ -2084,7 +2087,10 @@ class TestFaqAudit:
     active cards below it.
     """
 
-    def _orch(self, stack):
+    def _orch(self, stack, tiers=((1, 0.95),)):
+        # Pinned, so tuning a shipped default cannot silently change what
+        # this test believes it is checking.
+        stack["config"].faq_promote_tiers = list(tiers)
         from chicory.orchestrator.orchestrator import Orchestrator
         from chicory.layer4.closure import ClosureLedger
         from chicory.layer1.tag_manager import TagManager

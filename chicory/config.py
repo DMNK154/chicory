@@ -367,16 +367,24 @@ class ChicoryConfig(BaseModel):
     # ladder rather than one number: (minimum asks, minimum score),
     # evaluated from the most asks down, first match wins.
     #
-    # A question asked once has to answer itself convincingly (0.95).
-    # Asked three times it is demonstrably wanted, so a merely good answer
-    # will do (0.70).  Two sits between (0.80) — and on the live library
-    # that tier is bimodal, two clusters near 0.98 and a clean gap down to
-    # the duds, so anything from 0.65 to 0.82 selects the same three.
+    # The single-ask rung was 0.95 and that was too tight, set from the
+    # top of the distribution rather than from where answers stop being
+    # answers.  Measured on the live library, retrieval scores 0.66-0.80
+    # on questions the shelves CAN answer and 0.48-0.56 on ones they
+    # cannot; single-ask candidates then run continuously from 0.752 to
+    # 0.931 with no natural gap, and below 0.75 nothing further is
+    # admitted except known duds.  0.75 is therefore the last cut that
+    # separates on evidence rather than on taste.
+    #
+    # Two asks sits at 0.80 — that tier is bimodal on real data, two
+    # clusters near 0.98 and a clean gap down to the duds, so anything
+    # from 0.65 to 0.82 selects the same three.  Three asks is
+    # demonstrably wanted, so a merely good answer will do (0.70).
     #
     # An empty list disables the ladder and falls back to the flat
     # faq_promote_min_hits / faq_promote_min_score pair above.
     faq_promote_tiers: list[tuple[int, float]] = Field(
-        default_factory=lambda: [(3, 0.70), (2, 0.80), (1, 0.95)]
+        default_factory=lambda: [(3, 0.70), (2, 0.80), (1, 0.75)]
     )
     commission_min_hits: int = Field(default=3)
     commission_weak_score: float = Field(default=0.30)
