@@ -41,6 +41,7 @@ def dispatch_tool_call(
         "librarian_subjects": _handle_librarian_subjects,
         "librarian_desk": _handle_librarian_desk,
         "librarian_closure": _handle_librarian_closure,
+        "librarian_gaps": _handle_librarian_gaps,
     }
 
     handler = handlers.get(tool_name)
@@ -247,4 +248,13 @@ def _handle_librarian_commissions(o: "Orchestrator", inp: dict) -> dict:
         report_memory_id=inp.get("report_memory_id"),
         status=inp.get("status", "open"),
         limit=inp.get("limit", 20),
+    )
+
+
+def _handle_librarian_gaps(o: "Orchestrator", inp: dict) -> dict:
+    return o.handle_librarian_gaps(
+        action=inp.get("action", "clusters"),
+        subject=inp.get("subject"),
+        limit=inp.get("limit", 20),
+        min_confirmations=inp.get("min_confirmations", 2),
     )

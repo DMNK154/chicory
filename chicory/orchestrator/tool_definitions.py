@@ -403,6 +403,51 @@ CHICORY_TOOLS = [
         },
     },
     {
+        "name": "librarian_gaps",
+        "description": (
+            "The net of what this library is MISSING. Every other graph "
+            "here connects what it holds; this one connects concepts the "
+            "shelves discuss constantly and cannot be retrieved by, joined "
+            "when the same documents raise them. Built by the wandering "
+            "librarian's concept_gaps errand from what it read, not from "
+            "the index. Use it to answer 'what does the library talk about "
+            "but cannot find', and to see whether a bad answer was a "
+            "holdings gap or an indexing one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["clusters", "neighbors", "list", "rebuild"],
+                    "description": (
+                        "clusters (default) — the missing SUBJECTS, being "
+                        "connected components of the net; a single "
+                        "unfindable word is a nuisance, a component of them "
+                        "is one problem with one fix. neighbors — what else "
+                        "the material around a term raises (needs subject). "
+                        "list — individual gaps, most concentrated first. "
+                        "rebuild — recompute edges from the walk's "
+                        "observations."
+                    ),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "The concept to step out from, for neighbors.",
+                },
+                "limit": {"type": "integer"},
+                "min_confirmations": {
+                    "type": "integer",
+                    "description": (
+                        "How many passes must have seen a gap before it "
+                        "counts. Recurrence is what separates a concept "
+                        "from a one-off capitalised word."
+                    ),
+                },
+            },
+        },
+    },
+    {
         "name": "librarian_closure",
         "description": (
             "Specialist closure — settle what a piece of work overturned. "

@@ -2071,6 +2071,81 @@ class Orchestrator:
             ),
         }
 
+    def handle_librarian_gaps(
+        self,
+        action: str = "clusters",
+        subject: str | None = None,
+        limit: int = 20,
+        min_confirmations: int = 2,
+    ) -> dict[str, Any]:
+        """The net of what the library is missing.
+
+        Every other graph here connects what the library holds.  This one
+        connects what it does not: concepts the shelves discuss constantly
+        and cannot be retrieved by, joined when the same documents raise
+        them.  A single unfindable word is a nuisance; a connected
+        component of them is a subject — "malchut, chochmah, godhead,
+        tabernacle" together say the Kabbalah vocabulary is unindexed,
+        which is one problem with one fix rather than four.
+
+        clusters  — the missing subjects, largest first
+        neighbors — what else the material around this term raises
+        list      — the individual gaps, most concentrated first
+        rebuild   — recompute the edges from the walk's observations
+        """
+        import json as _json
+
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                if action == "rebuild":
+                    return self._patrol.build_observation_edges(
+                        min_confirmations=min_confirmations,
+                    )
+                if action == "neighbors":
+                    if not subject:
+                        return {"error": "neighbors requires subject"}
+                    return {
+                        "subject": subject,
+                        "neighbors": self._patrol.gap_neighbors(subject, limit=limit),
+                    }
+                if action == "clusters":
+                    clusters = self._patrol.gap_clusters(limit=limit)
+                    return {
+                        "clusters": clusters,
+                        "note": (
+                            "each cluster is a body of material whose own "
+                            "vocabulary the library cannot retrieve by"
+                        ) if clusters else "no edges yet — run action=rebuild",
+                    }
+                if action == "list":
+                    rows = self._db.execute(
+                        "SELECT subject, weight, confirmations, detail, data "
+                        "FROM patrol_observations "
+                        "WHERE kind = 'concept_gap' AND retracted = 0 "
+                        "AND confirmations >= ? "
+                        "ORDER BY weight ASC, confirmations DESC LIMIT ?",
+                        (min_confirmations, limit),
+                    ).fetchall()
+                    gaps = []
+                    for r in rows:
+                        try:
+                            docs = _json.loads(r["data"]).get("documents", [])
+                        except (ValueError, TypeError):
+                            docs = []
+                        gaps.append({
+                            "concept": r["subject"],
+                            "spread": r["weight"],
+                            "seen_on_passes": r["confirmations"],
+                            "documents": docs[:6],
+                            "document_count": len(docs),
+                            "detail": r["detail"],
+                        })
+                    return {"gaps": gaps}
+                return {"error": f"Unknown action: {action}"}
+        finally:
+            self._foreground_waiting.clear()
+
     def handle_librarian_commissions(
         self,
         action: str = "list",

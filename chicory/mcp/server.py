@@ -943,6 +943,44 @@ def librarian_maintain(ctx: Context, cold_rebuild: bool = False) -> str:
     return _call(ctx, "librarian_maintain", {"cold_rebuild": cold_rebuild})
 
 
+@mcp_server.tool()
+def librarian_gaps(
+    ctx: Context,
+    action: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: Optional[int] = None,
+    min_confirmations: Optional[int] = None,
+) -> str:
+    """The net of what this library is MISSING.
+
+    Every other graph here connects what the library holds. This one
+    connects what it does not: concepts the shelves discuss constantly
+    and cannot be retrieved by, joined when the same documents raise
+    them. Built by the wandering librarian from what it READ, not from
+    the index — which is why it can see a subject the index has no word
+    for.
+
+    action='clusters' (default): the missing subjects, largest first. A
+    single unfindable word is a nuisance; a connected component of them
+    is one problem with one fix.
+    action='neighbors' (subject=...): what else the surrounding material
+    raises — one step out in the net.
+    action='list': individual gaps, most concentrated first.
+    action='rebuild': recompute the edges from the walk's observations.
+
+    Use it when an answer was thin, to tell a HOLDINGS gap (the material
+    is not here) from an INDEXING one (it is here and unreachable).
+    """
+    inp: dict = {}
+    for key, val in (
+        ("action", action), ("subject", subject), ("limit", limit),
+        ("min_confirmations", min_confirmations),
+    ):
+        if val is not None:
+            inp[key] = val
+    return _call(ctx, "librarian_gaps", inp)
+
+
 # ── Entry point ─────────────────────────────────────────────────────
 
 

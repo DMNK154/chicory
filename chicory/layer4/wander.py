@@ -490,6 +490,119 @@ class Patrol:
         params.append(limit)
         return [dict(r) for r in self._db.execute(sql, tuple(params)).fetchall()]
 
+    def build_observation_edges(
+        self, kind: str = "concept_gap", min_confirmations: int = 2,
+    ) -> dict:
+        """Connect observations that the same documents raised.
+
+        Built by inverting rather than pairing: 9,551 gaps compared
+        pairwise is 45 million comparisons, while walking each document's
+        term list is a few thousand.  The document sets were already
+        accumulated by the walk, so this needs no further reading.
+
+        Weight is Jaccard over document sets — how much two gaps belong to
+        the same material rather than merely touching once.
+        """
+        import itertools
+        import json as _json
+
+        rows = self._db.execute(
+            "SELECT subject, data FROM patrol_observations "
+            "WHERE kind = ? AND retracted = 0 AND confirmations >= ?",
+            (kind, min_confirmations),
+        ).fetchall()
+        docsets: dict[str, set] = {}
+        for r in rows:
+            try:
+                docs = set(_json.loads(r["data"]).get("documents", []))
+            except (ValueError, TypeError):
+                continue
+            if docs:
+                docsets[r["subject"]] = docs
+
+        by_doc: dict[str, list[str]] = {}
+        for subject, docs in docsets.items():
+            for d in docs:
+                by_doc.setdefault(d, []).append(subject)
+
+        pairs: dict[tuple[str, str], int] = {}
+        for members in by_doc.values():
+            # A document mentioning hundreds of gap terms is a save file or
+            # a dump, not a subject; it would emit a dense useless clique.
+            if len(members) > self._config.gap_edge_max_document_terms:
+                continue
+            for a, b in itertools.combinations(sorted(set(members)), 2):
+                pairs[(a, b)] = pairs.get((a, b), 0) + 1
+
+        self._db.execute("DELETE FROM observation_edges WHERE kind = ?", (kind,))
+        written = 0
+        batch = []
+        for (a, b), shared in pairs.items():
+            union = len(docsets[a] | docsets[b])
+            weight = round(shared / union, 4) if union else 0.0
+            if weight < self._config.gap_edge_min_weight:
+                continue
+            batch.append((kind, a, b, shared, weight))
+        if batch:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO observation_edges "
+                "(kind, subject_a, subject_b, shared, weight) VALUES (?, ?, ?, ?, ?)",
+                batch,
+            )
+            written = len(batch)
+        return {"nodes": len(docsets), "edges": written}
+
+    def gap_neighbors(
+        self, subject: str, kind: str = "concept_gap", limit: int = 12,
+    ) -> list[dict]:
+        """What else the same material raises — one step out in the net."""
+        rows = self._db.execute(
+            "SELECT subject_b AS other, shared, weight FROM observation_edges "
+            "WHERE kind = ? AND subject_a = ? "
+            "UNION ALL "
+            "SELECT subject_a AS other, shared, weight FROM observation_edges "
+            "WHERE kind = ? AND subject_b = ? "
+            "ORDER BY weight DESC, shared DESC LIMIT ?",
+            (kind, subject, kind, subject, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def gap_clusters(
+        self, kind: str = "concept_gap", min_size: int = 3, limit: int = 20,
+    ) -> list[dict]:
+        """Connected components of the net — coherent missing subjects.
+
+        A list of unfindable words is a nuisance; a component of them is a
+        finding.  "malchut, chochmah, godhead, tabernacle" together say
+        the Kabbalah vocabulary is unindexed, which is one problem with
+        one fix rather than four.
+        """
+        adj: dict[str, set] = {}
+        for r in self._db.execute(
+            "SELECT subject_a, subject_b FROM observation_edges WHERE kind = ?",
+            (kind,),
+        ).fetchall():
+            adj.setdefault(r["subject_a"], set()).add(r["subject_b"])
+            adj.setdefault(r["subject_b"], set()).add(r["subject_a"])
+
+        seen: set = set()
+        out: list[dict] = []
+        for node in adj:
+            if node in seen:
+                continue
+            comp, stack = set(), [node]
+            while stack:
+                n = stack.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                comp.add(n)
+                stack.extend(adj[n] - seen)
+            if len(comp) >= min_size:
+                out.append({"size": len(comp), "members": sorted(comp)})
+        out.sort(key=lambda c: -c["size"])
+        return out[:limit]
+
     # ── Running ─────────────────────────────────────────────────────────
 
     def run_errand(

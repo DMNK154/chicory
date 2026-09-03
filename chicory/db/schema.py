@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 
 TABLES = [
     # -- Schema version tracking --
@@ -1073,6 +1073,33 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_patrol_obs_errand "
     "ON patrol_observations(errand)",
 
+    # -- The net of what is missing --
+    #
+    # Every other graph in this system connects what the library HAS.
+    # This one connects what it does not: concepts it discusses constantly
+    # and cannot retrieve by.  Two such gaps are related when the same
+    # documents raise both, which makes a connected component a coherent
+    # missing SUBJECT rather than a list of unrelated words — the
+    # difference between "malchut, chochmah, godhead, tabernacle" and
+    # "the Kabbalah vocabulary is unindexed".
+    #
+    # Derived from patrol_observations.data, so it is rebuildable and
+    # holds no judgement of its own.
+    """
+    CREATE TABLE IF NOT EXISTS observation_edges (
+        kind       TEXT NOT NULL,
+        subject_a  TEXT NOT NULL,
+        subject_b  TEXT NOT NULL,
+        shared     INTEGER NOT NULL DEFAULT 0,
+        weight     REAL NOT NULL DEFAULT 0.0,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (kind, subject_a, subject_b),
+        CHECK (subject_a < subject_b)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_obs_edges_a ON observation_edges(kind, subject_a, weight)",
+    "CREATE INDEX IF NOT EXISTS idx_obs_edges_b ON observation_edges(kind, subject_b, weight)",
+
     # -- Wandering librarian: what each errand is currently curious about --
     #
     # The small centralised half of the state.  Position is distributed
@@ -1193,6 +1220,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v40_to_v41(db)
             if current_version <= 41:
                 _migrate_v41_to_v42(db)
+            if current_version <= 42:
+                _migrate_v42_to_v43(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1206,7 +1235,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Observation state: accumulate corpus-wide measures across passes"),
+                (SCHEMA_VERSION, "The net of what is missing: edges between observations"),
             )
 
 
@@ -2022,3 +2051,8 @@ def _migrate_v41_to_v42(db: DatabaseEngine) -> None:
             "ADD COLUMN data TEXT NOT NULL DEFAULT '{}'"
         )
     db.connection.commit()
+
+
+def _migrate_v42_to_v43(db: DatabaseEngine) -> None:
+    """observation_edges is derived and rebuildable; nothing to migrate."""
+    pass

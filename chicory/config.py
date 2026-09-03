@@ -353,6 +353,20 @@ class ChicoryConfig(BaseModel):
     # than something it mentions.  Four was calibrated on this corpus:
     # three admitted 'that' and 'great' alongside malchut and tiferet.
     concept_min_mentions: int = Field(default=4)
+    # A document raising more gap terms than this is a dump or a save
+    # file, not a subject; pairing its terms would emit a dense clique
+    # that says nothing (Rocket League telemetry alone contributes
+    # hundreds of untagged JSON keys to one document).
+    gap_edge_max_document_terms: int = Field(default=40)
+    # Jaccard over document sets: how much of each gap's material the two
+    # share, not whether they touched once.
+    #
+    # 0.6 is a measured knee, and the failure below it is the one the
+    # shelf tree already taught: at 0.2 everything chains into a single
+    # 1,893-concept blob that says nothing. 0.6 breaks that to a largest
+    # component of 33 with 186 legible clusters, and tightening further
+    # buys almost nothing (6,838 edges at 0.6 against 6,749 at 1.0).
+    gap_edge_min_weight: float = Field(default=0.6)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the
