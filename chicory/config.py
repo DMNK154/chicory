@@ -345,19 +345,25 @@ class ChicoryConfig(BaseModel):
     demand_process_batch: int = Field(default=200)
     demand_history_retention_days: int = Field(default=30)
     faq_serve_threshold: float = Field(default=0.90)
-    # Two, not three, and measured rather than guessed.  On a 124K library
-    # the score gate below has never rejected anything — cluster
-    # mean_top_score runs 0.48..1.15, so 0.45 admits everything and the hit
-    # count is the only real gate.  At three, ten months of traffic yielded
-    # two cards; at two it yields seven, of which the Nietzsche and Vedanta
-    # ones land squarely on the right corpus.  The cost is visible in the
-    # same experiment: one card ('FAISS index recall nprobe') is answered
-    # with Tamil ethical poetry and a Gnostic devotional at mean_top_score
-    # 0.483 — above the gate meant to catch exactly that.  A candidate
-    # serves nothing until judged, so the cost is a reader's time, not a
-    # wrong answer.
-    faq_promote_min_hits: int = Field(default=2)
-    faq_promote_min_score: float = Field(default=0.45)
+    # One ask is enough, because the SCORE now carries the judgment.
+    #
+    # These two gates were calibrated backwards.  Repetition was doing the
+    # filtering (three asks) while quality was doing none (0.45, below the
+    # noise floor of a 124K library).  Measured: retrieval scores 0.66-0.80
+    # on questions the shelves can answer and 0.48-0.56 on ones they
+    # cannot, so 0.45 admitted everything — a question about FAISS
+    # internals was answered with untranscribed Tamil script at 0.483 and
+    # promoted, while genuine one-off questions scoring 0.98 were held back
+    # for want of a second asker.
+    #
+    # Inverted: any question the library can answer well is worth a card,
+    # asked once.  Cards below the bar are not lost, they are simply not
+    # crystallized; and a candidate serves nothing until a person approves
+    # it, so the cost of a wrong one is a reader's time.
+    faq_promote_min_hits: int = Field(default=1)
+    # 0.70 sits in the gap the data shows between answerable and not: every
+    # card worth reading scored >= 0.83, both duds scored 0.48 and 0.63.
+    faq_promote_min_score: float = Field(default=0.70)
     commission_min_hits: int = Field(default=3)
     commission_weak_score: float = Field(default=0.30)
     consult_subject_threshold: float = Field(default=0.30)
