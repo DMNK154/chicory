@@ -46,7 +46,10 @@ Deliberate limits, since this thing runs unattended:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import socket
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -196,6 +199,89 @@ class WanderState:
         return [self.get(r["errand"]) for r in rows]
 
 
+# ── Lease ───────────────────────────────────────────────────────────────
+
+_LEASE_KEY = "patrol_lease"
+
+
+class PatrolLease:
+    """One wanderer per library, whatever the process count.
+
+    patrol_visits makes the walk restartable; it does not make it
+    singular.  select -> run -> record is not atomic across processes, so
+    every server sharing a database walks the same least-recently-visited
+    batch at the same moment.  That is not hypothetical: an MCP client
+    spawns a server per session, fourteen accumulated on one install, and
+    the first heartbeat release had all fourteen patrolling on the same
+    30s tick — three logging an identical `examined=50` in the same
+    second, ~38% of visits duplicated, UNIQUE collisions in `embeddings`,
+    and lock contention on a 12GB file.
+
+    The lease is advisory and expiring rather than held: a holder that
+    dies takes nothing with it, and the next tick to notice the expiry
+    picks the work up.  It lives in librarian_state because that is
+    exactly what that table is for, and the claim is a single conditional
+    UPDATE — atomic in SQLite without a transaction, which matters
+    because the losers must not block.
+    """
+
+    def __init__(self, config: ChicoryConfig, db: DatabaseEngine) -> None:
+        self._config = config
+        self._db = db
+        self._owner = f"{socket.gethostname()}:{os.getpid()}"
+
+    @property
+    def owner(self) -> str:
+        return self._owner
+
+    def acquire(self) -> bool:
+        """Claim the lease, or report that someone else holds a live one."""
+        now = datetime.utcnow()
+        expires = now + timedelta(seconds=self._config.wander_lease_seconds)
+        payload = json.dumps(
+            {"owner": self._owner, "expires_at": expires.isoformat()}
+        )
+        self._db.execute(
+            "INSERT OR IGNORE INTO librarian_state (key, value) VALUES (?, NULL)",
+            (_LEASE_KEY,),
+        )
+        # json_valid guards the row against anything that is not ours —
+        # a malformed value must be reclaimable, not permanently fatal.
+        cur = self._db.execute(
+            "UPDATE librarian_state SET value = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+            "WHERE key = ? AND ("
+            "    value IS NULL"
+            " OR NOT json_valid(value)"
+            " OR json_extract(value, '$.owner') = ?"
+            " OR json_extract(value, '$.expires_at') <= ?"
+            ")",
+            (payload, _LEASE_KEY, self._owner, now.isoformat()),
+        )
+        return cur.rowcount == 1
+
+    def release(self) -> None:
+        """Drop the lease if it is ours, so the next tick need not wait."""
+        self._db.execute(
+            "UPDATE librarian_state SET value = NULL, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+            "WHERE key = ? AND json_valid(value) "
+            "AND json_extract(value, '$.owner') = ?",
+            (_LEASE_KEY, self._owner),
+        )
+
+    def holder(self) -> dict | None:
+        row = self._db.execute(
+            "SELECT value FROM librarian_state WHERE key = ?", (_LEASE_KEY,),
+        ).fetchone()
+        if row is None or not row["value"]:
+            return None
+        try:
+            return json.loads(row["value"])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+
 # ── Patrol ──────────────────────────────────────────────────────────────
 
 
@@ -212,11 +298,16 @@ class Patrol:
         self._db = db
         self._embedding = embedding
         self._state = WanderState(db)
+        self._lease = PatrolLease(config, db)
         self._last_run: dict[str, datetime] = {}
 
     @property
     def state(self) -> WanderState:
         return self._state
+
+    @property
+    def lease(self) -> PatrolLease:
+        return self._lease
 
     # ── Cursor ──────────────────────────────────────────────────────────
 
@@ -391,6 +482,27 @@ class Patrol:
         being used, so a walk that reshapes retrieval geometry cannot do it
         underneath a patron's question.
         """
+        if not self._lease.acquire():
+            holder = self._lease.holder() or {}
+            return {
+                "idle": idle,
+                "errands": [],
+                "skipped": "lease held elsewhere",
+                "lease_holder": holder.get("owner"),
+            }
+        try:
+            return self._run_due_locked(idle=idle, should_stop=should_stop)
+        finally:
+            # Released rather than left to expire, so the next tick — very
+            # likely a different process — can pick the walk straight up.
+            self._lease.release()
+
+    def _run_due_locked(
+        self,
+        *,
+        idle: bool,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> dict:
         now = datetime.utcnow()
         interval = timedelta(minutes=self._config.wander_interval_minutes)
         results = []
@@ -467,11 +579,26 @@ def _repair_missing_embedding(
                 embedding.store_chunks(mid, list(embedding.embed_batch(chunks)))
             verdicts[mid] = ("acted", f"chunks={max(1, len(chunks))}")
         except Exception as exc:  # noqa: BLE001 - one bad memory must not stop the lap
-            _log.warning("Re-embed failed for %s: %s", mid, exc)
-            verdicts[mid] = ("failed", str(exc)[:200])
+            # Another writer may have embedded this memory in the moment we
+            # were working on it — the lease makes that rare, not
+            # impossible, since ingest and re-embed write here too.  If the
+            # embedding now exists the invariant is satisfied, whoever
+            # satisfied it, and calling that a failure would rotate a
+            # perfectly good memory to the back of the queue.
+            if _has_embedding(db, mid):
+                verdicts[mid] = ("ok", "embedded concurrently")
+            else:
+                _log.warning("Re-embed failed for %s: %s", mid, exc)
+                verdicts[mid] = ("failed", str(exc)[:200])
 
     _resolve_findings(db, [m for m, (v, _) in verdicts.items() if v == "acted"])
     return verdicts
+
+
+def _has_embedding(db: DatabaseEngine, memory_id: str) -> bool:
+    return db.execute(
+        "SELECT 1 FROM embeddings WHERE memory_id = ? LIMIT 1", (memory_id,),
+    ).fetchone() is not None
 
 
 def _resolve_findings(db: DatabaseEngine, memory_ids: list[str]) -> None:

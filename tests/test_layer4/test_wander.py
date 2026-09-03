@@ -429,3 +429,101 @@ def test_heartbeat_start_is_idempotent_and_stops(stack):
     stopped_at = hb.ticks
     hb.stop()                           # stopping twice is safe
     assert hb.ticks == stopped_at
+
+
+# ── Lease ───────────────────────────────────────────────────────────────
+
+
+def _rival(stack):
+    """A second Patrol on the same database, as a second server would be."""
+    from chicory.layer4.wander import Patrol
+    other = Patrol(stack["config"], stack["db"], stack["emb"])
+    other.lease._owner = "otherhost:99999"
+    return other
+
+
+def test_lease_is_granted_once(stack):
+    mine, theirs = stack["patrol"], _rival(stack)
+    assert mine.lease.acquire() is True
+    assert theirs.lease.acquire() is False
+    assert mine.lease.holder()["owner"] == mine.lease.owner
+
+
+def test_lease_is_reentrant_for_its_holder(stack):
+    lease = stack["patrol"].lease
+    assert lease.acquire() is True
+    assert lease.acquire() is True      # renews rather than blocking itself
+
+
+def test_release_frees_the_lease(stack):
+    mine, theirs = stack["patrol"], _rival(stack)
+    assert mine.lease.acquire() is True
+    mine.lease.release()
+    assert mine.lease.holder() is None
+    assert theirs.lease.acquire() is True
+
+
+def test_release_by_a_non_holder_is_a_noop(stack):
+    mine, theirs = stack["patrol"], _rival(stack)
+    mine.lease.acquire()
+    theirs.lease.release()              # not theirs to give away
+    assert mine.lease.holder()["owner"] == mine.lease.owner
+
+
+def test_expired_lease_is_reclaimed(stack):
+    """A holder that dies must not stop the library patrolling forever."""
+    import json
+    mine, theirs = stack["patrol"], _rival(stack)
+    mine.lease.acquire()
+    stack["db"].execute(
+        "UPDATE librarian_state SET value = ? WHERE key = 'patrol_lease'",
+        (json.dumps({"owner": "deadhost:1", "expires_at": "2000-01-01T00:00:00"}),),
+    )
+    assert theirs.lease.acquire() is True
+
+
+def test_malformed_lease_value_is_reclaimable(stack):
+    stack["db"].execute(
+        "INSERT OR REPLACE INTO librarian_state (key, value) "
+        "VALUES ('patrol_lease', 'not json at all')"
+    )
+    assert stack["patrol"].lease.acquire() is True
+    assert stack["patrol"].lease.holder()["owner"] == stack["patrol"].lease.owner
+
+
+def test_only_the_lease_holder_patrols(stack):
+    """The defect this exists for: N servers, one library, same tick."""
+    db = stack["db"]
+    for i in range(6):
+        make_memory(db, f"m{i}", content=f"body {i}")
+    mine, theirs = stack["patrol"], _rival(stack)
+
+    theirs.lease.acquire()              # the rival got there first
+    blocked = mine.run_due(idle=True)
+    assert blocked["errands"] == []
+    assert blocked["skipped"] == "lease held elsewhere"
+    assert blocked["lease_holder"] == "otherhost:99999"
+    assert db.execute("SELECT COUNT(*) AS n FROM patrol_visits").fetchone()["n"] == 0
+
+    theirs.lease.release()
+    ran = mine.run_due(idle=True)
+    assert ran["errands"][0]["examined"] > 0
+
+
+def test_lease_is_released_after_a_run(stack):
+    make_memory(stack["db"], "m1", content="body")
+    stack["patrol"].run_due(idle=True)
+    assert stack["patrol"].lease.holder() is None
+
+
+def test_lease_released_even_when_an_errand_explodes(stack):
+    from chicory.layer4.wander import ERRANDS, Errand
+    boom = Errand(
+        name="explodes", description="test",
+        run=lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    ERRANDS[boom.name] = boom
+    stack["patrol"]._config.wander_errands = ["explodes"]
+    make_memory(stack["db"], "m1")
+    stack["patrol"].run_due(idle=True)          # must not raise
+    assert stack["patrol"].lease.holder() is None

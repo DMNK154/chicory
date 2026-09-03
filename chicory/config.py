@@ -387,6 +387,14 @@ class ChicoryConfig(BaseModel):
     wander_errands: list[str] = Field(
         default_factory=lambda: ["missing_embedding"]
     )
+    # Only one process patrols a library at a time.  Every MCP client
+    # session spawns its own server against the same SQLite file — 14 were
+    # observed running on one install — and before this lease every one of
+    # them walked the same cursor on the same 30s tick: ~38% duplicated
+    # work, UNIQUE collisions in `embeddings`, and lock contention.  The
+    # lease must outlast one patrol pass by a wide margin; a holder that
+    # dies simply lets it expire.
+    wander_lease_seconds: float = Field(default=120.0)
 
     # Commons Layer — cross-project signal federation
     commons_enabled: bool = Field(default=False)

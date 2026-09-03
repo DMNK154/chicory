@@ -3724,11 +3724,16 @@ class Orchestrator:
                 "last_run_at": rec.last_run_at if rec else None,
                 "last_result": rec.last_result if rec else None,
             })
+        holder = self._patrol.lease.holder() or {}
         return {
             "enabled": self._config.wander_enabled,
             "tick_seconds": self._config.wander_tick_seconds,
             "ticks": self._heartbeat.ticks,
             "idle": self._heartbeat.idle,
+            # Which process is patrolling right now, if any.  With one
+            # server per client session, several may share this library.
+            "lease_owner": self._patrol.lease.owner,
+            "lease_held_by": holder.get("owner"),
             "errands": errands,
         }
 
