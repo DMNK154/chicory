@@ -2161,3 +2161,72 @@ class TestFaqAudit:
         self._card(stack, _basis_vec(0))
         out = self._orch(stack)._faq_audit()
         assert "error" in out                  # no clusters; guessing is worse
+
+
+class TestFaqGap:
+    """A score says whether the shelves answered; it cannot say what was
+    missing. Two live cards scored 0.84 and 0.85 while being answered with
+    Chan Buddhism and a table of contents, because the library holds
+    nothing on Shinto and retrieval returned its nearest neighbours.
+    Absence and mismatch are identical to a similarity score.
+    """
+
+    def _orch(self, stack):
+        from chicory.orchestrator.orchestrator import Orchestrator
+        from chicory.layer1.tag_manager import TagManager
+        o = Orchestrator.__new__(Orchestrator)
+        o._db = stack["db"]; o._config = stack["config"]
+        o._tag_manager = TagManager(stack["db"])
+        return o
+
+    def _tagged(self, stack, mid, tag, n_others=0):
+        _insert_memory(stack["db"], mid)
+        t = stack["tags"].get_or_create(tag, created_by="test")
+        stack["db"].execute(
+            "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) "
+            "VALUES (?, ?, 'test')", (mid, t.id))
+        for i in range(n_others):
+            other = f"{mid}-pad{i}"
+            _insert_memory(stack["db"], other)
+            stack["db"].execute(
+                "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) "
+                "VALUES (?, ?, 'test')", (other, t.id))
+        return t
+
+    def test_a_term_with_no_tag_is_what_would_complete_it(self, stack):
+        self._tagged(stack, "m1", "religion", n_others=40)
+        g = self._orch(stack)._faq_gap("Shinto kami shrine religion", ["m1"])
+        assert [x["term"] for x in g["covered"]] == ["religion"]
+        assert set(g["would_complete_it"]) == {"shinto", "kami", "shrine"}
+
+    def test_nothing_held_at_all_is_called_out(self, stack):
+        _insert_memory(stack["db"], "m1")
+        g = self._orch(stack)._faq_gap("FAISS nprobe recall", ["m1"])
+        assert g["covered"] == []
+        assert "nothing under any term" in g["verdict"]
+
+    def test_material_held_but_not_drawn_on_is_a_retrieval_problem(self, stack):
+        """Different diagnosis, different fix: the shelves have it, the
+        sources just do not cite it."""
+        self._tagged(stack, "m1", "nietzsche", n_others=40)
+        _insert_memory(stack["db"], "unrelated")
+        g = self._orch(stack)._faq_gap("nietzsche", ["unrelated"])
+        assert [x["term"] for x in g["held_but_not_used"]] == ["nietzsche"]
+        assert "retrieval problem" in g["verdict"]
+
+    def test_a_thinly_held_tag_counts_as_a_gap(self, stack):
+        self._tagged(stack, "m1", "faiss", n_others=2)   # 3 < the 20 default
+        g = self._orch(stack)._faq_gap("faiss", ["m1"])
+        assert [x["term"] for x in g["thinly_held"]] == ["faiss"]
+        assert "faiss" in g["would_complete_it"]
+
+    def test_stopwords_are_not_reported_as_gaps(self, stack):
+        _insert_memory(stack["db"], "m1")
+        g = self._orch(stack)._faq_gap("what about those which were", ["m1"])
+        assert g["would_complete_it"] == []
+
+    def test_a_fully_covered_question_reports_no_gap(self, stack):
+        self._tagged(stack, "m1", "kabbalah", n_others=40)
+        g = self._orch(stack)._faq_gap("kabbalah", ["m1"])
+        assert g["would_complete_it"] == []
+        assert "cover this question" in g["verdict"]

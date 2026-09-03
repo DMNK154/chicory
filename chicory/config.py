@@ -345,6 +345,9 @@ class ChicoryConfig(BaseModel):
     demand_process_batch: int = Field(default=200)
     demand_history_retention_days: int = Field(default=30)
     faq_serve_threshold: float = Field(default=0.90)
+    # Below this many memories, a tag exists but the library does not
+    # meaningfully hold the subject — counted as a gap, not as coverage.
+    faq_gap_thin_tag_memories: int = Field(default=20)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the

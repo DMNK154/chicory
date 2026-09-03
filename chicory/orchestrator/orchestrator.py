@@ -1780,6 +1780,19 @@ class Orchestrator:
             if required is not None and score >= required:
                 conforming.append(entry)
             else:
+                # Only for the ones falling short: the gap check costs a
+                # query per content word, and a card that passes does not
+                # need telling what it is missing.
+                try:
+                    sup = json.loads(
+                        self._db.execute(
+                            "SELECT supporting_memory_ids FROM faq_entries "
+                            "WHERE id = ?", (r["id"],),
+                        ).fetchone()["supporting_memory_ids"]
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    sup = []
+                entry["gap"] = self._faq_gap(r["question_text"], sup)
                 below.append(entry)
 
         demoted = []
@@ -1799,6 +1812,95 @@ class Orchestrator:
             "conforming": len(conforming),
             "below_bar": below,
             "demoted": demoted,
+        }
+
+    # Words that carry no subject on their own; asking what the library
+    # holds "about" them tells you nothing.
+    _GAP_STOPWORDS = frozenset("""
+        what when where which whose that this these those there here
+        about into from with without between among against during
+        does doing done have haves having been being were will would
+        should could cannot canst than then them they their theirs
+        more most much many some such only also very just like both
+        each other another same over under above below after before
+        why how who whom whether while because since though although
+    """.split())
+
+    def _faq_gap(self, question: str, supporting_ids: list[str]) -> dict[str, Any]:
+        """What material would be needed to actually answer this.
+
+        A score says whether the shelves answered well; it cannot say what
+        was missing.  Two cards on this library scored 0.84 and 0.85 while
+        being answered with Chan Buddhism and a table of contents, because
+        the library holds nothing on Shinto at all and retrieval returned
+        the nearest Asian-religion neighbours it had.  Absence and
+        mismatch look identical from a similarity score, and different
+        from here.
+
+        The check is deliberately literal: take the question's own content
+        words, ask whether each exists as a tag and how much sits under
+        it.  A term with no tag is material this library simply does not
+        hold — which is the concrete, actionable answer to "what would
+        complete this".
+        """
+        import re
+
+        terms = [
+            t for t in dict.fromkeys(re.findall(r"[a-zA-Z][\w'-]{3,}", question.lower()))
+            if t not in self._GAP_STOPWORDS
+        ]
+        source_tags: set[str] = set()
+        if supporting_ids:
+            for tags in self._tag_manager.get_tags_for_memories(
+                supporting_ids,
+            ).values():
+                source_tags.update(tags)
+
+        covered, unused, thin, absent = [], [], [], []
+        for term in terms:
+            tag = self._tag_manager.get_by_name(term)
+            if tag is None:
+                absent.append(term)
+                continue
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM memory_tags WHERE tag_id = ?", (tag.id,),
+            ).fetchone()
+            n = row["n"] if row else 0
+            entry = {"term": term, "memories": n}
+            if n < self._config.faq_gap_thin_tag_memories:
+                thin.append(entry)
+            elif tag.name in source_tags:
+                covered.append(entry)
+            else:
+                unused.append(entry)
+
+        if absent and not covered:
+            verdict = (
+                "the library holds nothing under any term in this question — "
+                "the sources are nearest neighbours, not an answer"
+            )
+        elif absent:
+            verdict = (
+                "partly covered; the absent terms are what this answer is "
+                "missing"
+            )
+        elif unused and not covered:
+            verdict = (
+                "the material exists but these sources do not draw on it — "
+                "a retrieval problem, not a holdings gap"
+            )
+        else:
+            verdict = "the shelves cover this question's terms"
+
+        return {
+            "covered": covered,
+            "held_but_not_used": unused,
+            "thinly_held": thin,
+            "not_held": absent,
+            "would_complete_it": (
+                [x["term"] for x in thin] + absent
+            ),
+            "verdict": verdict,
         }
 
     def _faq_list(self, status: str, limit: int) -> dict[str, Any]:
@@ -1961,6 +2063,7 @@ class Orchestrator:
             "usable_sources": sum(1 for x in supporting if x["usable"]),
             "total_sources": len(supporting_ids),
             "blockers": blockers,
+            "gap": self._faq_gap(r["question_text"], supporting_ids),
             "verdict_hint": (
                 "blocked — resolve the blockers before approving"
                 if blockers else
