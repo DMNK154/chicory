@@ -289,6 +289,7 @@ def retrieve_memories(
     tags: Optional[list[str]] = None,
     method: Optional[str] = None,
     top_k: Optional[int] = None,
+    actor: Optional[str] = None,
 ) -> str:
     """Search for relevant memories.
 
@@ -302,6 +303,8 @@ def retrieve_memories(
         inp["method"] = method
     if top_k is not None:
         inp["top_k"] = top_k
+    if actor is not None:
+        inp["actor"] = actor
     return _call(ctx, "retrieve_memories", inp)
 
 
@@ -380,6 +383,7 @@ def deep_retrieve(
     tags: Optional[list[str]] = None,
     max_depth: Optional[int] = None,
     per_level_k: Optional[int] = None,
+    actor: Optional[str] = None,
 ) -> str:
     """Recursively retrieve memories by following association chains.
 
@@ -394,6 +398,8 @@ def deep_retrieve(
         inp["max_depth"] = max_depth
     if per_level_k is not None:
         inp["per_level_k"] = per_level_k
+    if actor is not None:
+        inp["actor"] = actor
     return _call(ctx, "deep_retrieve", inp)
 
 
@@ -646,6 +652,7 @@ def librarian_consult(
     ctx: Context,
     query: str,
     top_k: Optional[int] = None,
+    actor: Optional[str] = None,
 ) -> str:
     """Ask the front desk. The structured consultation path:
 
@@ -662,6 +669,8 @@ def librarian_consult(
     inp: dict = {"query": query}
     if top_k is not None:
         inp["top_k"] = top_k
+    if actor is not None:
+        inp["actor"] = actor
     return _call(ctx, "librarian_consult", inp)
 
 

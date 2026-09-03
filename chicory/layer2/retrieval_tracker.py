@@ -26,14 +26,15 @@ class RetrievalTracker:
         results: list[tuple[str, int, float]],  # (memory_id, rank, relevance_score)
         model_version: str,
         context_summary: str | None = None,
+        actor: str = "patron",
     ) -> int:
         """Log a retrieval event and its results. Returns the retrieval_id."""
         cursor = self._db.execute(
             """
-            INSERT INTO retrieval_events (query_text, context_summary, method, result_count, model_version)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO retrieval_events (query_text, context_summary, method, result_count, model_version, actor)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (query_text, context_summary, method, len(results), model_version),
+            (query_text, context_summary, method, len(results), model_version, actor),
         )
         retrieval_id = cursor.lastrowid
 

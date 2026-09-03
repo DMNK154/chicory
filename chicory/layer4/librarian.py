@@ -1656,15 +1656,23 @@ class DemandLedger:
         query_vec: np.ndarray | None,
         result_count: int,
         top_score: float,
+        actor: str = "patron",
     ) -> None:
+        """Record every query, whoever asked.
+
+        Filtering happens at clustering time rather than here, so a query
+        that did not count as demand still leaves a row.  What was asked of
+        this library is part of its record even when it was not a patron
+        asking.
+        """
         blob = (
             _array_to_blob(_unit(query_vec.astype(np.float32)))
             if query_vec is not None else None
         )
         self._db.execute(
-            "INSERT INTO query_history (query_text, embedding, result_count, top_score) "
-            "VALUES (?, ?, ?, ?)",
-            (query_text, blob, result_count, top_score),
+            "INSERT INTO query_history (query_text, embedding, result_count, "
+            "top_score, actor) VALUES (?, ?, ?, ?, ?)",
+            (query_text, blob, result_count, top_score, actor),
         )
 
     def _embed_query(self, text: str) -> np.ndarray | None:
@@ -1693,7 +1701,7 @@ class DemandLedger:
         built (promotion defers; clusters persist).
         """
         rows = self._db.execute(
-            "SELECT id, query_text, embedding, top_score FROM query_history "
+            "SELECT id, query_text, embedding, top_score, actor FROM query_history "
             "WHERE processed = 0 ORDER BY id ASC LIMIT ?",
             (self._config.demand_process_batch,),
         ).fetchall()
@@ -1711,7 +1719,14 @@ class DemandLedger:
 
         recovered = 0
         dropped = 0
+        not_demand = 0
+        demand_actors = set(self._config.demand_actors)
         for r in rows:
+            if demand_actors and r["actor"] not in demand_actors:
+                # Recorded, marked processed, never clustered: an agent's
+                # research must not become the library's demand.
+                not_demand += 1
+                continue
             blob = r["embedding"]
             if blob is None:
                 # record() stores the query even when the caller had no
@@ -1788,6 +1803,7 @@ class DemandLedger:
             )
         return {
             "processed": len(rows),
+            "not_demand": not_demand,
             "recovered_embeddings": recovered,
             "dropped_unembeddable": dropped,
             "faq_candidates": faq_count,

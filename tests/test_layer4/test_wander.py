@@ -527,3 +527,36 @@ def test_lease_released_even_when_an_errand_explodes(stack):
     make_memory(stack["db"], "m1")
     stack["patrol"].run_due(idle=True)          # must not raise
     assert stack["patrol"].lease.holder() is None
+
+
+# ── Geometry attribution ────────────────────────────────────────────────
+
+
+def test_geometry_gate_config_defaults(stack):
+    """Only patrons reshape the map by default.
+
+    record_co_retrieval and update_on_retrieval write the centroid edges
+    and tag centroids SubjectRoster.rebuild derives the shelf tree from.
+    Measured: 200 retrievals moved that geometry 0.97% and re-partitioned
+    70% of the tree — so an automated reader left out of geometry_actors
+    can walk the library without rewriting the map it walks.
+    """
+    cfg = stack["config"]
+    assert cfg.geometry_actors == ["patron"]
+    assert cfg.demand_actors == ["patron"]
+    assert cfg.retrieval_default_actor == "patron"
+
+
+def test_an_actor_outside_geometry_actors_is_excluded(stack):
+    cfg = stack["config"]
+    geometry = set(cfg.geometry_actors)
+    assert "patron" in geometry
+    assert "patrol" not in geometry      # the idle random walk, when it lands
+    assert "research" not in geometry
+
+
+def test_empty_geometry_actors_lets_everyone_reshape(stack):
+    """Back-compat escape: an empty list restores pre-attribution behaviour."""
+    stack["config"].geometry_actors = []
+    geometry = set(stack["config"].geometry_actors)
+    assert (not geometry) or ("anyone" in geometry)

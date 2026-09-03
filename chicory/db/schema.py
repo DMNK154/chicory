@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 TABLES = [
     # -- Schema version tracking --
@@ -114,7 +114,13 @@ TABLES = [
         method          TEXT NOT NULL,
         occurred_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
         result_count    INTEGER NOT NULL DEFAULT 0,
-        model_version   TEXT NOT NULL
+        model_version   TEXT NOT NULL,
+        -- Who asked.  Retrieval is not read-only here: it feeds the demand
+        -- ledger and reweights the centroid geometry the shelf tree is
+        -- derived from.  Without this column an agent researching on the
+        -- librarian's behalf is indistinguishable from a patron, and its
+        -- queries become the library's demand.
+        actor           TEXT NOT NULL DEFAULT 'patron'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_retrieval_events_time ON retrieval_events(occurred_at)",
@@ -845,10 +851,15 @@ TABLES = [
         result_count INTEGER NOT NULL DEFAULT 0,
         top_score    REAL NOT NULL DEFAULT 0.0,
         processed    INTEGER NOT NULL DEFAULT 0,
+        -- Recorded for every actor, clustered for only some.  The row is
+        -- kept either way: a query that did not count as demand is still
+        -- part of the record of what was asked of this library.
+        actor        TEXT NOT NULL DEFAULT 'patron',
         created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_query_history_unprocessed ON query_history(processed) WHERE processed = 0",
+    "CREATE INDEX IF NOT EXISTS idx_query_history_actor ON query_history(actor)",
 
     """
     CREATE TABLE IF NOT EXISTS query_clusters (
@@ -1114,6 +1125,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v36_to_v37(db)
             if current_version <= 37:
                 _migrate_v37_to_v38(db)
+            if current_version <= 38:
+                _migrate_v38_to_v39(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1127,7 +1140,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Wandering librarian: patrol_visits + wander_state"),
+                (SCHEMA_VERSION, "Retrieval attribution: actor on retrieval_events + query_history"),
             )
 
 
@@ -1883,3 +1896,22 @@ def _migrate_v37_to_v38(db: DatabaseEngine) -> None:
     new errand never performed.
     """
     pass
+
+
+def _migrate_v38_to_v39(db: DatabaseEngine) -> None:
+    """Add the actor column to the two ledgers a retrieval writes to.
+
+    Existing rows default to 'patron'.  That is the honest reading rather
+    than a convenient one: before this column there was no way to tell
+    whose traffic anything was, so calling the backlog patron demand
+    claims no more than the old schema already implied.
+    """
+    for table in ("retrieval_events", "query_history"):
+        if not _has_table(db, table):
+            continue
+        cols = {r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "actor" not in cols:
+            db.execute(
+                f"ALTER TABLE {table} ADD COLUMN actor TEXT NOT NULL DEFAULT 'patron'"
+            )
+    db.connection.commit()

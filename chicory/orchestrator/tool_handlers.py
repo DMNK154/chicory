@@ -67,6 +67,7 @@ def _handle_retrieve_memories(o: "Orchestrator", inp: dict) -> dict:
         tags=inp.get("tags"),
         method=inp.get("method", "hybrid"),
         top_k=inp.get("top_k", 10),
+        actor=inp.get("actor"),
     )
 
 
@@ -99,6 +100,7 @@ def _handle_deep_retrieve(o: "Orchestrator", inp: dict) -> dict:
         tags=inp.get("tags"),
         max_depth=inp.get("max_depth"),
         per_level_k=inp.get("per_level_k"),
+        actor=inp.get("actor"),
     )
 
 
@@ -165,6 +167,7 @@ def _handle_librarian_consult(o: "Orchestrator", inp: dict) -> dict:
     return o.handle_librarian_consult(
         query=inp["query"],
         top_k=inp.get("top_k", 5),
+        actor=inp.get("actor"),
     )
 
 

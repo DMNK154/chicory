@@ -1949,3 +1949,84 @@ class TestPromotionTiers:
         for _ in range(2):
             led.record("asked once, answered decently", _basis_vec(0), 5, 0.80)
         assert led.process_batch(allow_retrieval=True)["faq_candidates"] == 1
+
+
+class TestRetrievalAttribution:
+    """Whose traffic is this?
+
+    Retrieval is not read-only: it records demand and reweights the
+    centroid geometry the shelf tree is derived from. Without an actor an
+    agent researching on the librarian's behalf is indistinguishable from
+    a patron, and its queries become the library's demand — which is
+    exactly what happened, three times, before this existed.
+    """
+
+    def _ledger(self, stack, **cfg):
+        for k, v in cfg.items():
+            setattr(stack["config"], k, v)
+        return DemandLedger(
+            stack["config"], stack["db"], _StubStore([]),
+            FaqDesk(stack["config"], stack["db"]),
+            CommissionDesk(stack["config"], stack["db"]), stack["roster"],
+        )
+
+    def test_actor_is_recorded_on_every_query(self, stack):
+        led = self._ledger(stack)
+        led.record("a patron question", _basis_vec(0), 5, 0.9)
+        led.record("my own research", _basis_vec(1), 5, 0.9, actor="research")
+        rows = {
+            r["query_text"]: r["actor"] for r in stack["db"].execute(
+                "SELECT query_text, actor FROM query_history"
+            ).fetchall()
+        }
+        assert rows == {"a patron question": "patron", "my own research": "research"}
+
+    def test_only_demand_actors_are_clustered(self, stack):
+        led = self._ledger(stack)
+        led.record("a patron question", _basis_vec(0), 5, 0.9)
+        for _ in range(3):
+            led.record("my own research", _basis_vec(1), 5, 0.99, actor="research")
+        stats = led.process_batch(allow_retrieval=False)
+        assert stats["processed"] == 4
+        assert stats["not_demand"] == 3
+        rows = stack["db"].execute(
+            "SELECT representative_query FROM query_clusters"
+        ).fetchall()
+        assert [r["representative_query"] for r in rows] == ["a patron question"]
+
+    def test_non_demand_rows_still_leave_the_queue(self, stack):
+        """Recorded, not clustered — but never left to block the backlog."""
+        led = self._ledger(stack)
+        led.record("probe", _basis_vec(0), 0, 0.0, actor="probe")
+        led.process_batch(allow_retrieval=False)
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_history WHERE processed = 0"
+        ).fetchone()["n"] == 0
+        # ...and the row survives, because what was asked is still record.
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_history"
+        ).fetchone()["n"] == 1
+
+    def test_widening_demand_actors_lets_them_count(self, stack):
+        led = self._ledger(stack, demand_actors=["patron", "research"])
+        led.record("my own research", _basis_vec(1), 5, 0.9, actor="research")
+        stats = led.process_batch(allow_retrieval=False)
+        assert stats["not_demand"] == 0
+        assert stack["db"].execute(
+            "SELECT COUNT(*) AS n FROM query_clusters"
+        ).fetchone()["n"] == 1
+
+    def test_empty_demand_actors_disables_the_filter(self, stack):
+        led = self._ledger(stack, demand_actors=[])
+        led.record("anything at all", _basis_vec(1), 5, 0.9, actor="whoever")
+        assert led.process_batch(allow_retrieval=False)["not_demand"] == 0
+
+    def test_research_never_becomes_an_faq_card(self, stack):
+        """The end the channel exists for."""
+        _insert_memory(stack["db"], "sup1")
+        led = self._ledger(stack)
+        led._memory_store = _StubStore([(_mem("sup1"), 0.99)])
+        for _ in range(5):
+            led.record("gathering sources for a card", _basis_vec(0), 5, 0.99,
+                       actor="research")
+        assert led.process_batch(allow_retrieval=True)["faq_candidates"] == 0

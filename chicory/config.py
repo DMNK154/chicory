@@ -382,6 +382,27 @@ class ChicoryConfig(BaseModel):
     commission_weak_score: float = Field(default=0.30)
     consult_subject_threshold: float = Field(default=0.30)
     consult_max_subjects: int = Field(default=3)
+    # Retrieval attribution.
+    #
+    # Retrieval is not read-only: it records demand, and its bookkeeping
+    # reweights the tag centroids and co-retrieval edges the shelf tree is
+    # derived from. Until this existed, an agent researching on the
+    # librarian's behalf was indistinguishable from a patron asking a
+    # question, and three such research queries were promoted into FAQ
+    # cards as though the library had been asked them.
+    #
+    # This is a DECLARED channel, not an enforced one. A caller states who
+    # it is; nothing verifies the claim. That is worth stating plainly —
+    # it makes traffic separable and auditable, which is all it can do.
+    retrieval_default_actor: str = Field(default="patron")
+    # Whose queries count as demand (FAQ promotion, commission filing).
+    # Everything is still recorded; only these are clustered.
+    demand_actors: list[str] = Field(default_factory=lambda: ["patron"])
+    # Whose retrievals may reshape the centroid geometry. An automated
+    # reader left out of this list can walk the library without rewriting
+    # the map it walks — the precondition for the idle random-walk errand.
+    geometry_actors: list[str] = Field(default_factory=lambda: ["patron"])
+
     # Ingress dwell — receipted hold before commitment (detection window)
     ingress_enabled: bool = Field(default=True)
     ingress_dwell_seconds: float = Field(default=180.0)

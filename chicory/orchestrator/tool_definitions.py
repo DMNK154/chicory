@@ -50,6 +50,12 @@ CHICORY_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "actor": {
+                    "type": "string",
+                    "description": (
+                        "Who is asking. Retrieval is not read-only here: it records demand and reweights the centroid geometry the shelf tree is derived from. Leave unset (defaults to 'patron') when relaying a person's own question. Set 'research' when querying on your own behalf - gathering sources for an FAQ answer, a commission report, or a digest - so the queries are recorded but not counted as the library's demand. Set 'probe' for tests and diagnostics."
+                    ),
+                },
                 "query": {
                     "type": "string",
                     "description": "Natural language search query.",
@@ -167,6 +173,12 @@ CHICORY_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "actor": {
+                    "type": "string",
+                    "description": (
+                        "Who is asking. Retrieval is not read-only here: it records demand and reweights the centroid geometry the shelf tree is derived from. Leave unset (defaults to 'patron') when relaying a person's own question. Set 'research' when querying on your own behalf - gathering sources for an FAQ answer, a commission report, or a digest - so the queries are recorded but not counted as the library's demand. Set 'probe' for tests and diagnostics."
+                    ),
+                },
                 "query": {
                     "type": "string",
                     "description": "Initial natural language search query.",
@@ -308,6 +320,12 @@ CHICORY_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "actor": {
+                    "type": "string",
+                    "description": (
+                        "Who is asking. Retrieval is not read-only here: it records demand and reweights the centroid geometry the shelf tree is derived from. Leave unset (defaults to 'patron') when relaying a person's own question. Set 'research' when querying on your own behalf - gathering sources for an FAQ answer, a commission report, or a digest - so the queries are recorded but not counted as the library's demand. Set 'probe' for tests and diagnostics."
+                    ),
+                },
                 "query": {
                     "type": "string",
                     "description": "The patron's question.",

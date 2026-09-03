@@ -827,6 +827,7 @@ class Orchestrator:
         tags: list[str] | None = None,
         method: str = "hybrid",
         top_k: int = 10,
+        actor: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve memories, log the event, and fire side effects."""
         # Signal background thread that foreground needs the lock,
@@ -835,7 +836,9 @@ class Orchestrator:
         self._foreground_waiting.set()
         try:
             with self._foreground_db_lock:
-                return self._handle_retrieve_memories_locked(query, tags, method, top_k)
+                return self._handle_retrieve_memories_locked(
+                    query, tags, method, top_k, actor,
+                )
         finally:
             self._foreground_waiting.clear()
 
@@ -845,9 +848,14 @@ class Orchestrator:
         tags: list[str] | None,
         method: str,
         top_k: int,
+        actor: str | None = None,
     ) -> dict[str, Any]:
         import time as _time
         _t0 = _time.time()
+        # Resolve the actor once, here: everything downstream writes it to
+        # a NOT NULL column or compares it against an allow-list.
+        actor = actor or self._config.retrieval_default_actor
+
 
         # Reset the shared query-vector and penumbra slots so stale values
         # from a previous call (or a background promotion pass) can never
@@ -891,6 +899,7 @@ class Orchestrator:
             method=method,
             results=result_tuples,
             model_version=self._config.llm_model,
+            actor=actor,
         )
 
         _t_log = _time.time()
@@ -898,7 +907,7 @@ class Orchestrator:
         # Side effects (background thread)
         self._on_retrieval_completed(
             retrieval_id, results, query, query_vec=query_vec_for_ledger,
-            penumbra=penumbra_for_ledger,
+            penumbra=penumbra_for_ledger, actor=actor,
         )
 
         _t_side = _time.time()
@@ -1006,6 +1015,7 @@ class Orchestrator:
         tags: list[str] | None = None,
         max_depth: int | None = None,
         per_level_k: int | None = None,
+        actor: str | None = None,
     ) -> dict[str, Any]:
         """Recursively retrieve memories with time-depth scoring.
 
@@ -1014,6 +1024,10 @@ class Orchestrator:
         retrieve excluding already-seen IDs, apply time-depth scoring that
         progressively favors older memories at deeper recursion levels.
         """
+
+        # Resolve the actor once: everything downstream writes it to a
+        # NOT NULL column or compares it against an allow-list.
+        actor = actor or self._config.retrieval_default_actor
         self._foreground_waiting.set()
         try:
             with self._foreground_db_lock:
@@ -1066,6 +1080,7 @@ class Orchestrator:
                 method="deep_retrieve_L0",
                 results=result_tuples,
                 model_version=self._config.llm_model,
+                actor=actor,
             )
 
         # -- Levels 1..depth_limit: Recursive expansion --
@@ -1120,6 +1135,7 @@ class Orchestrator:
                     method=f"deep_retrieve_L{depth}",
                     results=result_tuples,
                     model_version=self._config.llm_model,
+                    actor=actor,
                 )
 
             prev_level_results = level_results
@@ -1163,11 +1179,13 @@ class Orchestrator:
                 method="deep_retrieve",
                 results=combined_tuples,
                 model_version=self._config.llm_model,
+                actor=actor,
             )
             self._on_retrieval_completed(
                 combined_id, all_retrieval_results, query,
                 query_vec=query_vec_for_ledger,
                 penumbra=penumbra_for_ledger,
+                actor=actor,
             )
 
         self._annotate_supersession(all_results)
@@ -1507,7 +1525,7 @@ class Orchestrator:
         return vi is not None and getattr(vi, "is_built", False)
 
     def handle_librarian_consult(
-        self, query: str, top_k: int = 5,
+        self, query: str, top_k: int = 5, actor: str | None = None,
     ) -> dict[str, Any]:
         """The front desk: FAQ fast path, then subject dispatch, then the
         general shelf — with open research tickets surfaced alongside.
@@ -1516,6 +1534,9 @@ class Orchestrator:
         consulted shelf with its own results), general (whole-library
         hybrid results), research_pending (open commissions near the query).
         """
+        # Resolve the actor once: everything downstream writes it to a
+        # NOT NULL column or compares it against an allow-list.
+        actor = actor or self._config.retrieval_default_actor
         # Embed outside the lock (model forward pass is CPU-bound)
         query_vec = self._embedding_engine.embed(query)
 
@@ -1570,7 +1591,8 @@ class Orchestrator:
                             model_version=self._config.llm_model,
                         )
                         self._on_retrieval_completed(
-                            retrieval_id, faq_results, query, query_vec=query_vec,
+                            retrieval_id, faq_results, query,
+                            query_vec=query_vec, actor=actor,
                         )
                     return response
 
@@ -1633,7 +1655,7 @@ class Orchestrator:
                 # General channel: full hybrid retrieval with the normal
                 # bookkeeping/side effects (this also records demand).
                 general = self._handle_retrieve_memories_locked(
-                    query, None, "hybrid", top_k,
+                    query, None, "hybrid", top_k, actor,
                 )
                 response["general"] = general.get("results", [])
                 return response
@@ -3369,6 +3391,7 @@ class Orchestrator:
         query: str = "",
         query_vec=None,
         penumbra: list | None = None,
+        actor: str | None = None,
     ) -> None:
         """Fire after a retrieval is completed.
 
@@ -3383,7 +3406,7 @@ class Orchestrator:
         _bk_start = _time.perf_counter()
         try:
             self._retrieval_bookkeeping(
-                retrieval_id, results, query, query_vec, penumbra,
+                retrieval_id, results, query, query_vec, penumbra, actor,
             )
         except Exception:
             logging.getLogger(__name__).exception(
@@ -3532,6 +3555,7 @@ class Orchestrator:
         query: str = "",
         query_vec=None,
         penumbra: list | None = None,
+        actor: str | None = None,
     ) -> None:
         """Phase 1: cheap per-retrieval bookkeeping (batch SQL writes).
 
@@ -3541,6 +3565,7 @@ class Orchestrator:
         """
         import time as _time
         _bt = {}
+        actor = actor or self._config.retrieval_default_actor
 
         # Demand ledger: record the initiation BEFORE the empty-results
         # bail — a query the store couldn't serve is the gap signal the
@@ -3552,6 +3577,7 @@ class Orchestrator:
                     query_vec=query_vec,
                     result_count=len(results),
                     top_score=max((s for _, s in results), default=0.0),
+                    actor=actor,
                 )
             except Exception:
                 logging.getLogger(__name__).exception("Demand ledger record failed")
@@ -3657,7 +3683,14 @@ class Orchestrator:
         _bt["inflow_canopy"] = _time.perf_counter() - _s
 
         _s = _time.perf_counter()
-        if self._config.centroid_inhibition_enabled:
+        # Whose reading may move the map.  record_co_retrieval and
+        # update_on_retrieval below write the centroid edges and tag
+        # centroids that SubjectRoster.rebuild derives the shelf tree from,
+        # so an automated reader left out of geometry_actors can walk the
+        # library without rewriting it.
+        geometry_actors = set(self._config.geometry_actors)
+        may_reshape = (not geometry_actors) or (actor in geometry_actors)
+        if self._config.centroid_inhibition_enabled and may_reshape:
             all_tag_ids_flat: list[int] = []
             for tids in tag_ids_map.values():
                 all_tag_ids_flat.extend(tids)
