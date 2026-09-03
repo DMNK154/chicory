@@ -310,8 +310,8 @@ class ChicoryConfig(BaseModel):
     # Evidence is the gate that matters, so these are counts, not
     # strengths, and they are asymmetric: holding two tags together takes
     # one co-retrieval, merging two previously-separate groups takes
-    # several.  Three matches the bar the demand ledger already uses for
-    # promotion (faq_promote_min_hits, commission_min_hits).
+    # several.  Three matches the bar the demand ledger uses for filing a
+    # commission (commission_min_hits).
     subject_edge_keep_min_count: int = Field(default=1)
     subject_edge_merge_min_count: int = Field(default=3)
     subject_max_name_tags: int = Field(default=3)
@@ -345,7 +345,18 @@ class ChicoryConfig(BaseModel):
     demand_process_batch: int = Field(default=200)
     demand_history_retention_days: int = Field(default=30)
     faq_serve_threshold: float = Field(default=0.90)
-    faq_promote_min_hits: int = Field(default=3)
+    # Two, not three, and measured rather than guessed.  On a 124K library
+    # the score gate below has never rejected anything — cluster
+    # mean_top_score runs 0.48..1.15, so 0.45 admits everything and the hit
+    # count is the only real gate.  At three, ten months of traffic yielded
+    # two cards; at two it yields seven, of which the Nietzsche and Vedanta
+    # ones land squarely on the right corpus.  The cost is visible in the
+    # same experiment: one card ('FAISS index recall nprobe') is answered
+    # with Tamil ethical poetry and a Gnostic devotional at mean_top_score
+    # 0.483 — above the gate meant to catch exactly that.  A candidate
+    # serves nothing until judged, so the cost is a reader's time, not a
+    # wrong answer.
+    faq_promote_min_hits: int = Field(default=2)
     faq_promote_min_score: float = Field(default=0.45)
     commission_min_hits: int = Field(default=3)
     commission_weak_score: float = Field(default=0.30)
