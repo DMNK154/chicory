@@ -2102,6 +2102,34 @@ class Orchestrator:
                     return self._patrol.build_observation_edges(
                         min_confirmations=min_confirmations,
                     )
+                if action == "region":
+                    if not subject:
+                        return {"error": "region requires subject"}
+                    r = self._db.execute(
+                        "SELECT subject, weight, confirmations, detail, data "
+                        "FROM patrol_observations WHERE kind = 'concept_gap' "
+                        "AND subject = ? AND retracted = 0", (subject,),
+                    ).fetchone()
+                    if r is None:
+                        return {"error": f"no concept gap recorded for {subject!r}"}
+                    try:
+                        data = _json.loads(r["data"])
+                    except (ValueError, TypeError):
+                        data = {}
+                    return {
+                        "concept": r["subject"],
+                        "mentions": data.get("mentions"),
+                        "spread": r["weight"],
+                        "seen_on_passes": r["confirmations"],
+                        "documents": data.get("documents", []),
+                        # The bridge back into the index: tags carried by
+                        # the memories that discuss a concept the index has
+                        # no word for. This is where the missing tag would
+                        # attach if you made one.
+                        "surrounding_tags": data.get("around", {}),
+                        "shares_memories_with": data.get("co", {}),
+                        "neighbors": self._patrol.gap_neighbors(subject, limit=limit),
+                    }
                 if action == "neighbors":
                     if not subject:
                         return {"error": "neighbors requires subject"}

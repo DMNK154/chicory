@@ -963,6 +963,10 @@ def librarian_gaps(
     action='clusters' (default): the missing subjects, largest first. A
     single unfindable word is a nuisance; a connected component of them
     is one problem with one fix.
+    action='region' (subject=...): everything around one concept — the
+    documents that raise it, the tags carried by the memories that
+    discuss it (where a missing tag would attach), and what shares its
+    memories.
     action='neighbors' (subject=...): what else the surrounding material
     raises — one step out in the net.
     action='list': individual gaps, most concentrated first.

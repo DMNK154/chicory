@@ -782,3 +782,71 @@ def test_documents_accumulate_across_passes(stack):
     obs = p.observations(kind="concept_gap")[0]
     assert json.loads(obs["data"])["documents"] == ["a.pdf", "b.pdf"]
     assert obs["confirmations"] == 2
+
+
+# ── Regions of association ──────────────────────────────────────────────
+
+
+def _doc_mem(db, mid, text, doc="d.pdf"):
+    db.execute("INSERT INTO memories (id, content, summary, source_model, source_path) "
+               "VALUES (?, ?, 'x', 't', ?)", (mid, text, doc))
+
+
+def test_a_region_records_what_shares_the_memory(stack):
+    """Co-occurrence within a memory, not within a book: two terms in the
+    same chunk are related, two in the same 8,969-chunk book are not."""
+    import json
+    db, p = stack["db"], stack["patrol"]
+    _doc_mem(db, "m1", "Malchut Malchut Malchut Malchut. "
+                       "Chochmah Chochmah Chochmah Chochmah.")
+    p.run_errand("concept_gaps", batch_size=10)
+    obs = {o["subject"]: json.loads(o["data"]) for o in p.observations(kind="concept_gap")}
+    assert obs["malchut"]["co"] == {"chochmah": 1}
+    assert obs["chochmah"]["co"] == {"malchut": 1}
+
+
+def test_a_region_records_the_tags_around_it(stack):
+    """The bridge back into the index: where a missing tag would attach."""
+    import json
+    db, p = stack["db"], stack["patrol"]
+    _doc_mem(db, "m1", "Malchut Malchut Malchut Malchut.")
+    tag = stack["tags"].get_or_create("kabbalah", created_by="test") \
+        if "tags" in stack else None
+    from chicory.layer1.tag_manager import TagManager
+    tag = TagManager(db).get_or_create("kabbalah", created_by="test")
+    db.execute("INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, assigned_by) "
+               "VALUES ('m1', ?, 'test')", (tag.id,))
+    p.run_errand("concept_gaps", batch_size=10)
+    data = json.loads(p.observations(kind="concept_gap")[0]["data"])
+    assert data["around"] == {"kabbalah": 1}
+
+
+def test_edges_now_come_from_shared_memories(stack):
+    db, p = stack["db"], stack["patrol"]
+    # together in every memory -> strong edge
+    for i in range(3):
+        _doc_mem(db, f"t{i}", "Malchut Malchut Malchut Malchut. "
+                              "Chochmah Chochmah Chochmah Chochmah.")
+    # apart, in the same document -> no edge under a memory-level rule
+    _doc_mem(db, "a1", "Tabernacle Tabernacle Tabernacle Tabernacle.")
+    p.run_errand("concept_gaps", batch_size=20)
+    p.build_observation_edges(min_confirmations=1)
+    pairs = {(r["subject_a"], r["subject_b"]) for r in stack["db"].execute(
+        "SELECT subject_a, subject_b FROM observation_edges").fetchall()}
+    assert ("chochmah", "malchut") in pairs
+    assert not any("tabernacle" in p_ for p_ in pairs)
+
+
+def test_counters_accumulate_across_passes(stack):
+    import json
+    db, p = stack["db"], stack["patrol"]
+    for i in range(2):
+        _doc_mem(db, f"m{i}", "Malchut Malchut Malchut Malchut. "
+                              "Chochmah Chochmah Chochmah Chochmah.")
+    p.run_errand("concept_gaps", batch_size=1)
+    p.run_errand("concept_gaps", batch_size=1)
+    data = json.loads(
+        [o for o in p.observations(kind="concept_gap")
+         if o["subject"] == "malchut"][0]["data"])
+    assert data["co"]["chochmah"] == 2      # summed, not overwritten
+    assert data["mentions"] == 2

@@ -419,7 +419,7 @@ CHICORY_TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["clusters", "neighbors", "list", "rebuild"],
+                    "enum": ["clusters", "region", "neighbors", "list", "rebuild"],
                     "description": (
                         "clusters (default) — the missing SUBJECTS, being "
                         "connected components of the net; a single "

@@ -457,8 +457,19 @@ class Patrol:
                 except (json.JSONDecodeError, TypeError, ValueError):
                     prior = {}
                 for k, v in prior.items():
-                    if isinstance(v, list) and isinstance(merged.get(k), list):
-                        merged[k] = sorted(set(v) | set(merged[k]))
+                    cur = merged.get(k)
+                    if isinstance(v, list) and isinstance(cur, list):
+                        merged[k] = sorted(set(v) | set(cur))
+                    elif isinstance(v, dict) and isinstance(cur, dict):
+                        # Counters sum: a region is built a batch at a
+                        # time, and how often two concepts share a memory
+                        # is only meaningful over the whole corpus.
+                        totals = dict(v)
+                        for kk, vv in cur.items():
+                            totals[kk] = totals.get(kk, 0) + vv
+                        merged[k] = totals
+                    elif isinstance(v, (int, float)) and isinstance(cur, (int, float)):
+                        merged[k] = v + cur
                     elif k not in merged:
                         merged[k] = v
         self._db.execute(
@@ -490,18 +501,34 @@ class Patrol:
         params.append(limit)
         return [dict(r) for r in self._db.execute(sql, tuple(params)).fetchall()]
 
+    def tags_for(self, memory_ids: list[str]) -> dict[str, list[str]]:
+        """Tags on these memories, batched — one query, not one per memory."""
+        if not memory_ids:
+            return {}
+        ph = ",".join("?" * len(memory_ids))
+        out: dict[str, list[str]] = {}
+        for r in self._db.execute(
+            f"SELECT mt.memory_id, t.name FROM memory_tags mt "
+            f"JOIN tags t ON t.id = mt.tag_id "
+            f"WHERE mt.memory_id IN ({ph})",
+            tuple(memory_ids),
+        ).fetchall():
+            out.setdefault(r["memory_id"], []).append(r["name"])
+        return out
+
     def build_observation_edges(
         self, kind: str = "concept_gap", min_confirmations: int = 2,
     ) -> dict:
-        """Connect observations that the same documents raised.
+        """Connect concepts that share MEMORIES, not merely documents.
 
-        Built by inverting rather than pairing: 9,551 gaps compared
-        pairwise is 45 million comparisons, while walking each document's
-        term list is a few thousand.  The document sets were already
-        accumulated by the walk, so this needs no further reading.
+        The document was the wrong unit and the Zohar proved it: one file
+        of 8,969 chunks, so "both appear in the Zohar" says almost
+        nothing.  Capped, the entire Kabbalah vocabulary had no edges at
+        all; uncapped, that one book became a 1,563-node clique.  Two
+        terms in the same chunk are genuinely related.
 
-        Weight is Jaccard over document sets — how much two gaps belong to
-        the same material rather than merely touching once.
+        Weight is Jaccard over the memories that discuss each — shared
+        over the union of their mentions.
         """
         import itertools
         import json as _json
@@ -511,35 +538,33 @@ class Patrol:
             "WHERE kind = ? AND retracted = 0 AND confirmations >= ?",
             (kind, min_confirmations),
         ).fetchall()
-        docsets: dict[str, set] = {}
+        mentions: dict[str, int] = {}
+        cooc: dict[str, dict] = {}
         for r in rows:
             try:
-                docs = set(_json.loads(r["data"]).get("documents", []))
+                data = _json.loads(r["data"])
             except (ValueError, TypeError):
                 continue
-            if docs:
-                docsets[r["subject"]] = docs
-
-        by_doc: dict[str, list[str]] = {}
-        for subject, docs in docsets.items():
-            for d in docs:
-                by_doc.setdefault(d, []).append(subject)
+            if data.get("co"):
+                cooc[r["subject"]] = data["co"]
+                mentions[r["subject"]] = max(1, int(data.get("mentions", 1)))
 
         pairs: dict[tuple[str, str], int] = {}
-        for members in by_doc.values():
-            # A document mentioning hundreds of gap terms is a save file or
-            # a dump, not a subject; it would emit a dense useless clique.
-            if len(members) > self._config.gap_edge_max_document_terms:
-                continue
-            for a, b in itertools.combinations(sorted(set(members)), 2):
-                pairs[(a, b)] = pairs.get((a, b), 0) + 1
+        for a, partners in cooc.items():
+            for b, n in partners.items():
+                if b not in cooc or a == b:
+                    continue
+                key = (a, b) if a < b else (b, a)
+                # Each side counted it, so keep the larger rather than
+                # doubling: a saw b in n memories, b saw a in the same n.
+                pairs[key] = max(pairs.get(key, 0), int(n))
 
         self._db.execute("DELETE FROM observation_edges WHERE kind = ?", (kind,))
         written = 0
         batch = []
         for (a, b), shared in pairs.items():
-            union = len(docsets[a] | docsets[b])
-            weight = round(shared / union, 4) if union else 0.0
+            union = mentions.get(a, 1) + mentions.get(b, 1) - shared
+            weight = round(shared / union, 4) if union > 0 else 0.0
             if weight < self._config.gap_edge_min_weight:
                 continue
             batch.append((kind, a, b, shared, weight))
@@ -550,7 +575,7 @@ class Patrol:
                 batch,
             )
             written = len(batch)
-        return {"nodes": len(docsets), "edges": written}
+        return {"nodes": len(cooc), "edges": written}
 
     def gap_neighbors(
         self, subject: str, kind: str = "concept_gap", limit: int = 12,
@@ -999,6 +1024,15 @@ def _concept_gaps(
     verdicts: dict[str, tuple[str, str | None]] = {}
     seen: Counter = Counter()
     docs: dict[str, set] = {}
+    # A concept's REGION: what shares its memories.  Co-occurrence within
+    # one memory is the honest unit — two terms in the same chunk are
+    # related, two terms in the same 8,969-chunk book are barely
+    # acquainted, which is why a document-level net left the whole
+    # Kabbalah vocabulary with no edges at all.
+    co: dict[str, Counter] = {}
+    around: dict[str, Counter] = {}
+
+    tags_by_memory = patrol.tags_for(memory_ids) if memory_ids else {}
 
     for mid in memory_ids:
         if should_stop is not None and should_stop():
@@ -1015,9 +1049,20 @@ def _concept_gaps(
             if term.lower() not in _CONCEPT_STOPWORDS
         )
         about = [t for t, n in hits.items() if n >= config.concept_min_mentions]
+        memory_tags = tags_by_memory.get(mid, [])
         for term in about:
             seen[term] += 1
             docs.setdefault(term, set()).add(row["source_path"] or "(unfiled)")
+            partners = co.setdefault(term, Counter())
+            for other in about:
+                if other != term:
+                    partners[other] += 1
+            # The tags on the memories that discuss it: the bridge from an
+            # unfindable concept back into the index that cannot find it.
+            near = around.setdefault(term, Counter())
+            for tag in memory_tags:
+                if len(tag) > 1:      # letter tags carry no subject
+                    near[tag] += 1
         verdicts[mid] = ("ok", f"concepts={len(about)}")
 
     deposited = 0
@@ -1052,7 +1097,15 @@ def _concept_gaps(
                 + " — the library talks about this and cannot retrieve by it"
             ),
             weight=spread,
-            data={"documents": term_docs},
+            data={
+                "documents": term_docs,
+                "mentions": mentions,
+                # Capped: a region is a neighbourhood, not a census, and
+                # an uncapped counter on 9,551 concepts is a megabyte of
+                # JSON nobody reads.
+                "co": dict(co.get(term, Counter()).most_common(24)),
+                "around": dict(around.get(term, Counter()).most_common(12)),
+            },
             lap=state.lap,
         )
         deposited += 1
