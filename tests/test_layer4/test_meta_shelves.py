@@ -374,3 +374,57 @@ class TestProseGate:
     def test_no_content_scores_zero_rather_than_passing(self, stack):
         p = self._proposer(stack["db"], stack["config"])
         assert p._prose_ratio({"x": {"documents": set()}}, {"x"}) == 0.0
+
+
+class TestShapeIsInherited:
+    """A node keeps the leaf/split decision it already had.
+
+    Inheriting the ARITY was not enough. The warm seed is drawn from a
+    whole depth, so how many groups a node's tags fall into depends on
+    whether that node has children — and the two answers sustain each
+    other. Measured on the live roster after 2,522 attachments landed,
+    `life+wisdom+power` alternated between 0 and 2 children on every
+    rebuild for eight consecutive runs: with children the split came out
+    [2,7,7] and stood, without them [2,14], which the memory-separation
+    test rejected, restoring the first.
+    """
+
+    def _many(self, stack, n=14):
+        db = stack["db"]
+        ids = _scatter(db, [f"t{i}" for i in range(n)], 40)
+        for i, t in enumerate(ids):
+            for m in range(3):
+                mid = f"mm{i}-{m}"
+                db.execute(
+                    "INSERT OR IGNORE INTO memories (id, content, source_model, "
+                    "ingestion_tier) VALUES (?, 'x', 'test', 'critical')", (mid,))
+                db.execute(
+                    "INSERT OR IGNORE INTO memory_tags (memory_id, tag_id, "
+                    "assigned_by) VALUES (?, ?, 'test')", (mid, t))
+        db.connection.commit()
+        return ids
+
+    def test_a_leaf_stays_a_leaf(self, stack):
+        db = stack["db"]
+        self._many(stack)
+        stack["roster"].rebuild()
+        leaves = {r["name"] for r in db.execute(
+            "SELECT s.name FROM subjects s WHERE s.status='active' "
+            "AND NOT EXISTS(SELECT 1 FROM subjects c WHERE c.parent_id=s.id "
+            "AND c.status='active')")}
+        stack["roster"].rebuild()
+        still = {r["name"] for r in db.execute(
+            "SELECT s.name FROM subjects s WHERE s.status='active' "
+            "AND NOT EXISTS(SELECT 1 FROM subjects c WHERE c.parent_id=s.id "
+            "AND c.status='active')")}
+        assert leaves <= still, "a leaf must not acquire children on a rebuild"
+
+    def test_ten_rebuilds_settle_on_one_shape(self, stack):
+        self._many(stack)
+        shapes = []
+        for _ in range(10):
+            stack["roster"].rebuild()
+            shapes.append(frozenset(_paths(stack["db"])))
+        assert len(set(shapes)) == 1, (
+            f"the roster must not cycle; saw {len(set(shapes))} states"
+        )

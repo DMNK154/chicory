@@ -213,3 +213,96 @@ class TestBoilerplate:
         got = {e["hebrew"] for e in lex.align(lex.scan())
                if e["english"] == "Metatron"}
         assert "מטטרון" in got
+
+
+class TestAramaicPrefix:
+    """The Zohar is Aramaic, where ד (of/that) is the commonest prefix.
+
+    Omitting it left construct forms standing as words, and a construct
+    form never appears without what it governs — so דזעיר aligned to
+    `Anpin` and והוד to `Netzach`, each mapping to its partner rather
+    than itself.
+    """
+
+    def test_the_genitive_is_stripped(self):
+        assert base_forms("דעתיקא") == ["דעתיקא", "עתיקא"]
+
+    def test_construct_forms_fold_onto_the_bare_word(self):
+        counts = skeleton_counts("דזעיר" + ZWSP + "זעיר" + ZWSP + "וזעיר")
+        assert counts["זעיר"] == 3
+
+    def test_a_hebrew_prefix_still_works(self):
+        assert base_forms("בחכמה") == ["בחכמה", "חכמה"]
+
+
+class TestSuffixAmbiguity:
+    """One skeleton being a suffix of another has two opposite causes.
+
+    `ריך` is debris from stripping `בריך`, so the LONGER form is real.
+    `דזעיר` is a construct form whose bare word `זעיר` is real, so the
+    SHORTER one is. The shapes are identical; the counts are not.
+    """
+
+    def test_the_bare_word_beats_its_construct_form(self, stack):
+        db = stack["db"]
+        # זעיר appears bare and prefixed; both emit the bare skeleton, so
+        # it outnumbers דזעיר.
+        for i in range(4):
+            _mem(db, f"p{i}", f"אמר{ZWSP}דזעיר spoke. Anpin answered.")
+        for i in range(4):
+            _mem(db, f"q{i}", f"אמר{ZWSP}זעיר spoke. Anpin answered.")
+        for i in range(9):
+            _mem(db, f"r{i}", f"אמר{ZWSP}דבר plainly. Yehuda listened.")
+        lex = BilingualLexicon(stack["config"], stack["db"])
+        got = {e["hebrew"] for e in lex.align(lex.scan())
+               if e["english"] == "Anpin"}
+        assert "זעיר" in got
+        assert "דזעיר" not in got
+
+    def test_stripping_debris_still_loses_to_its_parent(self, stack):
+        db = stack["db"]
+        # בריך never appears bare, so ריך only ever ties with it.
+        for i in range(5):
+            _mem(db, f"s{i}", f"אמר{ZWSP}בריך is said. Berikh follows.")
+        for i in range(9):
+            _mem(db, f"t{i}", f"אמר{ZWSP}דבר plainly. Yehuda listened.")
+        lex = BilingualLexicon(stack["config"], stack["db"])
+        got = {e["hebrew"] for e in lex.align(lex.scan())
+               if e["english"] == "Berikh"}
+        assert "בריך" in got
+        assert "ריך" not in got
+
+
+class TestAttestation:
+    """A prefix letter and a root letter look identical.
+
+    ב opens both בחכמה (in-wisdom) and בינה (Binah); מ opens both מחכמה
+    and מלכות. Stripping by shape turns Binah into ינה and Malchut into
+    לכות. What separates them is that a real prefix is OPTIONAL, so the
+    bare form appears somewhere on its own.
+    """
+
+    def test_a_root_letter_is_not_stripped(self):
+        attested = {"בינה", "חכמה", "בחכמה"}
+        counts = skeleton_counts("בינה", attested)
+        assert "בינה" in counts
+        assert "ינה" not in counts, "ינה is not a word this corpus uses"
+
+    def test_a_real_prefix_is_stripped(self):
+        attested = {"בחכמה", "חכמה"}
+        counts = skeleton_counts("בחכמה", attested)
+        assert counts["חכמה"] == 1, "חכמה stands on its own, so ב is a prefix"
+
+    def test_without_a_corpus_it_falls_back_to_shape(self):
+        assert "ינה" in skeleton_counts("בינה")
+
+    def test_binah_survives_a_full_build(self, stack):
+        db = stack["db"]
+        for i in range(5):
+            _mem(db, f"bi{i}", f"אמר{ZWSP}בינה is third. Binah receives.")
+        for i in range(9):
+            _mem(db, f"bj{i}", f"אמר{ZWSP}דבר plainly. Yehuda listened.")
+        lex = BilingualLexicon(stack["config"], stack["db"])
+        got = {e["hebrew"] for e in lex.align(lex.scan()) if e["english"] == "Binah"}
+        assert "בינה" in got
+        assert "ינה" not in got

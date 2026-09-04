@@ -331,6 +331,18 @@ class ChicoryConfig(BaseModel):
     # separated nothing — treat the parent as a leaf rather than emitting
     # a near-identity child (the X / X~2 / X~3 chains).
     subject_split_min_separation: float = Field(default=0.9)
+    # How much MORE separation a node must show to start splitting than to
+    # keep a split it already has.  A Schmitt trigger on the split
+    # decision, for the same reason the component pass has one.
+    #
+    # Without it the warm start feeds back on itself and oscillates.
+    # Observed on the live roster after 2,522 attachments landed: a node
+    # with no children seeds one arity, splits, and passes; with two
+    # children it seeds another, splits differently, and fails — so
+    # `life+wisdom+power` alternated between 0 and 2 children on every
+    # single rebuild, a stable 2-cycle across eight runs. The inheritance
+    # was driving the flip it exists to prevent.
+    subject_split_hysteresis: float = Field(default=0.03)
     # Routing consults coarse shelves; teaching works fine ones.
     # -1 = auto: the shallowest depth that actually has >1 shelf.  On a
     # densely connected corpus the root is a single "everything" node, and

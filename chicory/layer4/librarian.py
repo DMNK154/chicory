@@ -714,6 +714,20 @@ class SubjectRoster:
                 suffix += 1
             name = f"{name}~{suffix}"
         state["used_names"].add(name)
+        # The node's shape as it stood BEFORE this rebuild touched it.
+        # Read here because the upsert below is about to make "prior" and
+        # "current" the same row.
+        was = self._db.execute(
+            "SELECT id FROM subjects WHERE name = ?", (name,),
+        ).fetchone()
+        prior_arity = 0
+        if was is not None:
+            row_k = self._db.execute(
+                "SELECT COUNT(*) AS n FROM subjects WHERE parent_id = ? "
+                "AND status = 'active'", (was["id"],),
+            ).fetchone()
+            prior_arity = row_k["n"] if row_k else 0
+        existed = was is not None
         path = f"{parent_path}/{name}" if parent_path else name
         state["active_paths"].add(path)
         state["max_depth_seen"] = max(state["max_depth_seen"], depth)
@@ -747,10 +761,26 @@ class SubjectRoster:
 
         if not self._should_split(cluster, memory_count, depth, state):
             return
+        # A node that already exists keeps the SHAPE it had.  Inheriting the
+        # arity was not enough: the seed is drawn from a whole depth, so how
+        # many groups a node's tags fall into depends on whether that node
+        # has children, and the two answers sustain each other.  Measured on
+        # the live roster, `life+wisdom+power` alternated 0 and 2 children on
+        # every rebuild for eight consecutive runs — with children the split
+        # came out [2,7,7] and stood, without them [2,14], which the
+        # memory-separation test rejected, restoring the first.
+        #
+        # So the decision is inherited, not recomputed. A node that was a
+        # leaf stays a leaf; a node that had children keeps that many. Only
+        # a genuinely new node derives its own shape, and rebuild(cold=True)
+        # is the way to re-derive the rest.
+        if existed and prior_arity < 2:
+            return
         # A node at depth d inherits the arity depth d+1 actually had.
         children = self._split_in_centroid_space(
             cluster,
             prior_leaf=(state.get("prior_by_depth") or {}).get(depth + 1),
+            target_k=prior_arity,
         )
         children = self._absorb_undersized(children)
         if len(children) < 2:
@@ -763,7 +793,20 @@ class SubjectRoster:
         # Judge that on MEMORY share as well as tag share: a child can shed
         # a third of the parent's tags and still carry ~all of its material,
         # which looks like a split and isn't one.
+        # Asymmetric: a node that already had children keeps them on
+        # slightly weaker evidence than it would need to acquire them.
+        # Equal thresholds let a marginal node flip forever, because the
+        # warm seed differs depending on which side of the flip it is on.
         separation = self._config.subject_split_min_separation
+        had_children = bool(
+            self._db.execute(
+                "SELECT 1 FROM subjects WHERE parent_id = (SELECT id FROM "
+                "subjects WHERE name = ?) AND status = 'active' LIMIT 1",
+                (name,),
+            ).fetchone()
+        )
+        if had_children:
+            separation += self._config.subject_split_hysteresis
         if max(len(c) for c in children) / len(cluster) >= separation:
             return
         tag_members = state.get("tag_members")
@@ -1200,6 +1243,7 @@ class SubjectRoster:
 
     def _split_in_centroid_space(
         self, cluster: set[int], prior_leaf: dict[int, int] | None = None,
+        target_k: int | None = None,
     ) -> list[set[int]]:
         """K-means over tag centroids (pure numpy).
 
@@ -1223,7 +1267,17 @@ class SubjectRoster:
         matrix = np.stack([centroids[t] for t in have])
 
         C = self._warm_centers(have, matrix, prior_leaf) if prior_leaf else None
-        if C is not None:
+        if target_k and target_k >= 2:
+            # The node's OWN arity, which is the only stable thing here.
+            # prior_leaf spans a whole depth, so how many groups a node's
+            # tags fall into changes with whether that node has children —
+            # and that made the seed alternate: two children fed the split
+            # [2,7,7], none fed [2,14], and the second was killed by the
+            # memory-separation test, restoring the first. A live 2-cycle.
+            if C is not None and len(C) != target_k:
+                C = None
+            k = target_k
+        elif C is not None:
             k = len(C)
         else:
             k = self._config.subject_split_k

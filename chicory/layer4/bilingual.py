@@ -54,10 +54,17 @@ _CONSONANT_MIN, _CONSONANT_MAX = "א", "ת"
 # INSIDE words and must not split them.
 _WORD_SEP = "​"
 
-# Letters that attach to the front of a Hebrew word: vav (and), he (the),
-# bet (in), lamed (to), mem (from), shin (that), kaf (like).  Stripping
-# these collapses בחכמה, מחכמה and וחכמה onto one term.
-PREFIX_LETTERS = "והבלמשכ"
+# Letters that attach to the front of a word: vav (and), he (the), bet
+# (in), lamed (to), mem (from), shin (that), kaf (like) — and dalet, which
+# is the point.  The Zohar is largely ARAMAIC, where ד is the genitive and
+# relative particle and by far the commonest prefix of all.
+#
+# Leaving it out was not a small omission.  It left דעתיקא, דזעיר, דכפורי
+# and דאתי in the lexicon as separate words, and because a construct form
+# never appears without the thing it governs, they aligned to their
+# PARTNER rather than themselves: והוד ("and Hod") mapped to `Netzach`,
+# since the pair Netzach-and-Hod is never split.
+PREFIX_LETTERS = "והבלמשכד"
 
 # Long enough to be a word, short enough not to be a phrase glued together
 # by a missing separator.
@@ -120,15 +127,31 @@ def english_terms(text: str) -> set[str]:
     }
 
 
-def skeleton_counts(text: str) -> Counter:
-    """Every usable skeleton in a chunk, counted, prefixes folded in."""
+def skeleton_counts(text: str, attested: set[str] | None = None) -> Counter:
+    """Every usable skeleton in a chunk, counted, prefixes folded in.
+
+    ``attested`` is the set of words the corpus actually uses on their own,
+    and without it this cannot work.  A prefix letter and a root letter
+    look identical: ב opens both בחכמה (in-wisdom) and בינה (Binah), and מ
+    opens both מחכמה and מלכות.  Strip by shape and Binah becomes ``ינה``
+    and Malchut becomes ``לכות``, neither of which is a word.
+
+    A real prefix is OPTIONAL, so its bare form turns up somewhere on its
+    own — זעיר appears beside דזעיר — while a root fragment never does.
+    Passing the attested set makes that the test.  Passing nothing keeps
+    the shape-only behaviour, which is right for a single-chunk caller
+    that has no corpus to consult.
+    """
     counts: Counter = Counter()
     for word in hebrew_words(text):
         if not (MIN_SKELETON <= len(word) <= MAX_SKELETON):
             continue
         for form in base_forms(word):
-            if MIN_SKELETON <= len(form) <= MAX_SKELETON:
-                counts[form] += 1
+            if not (MIN_SKELETON <= len(form) <= MAX_SKELETON):
+                continue
+            if attested is not None and form != word and form not in attested:
+                continue
+            counts[form] += 1
     return counts
 
 
@@ -175,9 +198,17 @@ class BilingualLexicon:
                "AND content GLOB '*[\u05D0-\u05EA]*'")
         if limit:
             sql += f" LIMIT {int(limit)}"
+        # First pass: which words does the corpus use on their own?  That
+        # is the only thing that separates a prefix from a root letter.
+        attested: set[str] = set()
+        for row in self._db.execute(sql):
+            for w in hebrew_words(row["content"] or ""):
+                if MIN_SKELETON <= len(w) <= MAX_SKELETON:
+                    attested.add(w)
+
         for row in self._db.execute(sql):
             text = row["content"] or ""
-            skeletons = set(skeleton_counts(text))
+            skeletons = set(skeleton_counts(text, attested))
             if not skeletons:
                 continue
             english = english_terms(text)
@@ -234,11 +265,28 @@ class BilingualLexicon:
             by_english.setdefault(rec["english"], []).append(rec)
         max_forms = self._config.bilingual_max_forms_per_term
         for term, recs in by_english.items():
-            recs.sort(key=lambda r: -len(r["hebrew"]))
+            # When one skeleton is a suffix of another, one of them is an
+            # artifact — but WHICH one flips depending on the cause, and
+            # the shapes are identical.  `ריך` is debris from stripping
+            # `בריך`; `דזעיר` is a real construct form whose bare word
+            # `זעיר` is the one worth keeping.
+            #
+            # Count settles it without needing to know.  A bare form is
+            # emitted for every prefixed occurrence as well as its own, so
+            # it always outnumbers any single prefixed variant.  Debris,
+            # emitted only alongside its parent, ties — and the longer form
+            # takes the tie.
+            # Shortest first, now that attestation has done the harder
+            # job.  Debris like ריך and ינה never reaches this point,
+            # because the corpus never uses them alone — so if two forms
+            # are BOTH here and one is a suffix of the other, the shorter
+            # is the bare root and the longer carries a prefix.
+            recs.sort(key=lambda r: (len(r["hebrew"]), -r["chunks"]))
             kept: list[dict] = []
             for r in recs:
-                if any(k["hebrew"].endswith(r["hebrew"]) and
-                       k["hebrew"] != r["hebrew"] for k in kept):
+                if any(k["hebrew"].endswith(r["hebrew"]) or
+                       r["hebrew"].endswith(k["hebrew"])
+                       for k in kept if k["hebrew"] != r["hebrew"]):
                     continue
                 kept.append(r)
             # A word translates a word.  If one English term still draws
