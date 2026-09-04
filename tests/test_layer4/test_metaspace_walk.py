@@ -616,3 +616,54 @@ class TestObserveDoesNotSumIdentifiers:
                       data={"mentions": 10}, lap=0)
         db.connection.commit()
         assert json.loads(_obs(db, "k2")["s"]["data"])["mentions"] == 30
+
+
+class TestAccumulationIsLapScoped:
+    """A lap visits every object once, so a total must not cross laps.
+
+    Batches within a lap have to accumulate — the walk sees one at a time
+    and a corpus-wide count has no other way to form. Carrying that total
+    into the next lap counts everything again. Measured after six laps:
+    `university` stored 1,318 against a true 225, `press` 1,759 against
+    295 — uniformly 6x, which is why no ratio built from it ever looked
+    wrong.
+    """
+
+    def test_batches_within_a_lap_accumulate(self, stack):
+        p, db = stack["patrol"], stack["db"]
+        for _ in range(3):
+            p.observe(errand="e", kind="k", subject="s", detail="d", weight=0.0,
+                      data={"mentions": 10}, lap=2)
+        db.connection.commit()
+        assert json.loads(_obs(db, "k")["s"]["data"])["mentions"] == 30
+
+    def test_a_new_lap_starts_the_count_again(self, stack):
+        p, db = stack["patrol"], stack["db"]
+        p.observe(errand="e", kind="k2", subject="s", detail="d", weight=0.0,
+                  data={"mentions": 30}, lap=2)
+        p.observe(errand="e", kind="k2", subject="s", detail="d", weight=0.0,
+                  data={"mentions": 30}, lap=3)
+        db.connection.commit()
+        assert json.loads(_obs(db, "k2")["s"]["data"])["mentions"] == 30, (
+            "a second lap re-measures; it does not count everything twice"
+        )
+
+    def test_counters_also_reset_across_laps(self, stack):
+        p, db = stack["patrol"], stack["db"]
+        p.observe(errand="e", kind="k3", subject="s", detail="d", weight=0.0,
+                  data={"co": {"binah": 4}}, lap=1)
+        p.observe(errand="e", kind="k3", subject="s", detail="d", weight=0.0,
+                  data={"co": {"binah": 4}}, lap=2)
+        db.connection.commit()
+        assert json.loads(_obs(db, "k3")["s"]["data"])["co"]["binah"] == 4
+
+    def test_document_lists_still_union_across_laps(self, stack):
+        """A later lap genuinely sees files the earlier one did not."""
+        p, db = stack["patrol"], stack["db"]
+        p.observe(errand="e", kind="k4", subject="s", detail="d", weight=0.0,
+                  data={"documents": ["a.pdf"]}, lap=1)
+        p.observe(errand="e", kind="k4", subject="s", detail="d", weight=0.0,
+                  data={"documents": ["b.pdf"]}, lap=2)
+        db.connection.commit()
+        assert json.loads(_obs(db, "k4")["s"]["data"])["documents"] == [
+            "a.pdf", "b.pdf"]

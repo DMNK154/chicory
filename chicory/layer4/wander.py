@@ -501,10 +501,21 @@ class Patrol:
             # whole corpus has to accumulate here rather than be recomputed.
             # List values union; everything else takes the newer reading.
             row = self._db.execute(
-                "SELECT data FROM patrol_observations "
+                "SELECT data, lap FROM patrol_observations "
                 "WHERE errand = ? AND kind = ? AND subject = ?",
                 (errand, kind, subject),
             ).fetchone()
+            # Counting is scoped to a LAP.  A walk sees one batch at a time,
+            # so a corpus-wide total has to be accumulated across batches —
+            # but a lap visits every object exactly once, so carrying the
+            # total into the NEXT lap counts everything a second time.
+            #
+            # Measured: after six laps, `concept_gap.mentions` stood at
+            # almost exactly six times the truth for every term checked —
+            # `university` 1,318 against 225, `press` 1,759 against 295,
+            # `light` 2,437 against 406. Uniform, and therefore invisible in
+            # any ratio built from it, which is why it survived so long.
+            same_lap = bool(row) and row["lap"] == lap
             if row and row["data"]:
                 try:
                     prior = json.loads(row["data"])
@@ -524,7 +535,8 @@ class Patrol:
                             # re-taken, and merging two of them would
                             # invent a state neither pass observed.
                             pass
-                    elif isinstance(v, dict) and isinstance(cur, dict):
+                    elif (same_lap and isinstance(v, dict)
+                          and isinstance(cur, dict)):
                         # Counters sum: a region is built a batch at a
                         # time, and how often two concepts share a memory
                         # is only meaningful over the whole corpus.
@@ -532,7 +544,7 @@ class Patrol:
                         for kk, vv in cur.items():
                             totals[kk] = totals.get(kk, 0) + vv
                         merged[k] = totals
-                    elif (k in _ACCUMULATING_KEYS
+                    elif (same_lap and k in _ACCUMULATING_KEYS
                           and isinstance(v, (int, float))
                           and isinstance(cur, (int, float))):
                         merged[k] = v + cur
