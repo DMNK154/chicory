@@ -741,3 +741,57 @@ class TestAuditCoversEveryTagAnchoredKind:
         db.connection.commit()   # no such gap and no such tag
         stack["patrol"].run_errand("seam_audit")
         assert _obs(db, "tag_gap_variant") == {}
+
+
+class TestLapLagStaleness:
+    """The one test available to a kind with no tag to look up.
+
+    corpus_asymmetry anchors on a term and two populations; bilingual_term
+    on a Hebrew skeleton and its English partner. Re-deriving either means
+    scanning whole populations — which is exactly what that errand's own
+    lap does. So the question is simply whether the last lap still found
+    it.
+    """
+
+    def _obs(self, db, kind, errand, subject, lap):
+        db.execute(
+            "INSERT INTO patrol_observations (errand, kind, subject, detail, "
+            "weight, data, lap) VALUES (?, ?, ?, '', 0.1, '{}', ?)",
+            (errand, kind, subject, lap))
+        db.connection.commit()
+
+    def _at_lap(self, db, errand, lap):
+        db.execute("INSERT OR REPLACE INTO wander_state (errand, lap) VALUES (?, ?)",
+                   (errand, lap))
+        db.connection.commit()
+
+    def test_a_finding_the_last_lap_missed_is_retracted(self, stack):
+        db = stack["db"]
+        self._at_lap(db, "corpus_asymmetry", 5)
+        self._obs(db, "corpus_asymmetry", "corpus_asymmetry", "pair:gone", 3)
+        stack["patrol"].run_errand("seam_audit")
+        assert _obs(db, "corpus_asymmetry") == {}
+
+    def test_the_off_by_one_is_not_treated_as_stale(self, stack):
+        """observe() stamps the lap read at the START of a run and
+        advance_lap increments after, so a current observation always sits
+        exactly one behind. A threshold of one flags everything."""
+        db = stack["db"]
+        self._at_lap(db, "corpus_asymmetry", 5)
+        self._obs(db, "corpus_asymmetry", "corpus_asymmetry", "pair:fresh", 4)
+        stack["patrol"].run_errand("seam_audit")
+        assert "pair:fresh" in _obs(db, "corpus_asymmetry")
+
+    def test_a_bilingual_pair_still_found_stands(self, stack):
+        db = stack["db"]
+        self._at_lap(db, "hebrew_lexicon", 2)
+        self._obs(db, "bilingual_term", "hebrew_lexicon", "משה", 1)
+        stack["patrol"].run_errand("seam_audit")
+        assert "משה" in _obs(db, "bilingual_term")
+
+    def test_an_errand_that_never_ran_strands_nothing(self, stack):
+        """No wander_state row means no lap to compare against."""
+        db = stack["db"]
+        self._obs(db, "bilingual_term", "never_ran", "מטטרון", 0)
+        stack["patrol"].run_errand("seam_audit")
+        assert "מטטרון" in _obs(db, "bilingual_term")

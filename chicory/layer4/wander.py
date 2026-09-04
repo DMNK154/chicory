@@ -1628,14 +1628,15 @@ def _seam_audit(
         str(i): ("skipped", "not an auditable observation") for i in ids
     }
     ph = ",".join("?" * len(ids))
-    kph = ",".join("?" * len(_TAG_ANCHORED_KINDS))
     rows = db.execute(
-        f"SELECT id, kind, subject, data FROM patrol_observations "
-        f"WHERE id IN ({ph}) AND kind IN ({kph}) AND retracted = 0",
-        (*ids, *_TAG_ANCHORED_KINDS),
+        f"SELECT id, kind, errand, subject, lap, data FROM patrol_observations "
+        f"WHERE id IN ({ph}) AND retracted = 0",
+        tuple(ids),
     ).fetchall()
     if not rows:
         return verdicts
+    errand_lap = {r["errand"]: r["lap"] for r in db.execute(
+        "SELECT errand, lap FROM wander_state")}
 
     live = db.execute(
         "SELECT COUNT(*) AS n FROM memories WHERE is_archived = 0").fetchone()
@@ -1673,6 +1674,24 @@ def _seam_audit(
         except (ValueError, TypeError):
             data = {}
         tag_id = data.get("tag_id")
+        # The one test available to every kind, including those with no
+        # tag to look up: did the errand still find this on its last lap?
+        current = errand_lap.get(r["errand"])
+        if current is not None and r["lap"] < current - config.audit_stale_laps + 1:
+            retract(r["id"],
+                    f"the walk no longer reports it (last seen on lap "
+                    f"{r['lap']}, now on {current})")
+            verdicts[key] = ("acted", "retracted: no longer found")
+            continue
+
+        if r["kind"] not in _TAG_ANCHORED_KINDS:
+            # Nothing further is cheap to check.  Re-deriving a corpus
+            # asymmetry or a bilingual alignment means scanning whole
+            # populations, which is precisely what that errand's own lap
+            # does — so the lap test above is the whole of the audit here.
+            verdicts[key] = ("ok", "current as of the last lap")
+            continue
+
         tag = db.execute(
             "SELECT id, name, is_active, merged_into FROM tags WHERE id = ?",
             (tag_id,),
@@ -1775,11 +1794,11 @@ def _seam_audit(
 
 register(Errand(
     name="seam_audit",
-    description="Re-check the walk's own findings; retract what has been fixed",
+    description="Re-check the walk's own findings; retract what no longer holds",
     run=_seam_audit,
     domain="observations",
-    population=("m.kind IN ('tag_seam', 'tag_twin', 'tag_gap_variant', "
-                "'tag_content')"),
+    # Every kind now, not only the tag-anchored ones.
+    population="1 = 1",
     when="always",
 ))
 

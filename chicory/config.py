@@ -587,6 +587,21 @@ class ChicoryConfig(BaseModel):
     tag_content_min_rate: float = Field(default=0.15)
     # ...and this much commoner there than in the library at large.
     tag_content_lift: float = Field(default=4.0)
+
+    # How many laps an observation may fall behind its errand before it is
+    # taken to be one the errand no longer makes.
+    #
+    # Two, not one, because of an off-by-one in the walk itself: observe()
+    # stamps the lap read at the START of a run and advance_lap increments
+    # after it, so a perfectly current observation always sits exactly one
+    # behind. Measured across 11,867 standing observations, a threshold of
+    # one flags every single one and a threshold of two flags four.
+    #
+    # This is the only staleness test available to a kind with no tag to
+    # check — corpus_asymmetry anchors on a term and two populations,
+    # bilingual_term on a Hebrew skeleton — and re-deriving either costs a
+    # full-population scan, which is what the errand's own lap already is.
+    audit_stale_laps: int = Field(default=2)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the
