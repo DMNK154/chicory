@@ -297,3 +297,76 @@ class TestHubTags:
         s["patrol"].run_errand("tag_seams")
         assert "malchut" in _obs(db, "tag_seam")
         db.close()
+
+
+class TestObserveMerging:
+    def test_a_list_of_records_is_replaced_not_unioned(self, stack):
+        """`observe` merges lists as a set union, which needs hashables.
+
+        `documents` is a list of names and accumulates correctly. A list
+        of measurement records is not unionable, and merging two readings
+        would invent a state neither pass observed — so the newer one
+        stands.
+        """
+        p, db = stack["patrol"], stack["db"]
+        for overlap in (0.2, 0.9):
+            p.observe(errand="e", kind="k", subject="s", detail="d", weight=0.0,
+                      data={"twins": [{"other": "x", "overlap": overlap}]},
+                      lap=0)
+        db.connection.commit()
+        rec = _obs(db, "k")["s"]
+        twins = json.loads(rec["data"])["twins"]
+        assert len(twins) == 1
+        assert twins[0]["overlap"] == 0.9, "the newer reading should stand"
+
+    def test_a_list_of_names_still_accumulates(self, stack):
+        p, db = stack["patrol"], stack["db"]
+        p.observe(errand="e", kind="k2", subject="s", detail="d", weight=0.0,
+                  data={"documents": ["a.pdf"]}, lap=0)
+        p.observe(errand="e", kind="k2", subject="s", detail="d", weight=0.0,
+                  data={"documents": ["b.pdf"]}, lap=0)
+        db.connection.commit()
+        docs = json.loads(_obs(db, "k2")["s"]["data"])["documents"]
+        assert docs == ["a.pdf", "b.pdf"]
+
+
+class TestEveryExaminedObjectIsStamped:
+    """The invariant that keeps a walk advancing.
+
+    An object the cursor offers and the errand does not stamp comes back
+    at the head of the queue on the next batch, forever. Measured on the
+    live library: tag_twins skipped short-named tags silently and was
+    still at 94% coverage after 72 runs.
+    """
+
+    def test_short_named_tags_do_not_block_the_queue(self, stack):
+        db, p = stack["db"], stack["patrol"]
+        short = [_tag(db, n) for n in ("ai", "ml", "os")]      # <= 3 chars
+        long_ = [_tag(db, n) for n in ("kabbalah", "vedanta")]
+        for t in short + long_:
+            _attach(db, f"m{t}", t)
+        db.connection.commit()
+
+        p.run_errand("tag_twins", batch_size=50)
+        db.connection.commit()
+        stamped = {r["memory_id"] for r in db.execute(
+            "SELECT memory_id FROM patrol_visits WHERE errand='tag_twins'")}
+        assert stamped == {str(t) for t in short + long_}, (
+            "every id the cursor offered must carry a visit row"
+        )
+
+    def test_a_second_batch_advances_past_them(self, stack):
+        db, p = stack["db"], stack["patrol"]
+        for n in ("ai", "ml", "os", "kabbalah"):
+            t = _tag(db, n)
+            _attach(db, f"m{t}", t)
+        db.connection.commit()
+        p.run_errand("tag_twins", batch_size=2)
+        db.connection.commit()
+        first = {r["memory_id"] for r in db.execute(
+            "SELECT memory_id FROM patrol_visits WHERE errand='tag_twins'")}
+        p.run_errand("tag_twins", batch_size=2)
+        db.connection.commit()
+        second = {r["memory_id"] for r in db.execute(
+            "SELECT memory_id FROM patrol_visits WHERE errand='tag_twins'")}
+        assert len(second) > len(first), "the walk must reach new tags"

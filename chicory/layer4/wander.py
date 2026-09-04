@@ -505,7 +505,17 @@ class Patrol:
                 for k, v in prior.items():
                     cur = merged.get(k)
                     if isinstance(v, list) and isinstance(cur, list):
-                        merged[k] = sorted(set(v) | set(cur))
+                        try:
+                            merged[k] = sorted(set(v) | set(cur))
+                        except TypeError:
+                            # A list of records rather than of names: the
+                            # union is undefined and the newer reading is
+                            # the one that counts.  `documents` accumulates
+                            # because a later pass sees different files;
+                            # a measurement like a twin candidate is simply
+                            # re-taken, and merging two of them would
+                            # invent a state neither pass observed.
+                            pass
                     elif isinstance(v, dict) and isinstance(cur, dict):
                         # Counters sum: a region is built a batch at a
                         # time, and how often two concepts share a memory
@@ -1428,12 +1438,20 @@ def _tag_twins(
         return {}
     ratio_min = config.meta_shelf_variant_ratio
     ph = ",".join("?" * len(ids))
+    # Every id the cursor handed over gets a verdict, whatever happens
+    # below.  An object an errand examines and does not stamp returns to
+    # the head of the queue forever: measured, a batch of short-named tags
+    # kept this errand at 94% coverage after 72 runs, because the cursor
+    # kept re-offering the same rows it had never recorded a visit for.
+    verdicts: dict[str, tuple[str, str | None]] = {
+        str(i): ("skipped", "too short to compare") for i in ids
+    }
     mine = db.execute(
         f"SELECT id, name FROM tags WHERE id IN ({ph}) AND is_active = 1 "
         f"AND LENGTH(name) > 3", tuple(ids),
     ).fetchall()
     if not mine:
-        return {str(i): ("skipped", "not a comparable tag") for i in ids}
+        return verdicts
 
     others = db.execute(
         "SELECT id, name FROM tags WHERE is_active = 1 AND LENGTH(name) > 3"
@@ -1442,7 +1460,6 @@ def _tag_twins(
             if not r["name"].startswith(_STRUCTURAL_TAG_PREFIXES)]
 
     matcher = SequenceMatcher(autojunk=False)
-    verdicts: dict[str, tuple[str, str | None]] = {}
     for r in mine:
         key, name = str(r["id"]), r["name"]
         if name.startswith(_STRUCTURAL_TAG_PREFIXES):
