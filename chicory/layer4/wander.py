@@ -532,7 +532,9 @@ class Patrol:
                         for kk, vv in cur.items():
                             totals[kk] = totals.get(kk, 0) + vv
                         merged[k] = totals
-                    elif isinstance(v, (int, float)) and isinstance(cur, (int, float)):
+                    elif (k in _ACCUMULATING_KEYS
+                          and isinstance(v, (int, float))
+                          and isinstance(cur, (int, float))):
                         merged[k] = v + cur
                     elif k not in merged:
                         merged[k] = v
@@ -1034,6 +1036,23 @@ _CONCEPT_RE = re.compile(r"\b([A-Z][a-zA-Z]{4,})\b")
 
 # Ingestion stamps and format labels: true of the memory, not of the
 # concept, and identical across everything imported in the same minute.
+# Numeric fields that ACCUMULATE across passes.  Everything else takes the
+# newer reading.
+#
+# This was the other way round — sum any number — and it was silently
+# corrupting every observation with a numeric field.  `tag_id` was being
+# added to itself on each re-deposit, so a seam recorded against tag 69
+# eventually pointed at tag 207, an unrelated tag that happened to sit at
+# the running total; `held` became a sum of every measurement ever taken,
+# which is how `example` came to claim 16,130 memories while holding 2.
+# Forty of forty seams and 406 of 406 twins were affected.
+#
+# An identifier is not a quantity and a measurement is not a tally.  Only
+# a field that genuinely counts occurrences over the whole corpus belongs
+# here, because a walk sees one batch at a time and cannot total such a
+# thing any other way.
+_ACCUMULATING_KEYS = frozenset({"mentions"})
+
 _STRUCTURAL_TAG_PREFIXES = ("month-", "day-", "minute-", "hour-",
                             "week-", "year-")
 

@@ -584,3 +584,35 @@ class TestTagGapVariants:
         assert db.execute(
             "SELECT COUNT(*) n FROM tags WHERE is_active=1").fetchone()["n"] == tags
         assert db.execute("SELECT COUNT(*) n FROM memory_tags").fetchone()["n"] == links
+
+
+class TestObserveDoesNotSumIdentifiers:
+    """An identifier is not a quantity, and a measurement is not a tally.
+
+    observe() summed ANY numeric field across passes. `tag_id` was added
+    to itself on every re-deposit, so a seam recorded against tag 69 came
+    to point at tag 207 — an unrelated tag sitting at the running total —
+    and `held` became a sum of every reading ever taken, which is how
+    `example` claimed 16,130 memories while holding 2. Forty of forty
+    seams and 406 of 406 twins were wrong.
+    """
+
+    def test_an_identifier_is_not_added_up(self, stack):
+        p, db = stack["patrol"], stack["db"]
+        for _ in range(3):
+            p.observe(errand="e", kind="k", subject="s", detail="d", weight=0.0,
+                      data={"tag_id": 69, "held": 2}, lap=0)
+        db.connection.commit()
+        d = json.loads(_obs(db, "k")["s"]["data"])
+        assert d["tag_id"] == 69, "an id must survive being re-observed"
+        assert d["held"] == 2, "a measurement is the newer reading, not a sum"
+
+    def test_a_declared_counter_still_accumulates(self, stack):
+        """`mentions` is counted a batch at a time and has no other way
+        to reach a corpus-wide total."""
+        p, db = stack["patrol"], stack["db"]
+        for _ in range(3):
+            p.observe(errand="e", kind="k2", subject="s", detail="d", weight=0.0,
+                      data={"mentions": 10}, lap=0)
+        db.connection.commit()
+        assert json.loads(_obs(db, "k2")["s"]["data"])["mentions"] == 30
