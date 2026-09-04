@@ -970,7 +970,7 @@ def librarian_gaps(
     action='neighbors' (subject=...): what else the surrounding material
     raises — one step out in the net.
     action='list': individual gaps, most concentrated first.
-    action='rebuild': recompute the edges from the walk's observations.
+    action='rebuild': recompute the edges from the walk's observations.\n    action='seams': the same question asked of the INDEX rather than the\n      material — tags with no centroid, no edge or no shelf, and tags\n      that may be one tag written twice. Invisible from inside normal\n      use, because retrieval works and the shelves render regardless.
 
     Use it when an answer was thin, to tell a HOLDINGS gap (the material
     is not here) from an INDEXING one (it is here and unreachable).

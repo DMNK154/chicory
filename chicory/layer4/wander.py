@@ -52,6 +52,7 @@ import os
 import re
 import socket
 import threading
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
@@ -69,14 +70,56 @@ VERDICTS = ("ok", "acted", "failed", "skipped")
 
 
 @dataclass(frozen=True)
+class Domain:
+    """What an errand walks.
+
+    The distributed cursor was written for memories, but nothing about it
+    is specific to them: it needs a table, a string id, and something to
+    break ties by on the first lap.  ``patrol_visits.memory_id`` is already
+    TEXT and the primary key is (errand, memory_id), so a walk over another
+    kind of object needs no new table and cannot collide with the memory
+    walk — the errand name keeps them apart.
+
+    That matters because the library's METADATA has the same problem its
+    memories do.  A survey found 844 tags with no edge, 392 with no
+    centroid and 520 redundant fragments — none of it visible from inside
+    normal use, because retrieval worked and the shelves rendered the whole
+    time.  A one-off query finds that once; a walk keeps finding it as new
+    tags arrive.
+    """
+
+    table: str
+    id_expr: str
+    tiebreak: str
+    where: str = "1 = 1"
+    label: str = "object"
+
+
+DOMAIN_MEMORIES = Domain(
+    table="memories m", id_expr="m.id", tiebreak="m.created_at",
+    where="m.is_archived = 0", label="memory",
+)
+DOMAIN_TAGS = Domain(
+    # Cast so the id matches patrol_visits.memory_id, which is TEXT.
+    table="tags m", id_expr="CAST(m.id AS TEXT)", tiebreak="m.id",
+    where="m.is_active = 1 AND LENGTH(m.name) > 1",
+    label="tag",
+)
+DOMAINS = {"memories": DOMAIN_MEMORIES, "tags": DOMAIN_TAGS}
+
+
+@dataclass(frozen=True)
 class Errand:
     """One standing question the patrol carries around the library.
 
-    ``population`` narrows which memories the errand cares about at all —
-    a SQL predicate over alias ``m`` (the memories table).  The cursor then
-    orders *within* that population, so a targeted errand still gets the
-    least-recently-visited guarantee, and a memory it cannot fix rotates to
-    the back instead of blocking the queue.
+    ``population`` narrows which objects the errand cares about at all — a
+    SQL predicate over alias ``m``.  The cursor then orders *within* that
+    population, so a targeted errand still gets the least-recently-visited
+    guarantee, and an object it cannot fix rotates to the back instead of
+    blocking the queue.
+
+    ``domain`` says WHAT it walks: "memories" by default, or "tags" for an
+    errand that patrols the metadata rather than the material.
 
     ``when`` is "always" for work that is safe beside a conversation, or
     "idle" for work that should wait until nobody is talking.
@@ -87,6 +130,7 @@ class Errand:
     run: Callable[..., dict[str, tuple[str, str | None]]]
     population: str | None = None
     when: str = "always"
+    domain: str = "memories"
 
 
 ERRANDS: dict[str, Errand] = {}
@@ -333,21 +377,22 @@ class Patrol:
         3.4s on a six-figure library, every batch, under the foreground
         lock).
         """
-        where = "m.is_archived = 0"
+        dom = DOMAINS.get(errand.domain, DOMAIN_MEMORIES)
+        where = dom.where
         if errand.population:
             where += f" AND ({errand.population})"
         rows = self._db.execute(
             f"""
-            SELECT m.id, v.lap AS visit_lap FROM memories m
+            SELECT {dom.id_expr} AS oid, v.lap AS visit_lap FROM {dom.table}
             LEFT JOIN patrol_visits v
-                   ON v.memory_id = m.id AND v.errand = ?
+                   ON v.memory_id = {dom.id_expr} AND v.errand = ?
             WHERE {where}
-            ORDER BY v.visited_at ASC, m.created_at ASC
+            ORDER BY v.visited_at ASC, {dom.tiebreak} ASC
             LIMIT ?
             """,
             (errand.name, limit),
         ).fetchall()
-        return [(r["id"], r["visit_lap"]) for r in rows]
+        return [(r["oid"], r["visit_lap"]) for r in rows]
 
     def record_visits(
         self,
@@ -371,25 +416,26 @@ class Patrol:
         )
 
     def population_size(self, errand: Errand, cap: int | None = None) -> int:
-        """How many memories this errand still cares about.
+        """How many objects this errand still cares about.
 
-        This is a full scan of the memories table with the errand's
-        predicate applied per row — 3.4s on a six-figure library — so it is
-        NEVER on the patrol's hot path.  Status callers pass a cap, which
+        This is a full scan of the errand's domain with its predicate
+        applied per row — 3.4s on a six-figure library — so it is NEVER on
+        the patrol's hot path.  Status callers pass a cap, which
         short-circuits the scan and turns the answer into "at least cap".
         """
-        where = "m.is_archived = 0"
+        dom = DOMAINS.get(errand.domain, DOMAIN_MEMORIES)
+        where = dom.where
         if errand.population:
             where += f" AND ({errand.population})"
         if cap is not None:
             row = self._db.execute(
                 f"SELECT COUNT(*) AS n FROM "
-                f"(SELECT 1 FROM memories m WHERE {where} LIMIT ?)",
+                f"(SELECT 1 FROM {dom.table} WHERE {where} LIMIT ?)",
                 (cap,),
             ).fetchone()
         else:
             row = self._db.execute(
-                f"SELECT COUNT(*) AS n FROM memories m WHERE {where}"
+                f"SELECT COUNT(*) AS n FROM {dom.table} WHERE {where}"
             ).fetchone()
         return row["n"] if row else 0
 
@@ -1194,6 +1240,274 @@ register(Errand(
     run=_meta_shelf_proposals,
     # Reads content for the bibliography guard and walks the whole net, so
     # it waits for quiet like the errand whose output it consumes.
+    when="idle",
+))
+
+
+# ── Metaspace errands ───────────────────────────────────────────────────
+#
+# The walk above reads the library's MATERIAL.  These read its INDEX.
+#
+# A survey found 844 tags with no edge (so the roster could not see them —
+# `plato`, 1,262 memories, had no shelf), 392 with no centroid, and 520
+# fragment tags duplicating a hyphenated parent.  None of it was visible
+# from inside normal use: retrieval worked, the shelves rendered, nothing
+# errored.  A one-off query finds that once.  A walk keeps finding it, as
+# tags keep arriving.
+
+
+def _tag_seams(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Notice where a tag has fallen out of the structure around it.
+
+    Four things can be true of a tag that make it unreachable, and each is
+    invisible from the outside:
+
+      no centroid  _topical_tag_ids selects FROM tag_centroids, so the
+                   roster cannot even consider it.
+      no edge      components are built from centroid_edges, which form
+                   through co-RETRIEVAL — so a tag nobody has queried is an
+                   isolated node and gets dropped for being under
+                   subject_min_cluster_size.
+      no shelf     it derives nothing, so nothing routes to it.
+      redundant    its memories are a subset of a hyphenated parent's, so
+                   it is the same tag twice and inflates co-occurrence.
+
+    Recording, not repairing.  Seeding an edge changes what the roster
+    derives and merging a tag deletes rows; neither belongs in an errand
+    that runs unattended.
+    """
+    ids = [int(x) for x in memory_ids if str(x).isdigit()]
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"""SELECT t.id, t.name,
+               (SELECT COUNT(*) FROM memory_tags mt WHERE mt.tag_id = t.id) AS held,
+               EXISTS(SELECT 1 FROM tag_centroids c WHERE c.tag_id = t.id) AS has_centroid,
+               EXISTS(SELECT 1 FROM centroid_edges e
+                      WHERE e.tag_a_id = t.id OR e.tag_b_id = t.id) AS has_edge
+            FROM tags t WHERE t.id IN ({ph})""",
+        tuple(ids),
+    ).fetchall()
+
+    shelved: set[int] = set()
+    for r in db.execute(
+        "SELECT member_tag_ids FROM subjects WHERE status = 'active'"
+    ):
+        try:
+            shelved.update(json.loads(r["member_tag_ids"]))
+        except (ValueError, TypeError):
+            continue
+
+    live = db.execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE is_archived = 0"
+    ).fetchone()
+    hub_cap = config.subject_hub_tag_max_fraction * max(
+        (live["n"] if live else 0), 1)
+
+    verdicts: dict[str, tuple[str, str | None]] = {}
+    for r in rows:
+        key = str(r["id"])
+        name, held = r["name"], r["held"]
+        if name.startswith(_STRUCTURAL_TAG_PREFIXES):
+            verdicts[key] = ("skipped", "a clock stamp, not a subject")
+            continue
+        if held == 0:
+            verdicts[key] = ("ok", "holds nothing")
+            continue
+        if held > hub_cap:
+            # `document` sits on 123,798 memories and `pdf` on 100,530.
+            # Being off the shelf tree is what subject_hub_tag_max_fraction
+            # is FOR — a tag on a fifth of the library connects everything
+            # to everything — so this is the rule working, not a seam.
+            verdicts[key] = ("ok", f"a hub tag ({held:,}), excluded by design")
+            continue
+
+        faults = []
+        if not r["has_centroid"]:
+            faults.append("no centroid")
+        if not r["has_edge"]:
+            faults.append("no edge")
+        if r["id"] not in shelved:
+            faults.append("on no shelf")
+        parent = _redundant_parent(db, r["id"], name)
+        if parent:
+            faults.append(f"duplicates {parent}")
+
+        if not faults:
+            verdicts[key] = ("ok", f"placed, {held} memories")
+            continue
+        patrol.observe(
+            errand="tag_seams",
+            kind="tag_seam",
+            subject=name,
+            detail=f"{held} memories - " + "; ".join(faults),
+            # Ascending order surfaces the least-affecting first, matching
+            # every other observation kind; the desk sorts by held instead.
+            weight=round(1.0 / (1.0 + held), 6),
+            data={"tag_id": r["id"], "held": held, "faults": faults},
+            lap=state.lap,
+        )
+        verdicts[key] = ("acted", "; ".join(faults))
+    return verdicts
+
+
+def _redundant_parent(db: DatabaseEngine, tag_id: int, name: str) -> str | None:
+    """A hyphenated tag whose memories are a superset of this one's.
+
+    Containment, not name shape.  A fragment that carries memories its
+    parent lacks is a real tag that merely looks like a piece of one —
+    `data` holds 4,103 memories outside `lab-data`, and `philosophy`
+    17,636 outside `political-philosophy`.
+    """
+    row = db.execute(
+        "SELECT id, name FROM tags WHERE is_active = 1 AND name LIKE ? "
+        "AND name != ? AND instr('-' || name || '-', ?) > 0 "
+        "ORDER BY LENGTH(name) DESC LIMIT 4",
+        (f"%{name}%", name, f"-{name}-"),
+    ).fetchall()
+    for r in row:
+        outside = db.execute(
+            "SELECT COUNT(*) AS n FROM memory_tags a WHERE a.tag_id = ? "
+            "AND NOT EXISTS(SELECT 1 FROM memory_tags b "
+            "WHERE b.memory_id = a.memory_id AND b.tag_id = ?)",
+            (tag_id, r["id"]),
+        ).fetchone()
+        if outside and outside["n"] == 0:
+            return r["name"]
+    return None
+
+
+register(Errand(
+    name="tag_seams",
+    description="Notice tags that have fallen out of the structure around them",
+    run=_tag_seams,
+    domain="tags",
+    # Cheap per tag and it touches no material, so it is safe beside a
+    # conversation.
+    when="always",
+))
+
+
+def _tag_twins(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Propose tags that may be one tag written twice.
+
+    The concept-level version of this found `gevurah` and `gvurah`, which
+    share zero memories and could only ever be joined by spelling.  At tag
+    level the same trick finds transliteration pairs and plurals — and it
+    CANNOT be trusted to act, because `device-dependent` and
+    `device-independent` sit at ratio 0.941 while meaning opposite things,
+    and `10-26-17-50mm-gdacca-pc-stir-2` and `-stir-3` are two experiments
+    rather than one misspelt.
+
+    So it records a candidate with both numbers a reader needs — how alike
+    the names are, and how far the memories overlap — and decides nothing.
+    An overlap near 1.0 is the same tag twice; near 0.0 with plural
+    morphology is a judgment about vocabulary, not a typo.
+    """
+    ids = [int(x) for x in memory_ids if str(x).isdigit()]
+    if not ids:
+        return {}
+    ratio_min = config.meta_shelf_variant_ratio
+    ph = ",".join("?" * len(ids))
+    mine = db.execute(
+        f"SELECT id, name FROM tags WHERE id IN ({ph}) AND is_active = 1 "
+        f"AND LENGTH(name) > 3", tuple(ids),
+    ).fetchall()
+    if not mine:
+        return {str(i): ("skipped", "not a comparable tag") for i in ids}
+
+    others = db.execute(
+        "SELECT id, name FROM tags WHERE is_active = 1 AND LENGTH(name) > 3"
+    ).fetchall()
+    pool = [(r["id"], r["name"]) for r in others
+            if not r["name"].startswith(_STRUCTURAL_TAG_PREFIXES)]
+
+    matcher = SequenceMatcher(autojunk=False)
+    verdicts: dict[str, tuple[str, str | None]] = {}
+    for r in mine:
+        key, name = str(r["id"]), r["name"]
+        if name.startswith(_STRUCTURAL_TAG_PREFIXES):
+            verdicts[key] = ("skipped", "a clock stamp")
+            continue
+        matcher.set_seq2(name)
+        found = []
+        for oid, other in pool:
+            if oid == r["id"] or abs(len(other) - len(name)) > 2:
+                continue
+            matcher.set_seq1(other)
+            if matcher.real_quick_ratio() < ratio_min \
+                    or matcher.quick_ratio() < ratio_min:
+                continue
+            ratio = matcher.ratio()
+            if ratio < ratio_min:
+                continue
+            found.append((round(ratio, 4), oid, other))
+        if not found:
+            verdicts[key] = ("ok", "no near name")
+            continue
+        found.sort(reverse=True)
+        twins = []
+        for ratio, oid, other in found[:4]:
+            counts = db.execute(
+                "SELECT (SELECT COUNT(*) FROM memory_tags WHERE tag_id = ?) AS a, "
+                "(SELECT COUNT(*) FROM memory_tags WHERE tag_id = ?) AS b, "
+                "(SELECT COUNT(*) FROM memory_tags x JOIN memory_tags y "
+                " ON y.memory_id = x.memory_id WHERE x.tag_id = ? AND y.tag_id = ?) AS s",
+                (r["id"], oid, r["id"], oid),
+            ).fetchone()
+            union = counts["a"] + counts["b"] - counts["s"]
+            twins.append({
+                "other": other, "other_id": oid, "ratio": ratio,
+                "overlap": round(counts["s"] / union, 4) if union else 0.0,
+                "held": counts["a"], "other_held": counts["b"],
+            })
+        best = max(twins, key=lambda x: x["overlap"])
+        patrol.observe(
+            errand="tag_twins",
+            kind="tag_twin",
+            subject=name,
+            detail=(
+                f"resembles {best['other']} (names {best['ratio']}, memories "
+                f"overlap {best['overlap']}) - "
+                + ("almost certainly the same tag twice"
+                   if best["overlap"] > 0.8 else
+                   "same-looking names on different memories; a vocabulary "
+                   "call, not a typo")
+            ),
+            # Highest overlap first under the ascending convention.
+            weight=round(1.0 - best["overlap"], 6),
+            data={"tag_id": r["id"], "twins": twins},
+            lap=state.lap,
+        )
+        verdicts[key] = ("acted", f"{len(twins)} candidate(s)")
+    return verdicts
+
+
+register(Errand(
+    name="tag_twins",
+    description="Propose tags that may be one tag written two ways",
+    run=_tag_twins,
+    domain="tags",
+    # Compares each tag against the whole vocabulary, so it waits for quiet.
     when="idle",
 ))
 

@@ -2553,6 +2553,9 @@ class Orchestrator:
         neighbors — what else the material around this term raises
         list      — the individual gaps, most concentrated first
         rebuild   — recompute the edges from the walk's observations
+        seams     — the same question asked of the INDEX rather than
+                    the material: tags that have fallen out of the
+                    structure, and tags that may be one tag twice
         """
         import json as _json
 
@@ -2607,6 +2610,8 @@ class Orchestrator:
                             "vocabulary the library cannot retrieve by"
                         ) if clusters else "no edges yet — run action=rebuild",
                     }
+                if action == "seams":
+                    return self._metaspace_seams(limit)
                 if action == "list":
                     rows = self._db.execute(
                         "SELECT subject, weight, confirmations, detail, data "
@@ -2879,6 +2884,81 @@ class Orchestrator:
             if len(out) >= limit:
                 break
         return out
+
+    def _metaspace_seams(self, limit: int) -> dict[str, Any]:
+        """What the walk has noticed about the INDEX rather than the material.
+
+        The concept-gap errand reads the library's content and asks what
+        the index cannot reach.  These two read the index itself and ask
+        where it fails to join up — which is invisible from inside normal
+        use, because retrieval works and the shelves render the whole time.
+
+        A survey found 844 tags with no edge (`plato`, 1,262 memories, had
+        no shelf), 392 with no centroid, and 520 fragments duplicating a
+        hyphenated parent.  A query finds that once; the walk keeps finding
+        it as tags keep arriving.
+
+        Neither errand acts.  Seeding an edge changes what the roster
+        derives, and merging a tag deletes rows — and the twin signal in
+        particular cannot be trusted to decide: `device-dependent` and
+        `device-independent` sit at name similarity 0.941.
+        """
+        import json as _json
+
+        seams = []
+        for r in self._db.execute(
+            "SELECT subject, detail, data FROM patrol_observations "
+            "WHERE kind = 'tag_seam' AND retracted = 0", ()
+        ).fetchall():
+            try:
+                d = _json.loads(r["data"] or "{}")
+            except (ValueError, TypeError):
+                d = {}
+            seams.append({"tag": r["subject"], "held": d.get("held", 0),
+                          "faults": d.get("faults", []), "detail": r["detail"]})
+        seams.sort(key=lambda x: -x["held"])
+
+        certain, judgement = [], []
+        for r in self._db.execute(
+            "SELECT subject, detail, data FROM patrol_observations "
+            "WHERE kind = 'tag_twin' AND retracted = 0", ()
+        ).fetchall():
+            try:
+                twins = _json.loads(r["data"] or "{}").get("twins") or []
+            except (ValueError, TypeError):
+                continue
+            if not twins:
+                continue
+            best = max(twins, key=lambda t: t.get("overlap", 0))
+            rec = {"tag": r["subject"], "resembles": best.get("other"),
+                   "name_similarity": best.get("ratio"),
+                   "memory_overlap": best.get("overlap"),
+                   "held": best.get("held"), "other_held": best.get("other_held")}
+            (certain if best.get("overlap", 0) > 0.8 else judgement).append(rec)
+        certain.sort(key=lambda x: -(x["memory_overlap"] or 0))
+        judgement.sort(key=lambda x: -(x["name_similarity"] or 0))
+
+        by_fault: dict[str, int] = {}
+        for s_ in seams:
+            for f in s_["faults"]:
+                k = "duplicates a hyphenated tag" if f.startswith("duplicates") else f
+                by_fault[k] = by_fault.get(k, 0) + 1
+
+        return {
+            "tags_with_seams": len(seams),
+            "by_fault": by_fault,
+            "seams": seams[:limit],
+            "same_tag_twice": certain[:limit],
+            "look_alike_but_different_memories": judgement[:limit],
+            "note": (
+                "Nothing here has been acted on. A seam is a fact about the "
+                "index; a twin is a candidate. Name similarity alone cannot "
+                "decide — device-dependent and device-independent score "
+                "0.941 — so the memory overlap is given beside it: near 1.0 "
+                "is one tag written twice, near 0.0 is a vocabulary "
+                "question."
+            ),
+        }
 
     def handle_librarian_commissions(
         self,
