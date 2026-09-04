@@ -428,3 +428,29 @@ class TestShapeIsInherited:
         assert len(set(shapes)) == 1, (
             f"the roster must not cycle; saw {len(set(shapes))} states"
         )
+
+
+class TestSplitSeeding:
+    """An inherited arity that rejects the warm centres must still seed.
+
+    The arity fix discards warm centres whose count does not match the
+    node's own child count — and then fell through to the assignment loop
+    with no centres at all. It survived the whole suite and two live
+    rebuilds, and only crashed when 53 new tags changed an arity.
+    """
+
+    def test_a_mismatched_warm_start_falls_back_to_cold_seeding(self, stack):
+        db = stack["db"]
+        ids = _scatter(db, [f"s{i}" for i in range(12)], 60)
+        prior = {t: (100 + i % 5) for i, t in enumerate(ids)}   # five groups
+        got = stack["roster"]._split_in_centroid_space(
+            set(ids), prior_leaf=prior, target_k=3,             # asked for three
+        )
+        assert got, "it must return a partition rather than raising"
+        assert sum(len(g) for g in got) == len(ids)
+
+    def test_no_warm_start_at_all_still_splits(self, stack):
+        db = stack["db"]
+        ids = _scatter(db, [f"c{i}" for i in range(12)], 90)
+        got = stack["roster"]._split_in_centroid_space(set(ids))
+        assert sum(len(g) for g in got) == len(ids)

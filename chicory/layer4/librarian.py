@@ -1283,6 +1283,14 @@ class SubjectRoster:
             k = self._config.subject_split_k
             if k <= 0:
                 k = max(2, int(round((len(have) / 2) ** 0.5)))
+
+        # Seed cold whenever there is no usable warm start — including the
+        # case where an inherited arity discarded one, which is the branch
+        # above rejecting warm centres that do not match the node's own
+        # child count.  Missing this left C as None for the assignment
+        # loop; it survived every test and both live rebuilds, and only
+        # surfaced when 53 new tags changed an arity.
+        if C is None:
             k = min(
                 k, len(have) // self._config.subject_min_cluster_size, len(have),
             )
