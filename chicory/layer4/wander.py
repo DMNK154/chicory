@@ -1982,6 +1982,56 @@ register(Errand(
 ))
 
 
+def _corpus_asymmetry(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Diff two accounts of one thing, and record where they disagree.
+
+    Not "find an asymmetry" — find the SAME thing represented twice.  A
+    tag pair scoring 0.997 on centroid similarity is two different things
+    whose vectors sit close, and 3,724 of those produced no question worth
+    asking.  A concept in two languages, a text in three witnesses, a
+    subject described from inside and outside: those diverge about
+    something, which is what makes the divergence readable.
+
+    A whole-corpus sweep once per lap, like the other comparative passes,
+    because a rate over a population means nothing until the population is
+    fully counted.
+    """
+    from chicory.layer4.asymmetry import CorpusAsymmetry
+
+    marker = f"lap{state.lap}"
+    if (state.cursor_hint or "") == marker:
+        return {mid: ("skipped", "already compared this lap") for mid in memory_ids}
+    result = CorpusAsymmetry(config, db).run(patrol=patrol, lap=state.lap)
+    db.execute(
+        "UPDATE wander_state SET cursor_hint = ?, "
+        "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE errand = ?",
+        (marker, "corpus_asymmetry"),
+    )
+    db.connection.commit()
+    total = sum(p.get("recorded", 0) for p in result.get("pairs", []))
+    _log.info("Corpus asymmetry: %d findings across %d pairs",
+              total, len(result.get("pairs", [])))
+    return {mid: ("ok", f"asymmetries={total}") for mid in memory_ids}
+
+
+register(Errand(
+    name="corpus_asymmetry",
+    description="Diff two accounts of one thing and record where they disagree",
+    run=_corpus_asymmetry,
+    # Reads the content of whole populations, so it waits for quiet.
+    when="idle",
+))
+
+
 register(Errand(
     name="concept_gaps",
     description="Record concepts the library discusses but holds no tag for",

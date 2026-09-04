@@ -531,6 +531,46 @@ class ChicoryConfig(BaseModel):
     # whole cluster is dropped rather than trimmed — the block gives no
     # reason to prefer any member of it.
     bilingual_max_forms_per_term: int = Field(default=3)
+
+    # ── Corpus asymmetry ───────────────────────────────────────────────
+    #
+    # Pairs of populations that describe the SAME thing, so that where
+    # their vocabularies diverge means something.  Both sides are SQL
+    # predicates over `memories`.
+    #
+    # The defaults are the two comparisons that were measured rather than
+    # guessed: three English Zohar editions whose key vocabulary is nearly
+    # disjoint, and a body of scholarship against the primary texts it is
+    # about, which share almost no words at all — `companions` is in 39.2%
+    # of the scholarship and 0.03% of the primary text.
+    asymmetry_pairs: list[dict] = Field(default_factory=lambda: [
+        {
+            "name": "zohar-editions",
+            "left_label": "the Kabbalah Centre edition",
+            "left": "source_path LIKE '%vdoc.pub_the-zohar%'",
+            "right_label": "the twelve-volume bilingual edition",
+            "right": "source_path LIKE 'THE HOLY ZOHAR%'",
+        },
+        {
+            "name": "zohar-scholarship",
+            "left_label": "the scholarship",
+            "left": "source_path LIKE '%Hellner-Eshed%'",
+            "right_label": "the primary text",
+            "right": ("source_path LIKE '%vdoc.pub_the-zohar%' OR "
+                      "source_path LIKE 'THE HOLY ZOHAR%' OR "
+                      "source_path LIKE '%eng_t_ml-sefer-zohar%'"),
+        },
+    ])
+    # A term must be this common on one side...
+    asymmetry_min_rate: float = Field(default=0.02)
+    # ...and this rare on the other.  Two orders of magnitude apart, which
+    # is where the measured cases sit: 39.2% against 0.03%, 37.5% against
+    # 0.00%.  A narrower gap is a difference of emphasis rather than of
+    # vocabulary, and reads as noise.
+    asymmetry_max_other: float = Field(default=0.002)
+    # Below this a side is too small for a rate to mean anything.
+    asymmetry_min_population: int = Field(default=50)
+    asymmetry_max_per_pair: int = Field(default=60)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the
