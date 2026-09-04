@@ -488,6 +488,37 @@ class ChicoryConfig(BaseModel):
     # So this only clears the floor (the tail sits at 0.000) and hands the
     # rest to a reader with both numbers attached, the way tag_twins does.
     variant_context_min: float = Field(default=0.50)
+
+    # ── Bilingual extraction ───────────────────────────────────────────
+    #
+    # Twelve Zohar volumes carry Aramaic and Hebrew beside the English.
+    # The English channel reached 92 of their 5,719 chunks; the Hebrew
+    # reaches 977, and finds seven sefirot the English extractor cannot
+    # see at all — הוד and דעת are below _CONCEPT_RE's five-letter floor.
+    #
+    # A term on nearly every page distinguishes nothing.  `ספר` and `זהר`
+    # sit in 5,090 of 5,719 chunks and align to `Parashat` at dice 0.985
+    # while meaning nothing whatever — the same failure the roster's hub
+    # cap exists to prevent, so this is the same rule at 0.5 rather
+    # than 0.2, because a facing text repeats its own title.
+    bilingual_ubiquity_max: float = Field(default=0.50)
+    # Below this a pairing is one coincidence rather than a convention.
+    bilingual_min_chunks: int = Field(default=8)
+    # Where the learned pairs stop being names and start being neighbours:
+    # measured, משה/Moshe 0.947 and מטטרון/Metatron 0.932 sit far above,
+    # and the tail below 0.45 is words that merely share a page.
+    bilingual_min_dice: float = Field(default=0.45)
+    # A repeated BLOCK aligns perfectly and means nothing.  A liturgical
+    # preface sits in exactly 12 chunks beside the English word `Singer`
+    # in the same 12, so every one of its 21 Hebrew words scores dice
+    # 1.000 against it — higher than בינה/Binah at 0.903.  Co-occurrence
+    # cannot tell a translation from a page that always travels together.
+    #
+    # What can: a word translates a word.  One English term drawing many
+    # unrelated skeletons is boilerplate, not a lexicon entry, so the
+    # whole cluster is dropped rather than trimmed — the block gives no
+    # reason to prefer any member of it.
+    bilingual_max_forms_per_term: int = Field(default=3)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the

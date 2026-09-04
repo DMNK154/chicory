@@ -1901,6 +1901,56 @@ register(Errand(
 ))
 
 
+def _hebrew_lexicon(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Read the bilingual volumes in Hebrew, and let the English name it.
+
+    A whole-corpus sweep once per lap, like the meta-shelf proposer: the
+    alignment is a ratio over chunk-sets and means nothing until both
+    sides are counted.
+
+    Scoped to the Hebrew-bearing material by the population predicate, so
+    it cannot disturb the English gap net that covers everything else.
+    """
+    from chicory.layer4.bilingual import BilingualLexicon
+
+    marker = f"lap{state.lap}"
+    if (state.cursor_hint or "") == marker:
+        return {mid: ("skipped", "already built this lap") for mid in memory_ids}
+    result = BilingualLexicon(config, db).build(patrol=patrol, lap=state.lap)
+    db.execute(
+        "UPDATE wander_state SET cursor_hint = ?, "
+        "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE errand = ?",
+        (marker, "hebrew_lexicon"),
+    )
+    db.connection.commit()
+    _log.info("Bilingual lexicon: %d pairs from %d chunks",
+              result.get("aligned", 0), result.get("chunks_scanned", 0))
+    return {mid: ("ok", f"aligned={result.get('aligned', 0)}")
+            for mid in memory_ids}
+
+
+register(Errand(
+    name="hebrew_lexicon",
+    description="Learn a Hebrew-English lexicon from the facing translation",
+    run=_hebrew_lexicon,
+    # The same predicate the sweep uses, deliberately.  An aleph LIKE is
+    # eight times faster and finds 5,729 of the 5,765, but the two would
+    # then disagree about what the population IS — and `משה` has no aleph,
+    # so the cheap version is an approximation rather than an index hint.
+    population="m.content GLOB '*[א-ת]*'",
+    when="idle",
+))
+
+
 register(Errand(
     name="concept_gaps",
     description="Record concepts the library discusses but holds no tag for",

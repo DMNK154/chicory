@@ -1,0 +1,281 @@
+"""Reading a facing-text corpus in both of its languages.
+
+Twelve volumes of the Zohar in this library are bilingual — Aramaic and
+Hebrew beside an English translation — and the English channel could
+reach almost none of them.  Measured: the concept extractor tagged 92 of
+their 5,719 chunks, 1.6%, because it looks for a capitalised word used
+four or more times in one chunk and this edition uses its vocabulary
+sparsely across many chunks instead.
+
+The Hebrew is a better key for three reasons, and none of them is subtle.
+
+It is INVARIANT.  ``gvurah`` and ``gevurah`` are two editions' romanisation
+of one word; גבורה is גבורה in both.  The whole edition-variant problem
+that produced tag_gap_variants exists only in the transliteration.
+
+It needs NO HEURISTIC.  The English extractor guesses termhood from
+capitalisation, which is why it needs a long stop-list and a four-mention
+floor, and why it still admits `Called` and `Namely`.  A Hebrew string in
+an English sentence is a term by construction.
+
+It has NO FLOOR PROBLEM.  ``_CONCEPT_RE`` requires five letters, so הוד
+(hod) and דעת (daat) — two of the ten sefirot — could never be extracted
+at all.  In Hebrew they are found 90 and 153 times.
+
+Measured against the English channel on the same volumes: chochmah 35
+chunks to 311, chesed 32 to 271, malchut 2 to 117, and seven sefirot that
+went from zero to found.  17.1% of the volumes rather than 1.6%.
+
+The extraction has a signature worth stating, because nothing works until
+it is handled: the PDF text uses U+200B ZERO WIDTH SPACE as the word
+separator and ordinary spaces INSIDE words, with nikkud as combining
+marks throughout.  So ``המשכילים`` arrives as ``ְו ַהַּמ ְׂש ִּכ יִלים``.
+Split on the zero-width space, keep only the 22 consonants, and the word
+comes back.
+
+Then English names what Hebrew found.  Because the translation faces the
+source, the mapping can be LEARNED rather than supplied: a skeleton and
+its English word appear in the same chunks, and Dice over that
+co-occurrence recovers משה→Moshe, מטטרון→Metatron, המנונא→Hamnuna and
+אדהכי→Meanwhile without a dictionary.
+"""
+
+from __future__ import annotations
+
+import re
+from collections import Counter
+
+# The 22 consonants, final forms included.  Nikkud (U+0591-U+05C7) and the
+# cantillation marks are combining characters and are simply not in this
+# range, so filtering to it removes them without a separate pass.
+_CONSONANT_MIN, _CONSONANT_MAX = "א", "ת"
+
+# The word separator the extraction actually uses.  Ordinary spaces appear
+# INSIDE words and must not split them.
+_WORD_SEP = "​"
+
+# Letters that attach to the front of a Hebrew word: vav (and), he (the),
+# bet (in), lamed (to), mem (from), shin (that), kaf (like).  Stripping
+# these collapses בחכמה, מחכמה and וחכמה onto one term.
+PREFIX_LETTERS = "והבלמשכ"
+
+# Long enough to be a word, short enough not to be a phrase glued together
+# by a missing separator.
+MIN_SKELETON, MAX_SKELETON = 3, 9
+
+_ENGLISH_RE = re.compile(r"\b([A-Z][a-zA-Z]{3,})\b")
+
+# Capitalised words that carry no subject in this material: sentence
+# openers, the apparatus of the edition, and the names that appear on
+# nearly every page and would therefore align with everything.
+_ENGLISH_STOP = frozenset("""
+the and but for that this with from come behold said holy one blessed
+book zohar torah what when then there they their have been which because
+therefore however indeed thus here now all not you your his her its him
+she was were will would should could shall may might must can rabbi
+verse portion chapter section page volume english aramaic hebrew
+""".split())
+
+
+def hebrew_words(text: str) -> list[str]:
+    """Consonantal skeletons, in order.
+
+    Splitting on the zero-width space is the whole trick.  Splitting on
+    whitespace instead shreds every word into letters, which is why a
+    naive scan finds גבורה three times in a corpus that contains it 213
+    times.
+    """
+    out: list[str] = []
+    for piece in text.split(_WORD_SEP):
+        skeleton = "".join(
+            ch for ch in piece if _CONSONANT_MIN <= ch <= _CONSONANT_MAX
+        )
+        if skeleton:
+            out.append(skeleton)
+    return out
+
+
+def base_forms(word: str) -> list[str]:
+    """The word, plus what it looks like with attached prefixes removed.
+
+    Returned longest-first so a caller that wants one answer takes the
+    unstripped form: stripping is a guess, and ``ריך`` from ``בריך`` is
+    the shape of that guess going wrong.
+    """
+    forms = [word]
+    for k in (1, 2):
+        if len(word) - k < MIN_SKELETON:
+            break
+        if not all(ch in PREFIX_LETTERS for ch in word[:k]):
+            break
+        forms.append(word[k:])
+    return forms
+
+
+def english_terms(text: str) -> set[str]:
+    """Capitalised words in the facing translation, minus the furniture."""
+    return {
+        w for w in _ENGLISH_RE.findall(text)
+        if w.lower() not in _ENGLISH_STOP
+    }
+
+
+def skeleton_counts(text: str) -> Counter:
+    """Every usable skeleton in a chunk, counted, prefixes folded in."""
+    counts: Counter = Counter()
+    for word in hebrew_words(text):
+        if not (MIN_SKELETON <= len(word) <= MAX_SKELETON):
+            continue
+        for form in base_forms(word):
+            if MIN_SKELETON <= len(form) <= MAX_SKELETON:
+                counts[form] += 1
+    return counts
+
+
+def dice(shared: int, a_total: int, b_total: int) -> float:
+    """Overlap of two chunk-sets, normalised by both sizes.
+
+    Chosen over raw co-occurrence because the corpus is dominated by a few
+    ubiquitous words: ``ספר`` and ``זהר`` appear in 5,090 of 5,719 chunks,
+    so anything else common co-occurs with them constantly while meaning
+    nothing.  Dice punishes that on the denominator — but not enough on
+    its own, which is why callers also apply a ubiquity cut.
+    """
+    total = a_total + b_total
+    return (2.0 * shared / total) if total else 0.0
+
+
+class BilingualLexicon:
+    """Builds a Hebrew-to-English lexicon from the facing translation.
+
+    A whole-corpus sweep rather than a per-chunk deposit.  The alignment
+    is a ratio over chunk-sets, so it means nothing until both sides are
+    fully counted, and 5,719 chunks is small enough to hold at once — the
+    per-term deposit that ``concept_gaps`` uses would write roughly three
+    hundred observations per chunk to compute the same thing.
+    """
+
+    def __init__(self, config, db) -> None:
+        self._config = config
+        self._db = db
+
+    def scan(self, limit: int | None = None) -> dict:
+        """Count skeletons, English terms, and their co-occurrence."""
+        heb_chunks: Counter = Counter()
+        eng_chunks: Counter = Counter()
+        together: dict[str, Counter] = {}
+        seen = 0
+        # The Unicode range, not the aleph shortcut the errand's population
+        # uses.  That shortcut is a cursor optimisation \u2014 0.4s against 3.4s
+        # over the same 5,7xx memories \u2014 and it is an approximation: `\u05DE\u05E9\u05D4`
+        # contains no aleph at all.  The sweep that does the counting
+        # cannot afford to miss a chunk silently, so it pays the full scan
+        # once per lap.
+        sql = ("SELECT content FROM memories WHERE is_archived = 0 "
+               "AND content GLOB '*[\u05D0-\u05EA]*'")
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        for row in self._db.execute(sql):
+            text = row["content"] or ""
+            skeletons = set(skeleton_counts(text))
+            if not skeletons:
+                continue
+            english = english_terms(text)
+            seen += 1
+            for s in skeletons:
+                heb_chunks[s] += 1
+            for e in english:
+                eng_chunks[e] += 1
+            for s in skeletons:
+                pair = together.setdefault(s, Counter())
+                for e in english:
+                    pair[e] += 1
+        return {"chunks": seen, "hebrew": heb_chunks,
+                "english": eng_chunks, "together": together}
+
+    def align(self, counts: dict) -> list[dict]:
+        """Pair each skeleton with the English word that tracks it.
+
+        Two cuts that the raw ratio needs.  UBIQUITY: `ספר` and `זהר` sit
+        in 5,090 of 5,719 chunks, so they co-occur with every common word
+        and score 0.985 against `Parashat` while meaning nothing — a term
+        on nearly every page distinguishes nothing, the same reason the
+        roster caps hub tags.  And LONGEST FORM WINS: prefix-stripping is
+        a guess, so `בריך` and its debris `ריך` both align to `Berikh`,
+        and only the longer one is kept.
+        """
+        chunks = max(counts["chunks"], 1)
+        ceiling = self._config.bilingual_ubiquity_max * chunks
+        floor = self._config.bilingual_min_chunks
+        min_dice = self._config.bilingual_min_dice
+
+        best: dict[str, dict] = {}
+        for skeleton, n in counts["hebrew"].items():
+            if n < floor or n > ceiling:
+                continue
+            top = None
+            for term, shared in counts["together"].get(skeleton, {}).items():
+                m = counts["english"].get(term, 0)
+                if m < floor or m > ceiling:
+                    continue
+                d = dice(shared, n, m)
+                if top is None or d > top["dice"]:
+                    top = {"hebrew": skeleton, "english": term,
+                           "dice": round(d, 4), "chunks": n,
+                           "english_chunks": m, "shared": shared}
+            if top and top["dice"] >= min_dice:
+                best[skeleton] = top
+
+        # Longest form wins: drop a skeleton that is a suffix of a longer
+        # one aligned to the same English word.
+        out = []
+        by_english: dict[str, list[dict]] = {}
+        for rec in best.values():
+            by_english.setdefault(rec["english"], []).append(rec)
+        max_forms = self._config.bilingual_max_forms_per_term
+        for term, recs in by_english.items():
+            recs.sort(key=lambda r: -len(r["hebrew"]))
+            kept: list[dict] = []
+            for r in recs:
+                if any(k["hebrew"].endswith(r["hebrew"]) and
+                       k["hebrew"] != r["hebrew"] for k in kept):
+                    continue
+                kept.append(r)
+            # A word translates a word.  If one English term still draws
+            # many unrelated skeletons after the suffix fold, they arrived
+            # together in a repeated block rather than as translations,
+            # and nothing in the co-occurrence distinguishes them — so the
+            # cluster goes, rather than an arbitrary member of it.
+            if len(kept) > max_forms:
+                continue
+            out.extend(kept)
+        out.sort(key=lambda r: -r["dice"])
+        return out
+
+    def build(self, patrol=None, lap: int = 0, limit: int | None = None) -> dict:
+        """Scan, align, and record the lexicon as observations."""
+        counts = self.scan(limit)
+        entries = self.align(counts)
+        if patrol is not None:
+            for rec in entries:
+                patrol.observe(
+                    errand="hebrew_lexicon",
+                    kind="bilingual_term",
+                    subject=rec["hebrew"],
+                    detail=(
+                        f"{rec['hebrew']} tracks {rec['english']!r} across "
+                        f"{rec['shared']} of {rec['chunks']} chunks "
+                        f"(dice {rec['dice']})"
+                    ),
+                    weight=round(1.0 - rec["dice"], 6),
+                    data={k: v for k, v in rec.items() if k != "hebrew"},
+                    lap=lap,
+                )
+            self._db.connection.commit()
+        return {
+            "chunks_scanned": counts["chunks"],
+            "skeletons": len(counts["hebrew"]),
+            "english_terms": len(counts["english"]),
+            "aligned": len(entries),
+            "top": entries[:15],
+        }
