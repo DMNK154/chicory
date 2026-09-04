@@ -46,7 +46,8 @@ def stack():
     apply_schema(db)
     emb = MockEmbeddingEngine(dimension=DIM)
     emb.set_db(db)
-    yield {"config": config, "db": db, "patrol": Patrol(config, db, emb)}
+    yield {"config": config, "db": db, "emb": emb,
+           "patrol": Patrol(config, db, emb)}
     db.close()
 
 
@@ -414,4 +415,102 @@ class TestQualifyingEdges:
         _shelf(db, "s", [a, b])
         db.connection.commit()
         stack["patrol"].run_errand("tag_seams")
+        assert _obs(db, "tag_seam") == {}
+
+
+class TestSeamAudit:
+    """The walk auditing its own record.
+
+    An observation is a claim made at a moment, and the library moves
+    underneath it. Within an hour of merging seven duplicate tags, 22
+    standing seams pointed at tags that no longer existed — the same rot
+    that left `malchut` claiming 3,948 mentions while its tag held 993.
+    """
+
+    def _seam(self, db, tag_id: int, name: str, faults: list[str], held: int = 5):
+        db.execute(
+            "INSERT INTO patrol_observations (errand, kind, subject, detail, "
+            "weight, data) VALUES ('tag_seams','tag_seam',?,?,?,?)",
+            (name, "; ".join(faults), 0.1,
+             json.dumps({"tag_id": tag_id, "held": held, "faults": faults})))
+        db.connection.commit()
+
+    def _live(self, db, n=20):
+        for i in range(n):
+            _memory(db, f"bulk{i}")
+        db.connection.commit()
+
+    def test_a_seam_for_a_merged_tag_is_retracted(self, stack):
+        db = stack["db"]
+        gone, keep = _tag(db, "gvurah"), _tag(db, "gevurah")
+        _attach(db, "m1", keep)
+        self._seam(db, gone, "gvurah", ["no qualifying edge"])
+        db.execute("UPDATE tags SET is_active=0, merged_into=? WHERE id=?",
+                   (keep, gone))
+        db.connection.commit()
+        stack["patrol"].run_errand("seam_audit")
+        assert _obs(db, "tag_seam") == {}, "a seam for a merged tag must retract"
+
+    def test_a_seam_whose_faults_cleared_is_retracted(self, stack):
+        db = stack["db"]
+        a, b = _tag(db, "aramaic"), _tag(db, "hebrew")
+        for t in (a, b):
+            _attach(db, f"m{t}", t)
+            _centroid(db, t)
+        _edge(db, a, b)                       # count 5, clears the merge floor
+        _shelf(db, "s", [a, b])
+        self._seam(db, a, "aramaic", ["no centroid", "no qualifying edge"])
+        stack["patrol"].run_errand("seam_audit")
+        assert _obs(db, "tag_seam") == {}
+
+    def test_a_still_true_seam_is_restated_not_dropped(self, stack):
+        db = stack["db"]
+        lonely = _tag(db, "thesis")
+        _attach(db, "m1", lonely)
+        _centroid(db, lonely)
+        self._seam(db, lonely, "thesis", ["no centroid"])
+        stack["patrol"].run_errand("seam_audit")
+        seen = _obs(db, "tag_seam")
+        assert "thesis" in seen
+        faults = json.loads(seen["thesis"]["data"])["faults"]
+        assert "no centroid" not in faults          # re-measured: it has one
+        assert "no qualifying edge" in faults       # and this is still true
+
+    def test_it_repairs_a_missing_centroid(self, stack):
+        db, emb = stack["db"], stack["emb"]
+        t = _tag(db, "archaeology")
+        _attach(db, "m1", t)
+        emb.store_cached("m1", emb.embed("some archaeology"))
+        db.connection.commit()
+        self._seam(db, t, "archaeology", ["no centroid"])
+        assert db.execute("SELECT COUNT(*) n FROM tag_centroids").fetchone()["n"] == 0
+        stack["patrol"].run_errand("seam_audit")
+        assert db.execute(
+            "SELECT COUNT(*) n FROM tag_centroids WHERE tag_id=?", (t,)
+        ).fetchone()["n"] == 1, "a centroid is a pure function of what the tag holds"
+
+    def test_it_never_seeds_an_edge_or_merges_a_tag(self, stack):
+        """Those change what the roster DERIVES; an unattended errand must not."""
+        db = stack["db"]
+        a, b = _tag(db, "plato"), _tag(db, "greek")
+        for t in (a, b):
+            _attach(db, "shared", t)
+            _centroid(db, t)
+        self._seam(db, a, "plato", ["no qualifying edge", "on no shelf"])
+        edges = db.execute("SELECT COUNT(*) n FROM centroid_edges").fetchone()["n"]
+        tags = db.execute("SELECT COUNT(*) n FROM tags WHERE is_active=1").fetchone()["n"]
+        stack["patrol"].run_errand("seam_audit")
+        assert db.execute("SELECT COUNT(*) n FROM centroid_edges").fetchone()["n"] == edges
+        assert db.execute(
+            "SELECT COUNT(*) n FROM tags WHERE is_active=1").fetchone()["n"] == tags
+        assert "plato" in _obs(db, "tag_seam"), "and the seam still stands"
+
+    def test_a_tag_that_became_a_hub_is_retracted(self, stack):
+        db = stack["db"]
+        hub = _tag(db, "document")
+        for i in range(10):
+            _attach(db, f"h{i}", hub)
+        self._seam(db, hub, "document", ["on no shelf"], held=10)
+        stack["config"].subject_hub_tag_max_fraction = 0.2
+        stack["patrol"].run_errand("seam_audit")
         assert _obs(db, "tag_seam") == {}

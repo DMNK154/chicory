@@ -105,7 +105,15 @@ DOMAIN_TAGS = Domain(
     where="m.is_active = 1 AND LENGTH(m.name) > 1",
     label="tag",
 )
-DOMAINS = {"memories": DOMAIN_MEMORIES, "tags": DOMAIN_TAGS}
+DOMAIN_OBSERVATIONS = Domain(
+    table="patrol_observations m", id_expr="CAST(m.id AS TEXT)",
+    tiebreak="m.id", where="m.retracted = 0", label="observation",
+)
+DOMAINS = {
+    "memories": DOMAIN_MEMORIES,
+    "tags": DOMAIN_TAGS,
+    "observations": DOMAIN_OBSERVATIONS,
+}
 
 
 @dataclass(frozen=True)
@@ -1536,6 +1544,178 @@ register(Errand(
     domain="tags",
     # Compares each tag against the whole vocabulary, so it waits for quiet.
     when="idle",
+))
+
+
+def _seam_audit(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **kwargs: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Walk the walk's own findings and keep them honest.
+
+    An observation is a claim about the library made at a moment, and the
+    library moves underneath it.  Nothing retracted them: `malchut` sat at
+    retracted=0 claiming 3,948 mentions while its tag held 993, and within
+    an hour of merging seven duplicate tags, 22 standing seams pointed at
+    tags that no longer existed.  A record nobody audits becomes a record
+    nobody can trust, and the desk that reads it inherits the rot.
+
+    Three outcomes per seam, and only one of them changes the library:
+
+      retract  the tag is gone, or every fault it named has cleared.
+      repair   the fault is "no centroid" and the memories are embedded.
+               A centroid is a pure function of what the tag already
+               holds — recomputing it asserts nothing new, which is what
+               makes it safe for an unattended errand, in the same way
+               that backfilling a missing embedding is.
+      restate  the fault list is re-measured and written back.
+
+    It will not seed an edge, merge a tag, or place a shelf.  Those change
+    what the roster DERIVES, and the survey that produced these seams is
+    also the evidence for why: `implementation` and `implementing` look
+    like one tag and share a co-tag context of 0.003.
+    """
+    import json as _json
+
+    ids = [int(x) for x in memory_ids if str(x).isdigit()]
+    if not ids:
+        return {}
+    verdicts: dict[str, tuple[str, str | None]] = {
+        str(i): ("skipped", "not an auditable observation") for i in ids
+    }
+    ph = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"SELECT id, kind, subject, data FROM patrol_observations "
+        f"WHERE id IN ({ph}) AND kind = 'tag_seam' AND retracted = 0",
+        tuple(ids),
+    ).fetchall()
+    if not rows:
+        return verdicts
+
+    live = db.execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE is_archived = 0").fetchone()
+    hub_cap = config.subject_hub_tag_max_fraction * max(
+        (live["n"] if live else 0), 1)
+    shelved: set[int] = set()
+    for r in db.execute(
+        "SELECT member_tag_ids FROM subjects WHERE status = 'active'"
+    ):
+        try:
+            shelved.update(_json.loads(r["member_tag_ids"]))
+        except (ValueError, TypeError):
+            continue
+
+    centroids = None
+    embedding = kwargs.get("embedding")
+    if embedding is not None:
+        try:
+            from chicory.layer3.centroid_subgraph import CentroidSubgraph
+            centroids = CentroidSubgraph(config, db, embedding)
+        except Exception:          # pragma: no cover - optional repair path
+            centroids = None
+
+    def retract(obs_id: int, why: str) -> None:
+        db.execute(
+            "UPDATE patrol_observations SET retracted = 1, detail = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
+            (f"resolved: {why}", obs_id),
+        )
+
+    for r in rows:
+        key = str(r["id"])
+        try:
+            data = _json.loads(r["data"] or "{}")
+        except (ValueError, TypeError):
+            data = {}
+        tag_id = data.get("tag_id")
+        tag = db.execute(
+            "SELECT id, name, is_active, merged_into FROM tags WHERE id = ?",
+            (tag_id,),
+        ).fetchone() if tag_id else None
+
+        if tag is None:
+            retract(r["id"], "the tag no longer exists")
+            verdicts[key] = ("acted", "retracted: tag gone")
+            continue
+        if not tag["is_active"]:
+            into = tag["merged_into"]
+            retract(r["id"], f"the tag was merged into {into}" if into
+                    else "the tag was deactivated")
+            verdicts[key] = ("acted", "retracted: tag merged away")
+            continue
+
+        held = db.execute(
+            "SELECT COUNT(*) AS n FROM memory_tags WHERE tag_id = ?", (tag_id,)
+        ).fetchone()["n"]
+        if held == 0 or held > hub_cap:
+            retract(r["id"], "holds nothing" if held == 0
+                    else f"a hub tag ({held:,}), off the tree by design")
+            verdicts[key] = ("acted", "retracted: no longer applicable")
+            continue
+
+        has_centroid = db.execute(
+            "SELECT 1 FROM tag_centroids WHERE tag_id = ?", (tag_id,)
+        ).fetchone() is not None
+        repaired = False
+        if not has_centroid and centroids is not None:
+            try:
+                if centroids.rebuild_centroid_for_tag(tag_id):
+                    has_centroid, repaired = True, True
+            except Exception:      # pragma: no cover - repair is best effort
+                pass
+
+        has_edge = db.execute(
+            "SELECT 1 FROM centroid_edges WHERE (tag_a_id = ? OR tag_b_id = ?) "
+            "AND edge_strength >= ? AND co_retrieval_count >= ?",
+            (tag_id, tag_id, config.subject_min_edge_strength,
+             config.subject_edge_merge_min_count),
+        ).fetchone() is not None
+
+        faults = []
+        if not has_centroid:
+            faults.append("no centroid")
+        if not has_edge:
+            faults.append("no qualifying edge")
+        if tag_id not in shelved:
+            faults.append("on no shelf")
+        parent = _redundant_parent(db, tag_id, tag["name"])
+        if parent:
+            faults.append(f"duplicates {parent}")
+
+        if not faults:
+            retract(r["id"], "every fault it named has cleared")
+            verdicts[key] = ("acted", "retracted: resolved")
+            continue
+
+        data["faults"] = faults
+        data["held"] = held
+        db.execute(
+            "UPDATE patrol_observations SET data = ?, weight = ?, detail = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
+            (_json.dumps(data, sort_keys=True), round(1.0 / (1.0 + held), 6),
+             f"{held} memories - " + "; ".join(faults), r["id"]),
+        )
+        verdicts[key] = (
+            ("acted", "repaired the centroid; " + "; ".join(faults))
+            if repaired else ("ok", "; ".join(faults))
+        )
+    db.connection.commit()
+    return verdicts
+
+
+register(Errand(
+    name="seam_audit",
+    description="Re-check the walk's own findings; retract what has been fixed",
+    run=_seam_audit,
+    domain="observations",
+    population="m.kind = 'tag_seam'",
+    when="always",
 ))
 
 
