@@ -1065,6 +1065,13 @@ _CONCEPT_RE = re.compile(r"\b([A-Z][a-zA-Z]{4,})\b")
 # thing any other way.
 _ACCUMULATING_KEYS = frozenset({"mentions"})
 
+# Observation kinds anchored on a tag, and therefore invalidated when that
+# tag is merged or deactivated.  The audit covered only `tag_seam` and kept
+# it spotless while three other kinds rotted beside it: merging five
+# duplicate tags left ten stale twin rows, four tag_content rows and one
+# variant candidate, all naming tags that no longer exist.
+_TAG_ANCHORED_KINDS = ("tag_seam", "tag_twin", "tag_gap_variant", "tag_content")
+
 _STRUCTURAL_TAG_PREFIXES = ("month-", "day-", "minute-", "hour-",
                             "week-", "year-")
 
@@ -1621,10 +1628,11 @@ def _seam_audit(
         str(i): ("skipped", "not an auditable observation") for i in ids
     }
     ph = ",".join("?" * len(ids))
+    kph = ",".join("?" * len(_TAG_ANCHORED_KINDS))
     rows = db.execute(
         f"SELECT id, kind, subject, data FROM patrol_observations "
-        f"WHERE id IN ({ph}) AND kind = 'tag_seam' AND retracted = 0",
-        tuple(ids),
+        f"WHERE id IN ({ph}) AND kind IN ({kph}) AND retracted = 0",
+        (*ids, *_TAG_ANCHORED_KINDS),
     ).fetchall()
     if not rows:
         return verdicts
@@ -1674,6 +1682,25 @@ def _seam_audit(
             retract(r["id"], "the tag no longer exists")
             verdicts[key] = ("acted", "retracted: tag gone")
             continue
+        # A pairwise finding dies when EITHER end does.  Merging five
+        # duplicate tags left ten twin rows standing: five whose subject
+        # was merged away, and five more still naming the merged tag as
+        # the thing their subject resembles.
+        partner = None
+        if r["kind"] in ("tag_twin", "tag_gap_variant"):
+            others = data.get("twins") or data.get("variants") or []
+            partner = (others[0].get("other") or others[0].get("gap"))                 if others else None
+        if partner is not None:
+            alive = db.execute(
+                "SELECT 1 FROM tags WHERE name = ? AND is_active = 1 "
+                "UNION SELECT 1 FROM patrol_observations WHERE kind = "
+                "'concept_gap' AND subject = ? AND retracted = 0",
+                (partner, partner),
+            ).fetchone()
+            if alive is None:
+                retract(r["id"], f"the other side, {partner!r}, is gone")
+                verdicts[key] = ("acted", "retracted: partner gone")
+                continue
         if not tag["is_active"]:
             into = tag["merged_into"]
             retract(r["id"], f"the tag was merged into {into}" if into
@@ -1688,6 +1715,12 @@ def _seam_audit(
             retract(r["id"], "holds nothing" if held == 0
                     else f"a hub tag ({held:,}), off the tree by design")
             verdicts[key] = ("acted", "retracted: no longer applicable")
+            continue
+
+        if r["kind"] != "tag_seam":
+            # The other kinds have no fault list to re-measure; both ends
+            # existing is the whole of their claim.
+            verdicts[key] = ("ok", "both ends still exist")
             continue
 
         has_centroid = db.execute(
@@ -1745,7 +1778,8 @@ register(Errand(
     description="Re-check the walk's own findings; retract what has been fixed",
     run=_seam_audit,
     domain="observations",
-    population="m.kind = 'tag_seam'",
+    population=("m.kind IN ('tag_seam', 'tag_twin', 'tag_gap_variant', "
+                "'tag_content')"),
     when="always",
 ))
 

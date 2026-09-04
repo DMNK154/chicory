@@ -667,3 +667,77 @@ class TestAccumulationIsLapScoped:
         db.connection.commit()
         assert json.loads(_obs(db, "k4")["s"]["data"])["documents"] == [
             "a.pdf", "b.pdf"]
+
+
+class TestAuditCoversEveryTagAnchoredKind:
+    """The audit kept tag_seam spotless while three kinds rotted beside it.
+
+    Merging five duplicate tags left ten stale twin rows — five whose
+    subject was merged away, five still naming the merged tag as what
+    their subject resembles — plus four tag_content rows and a variant
+    candidate. All pointed at tags that no longer existed.
+    """
+
+    def _obs(self, db, kind, subject, data):
+        db.execute(
+            "INSERT INTO patrol_observations (errand, kind, subject, detail, "
+            "weight, data) VALUES ('x', ?, ?, '', 0.1, ?)",
+            (kind, subject, json.dumps(data)))
+        db.connection.commit()
+
+    def test_a_twin_whose_subject_was_merged_is_retracted(self, stack):
+        db = stack["db"]
+        gone, keep = _tag(db, "chokhmah"), _tag(db, "chochmah")
+        _attach(db, "m1", keep)
+        self._obs(db, "tag_twin", "chokhmah",
+                  {"tag_id": gone, "twins": [{"other": "chochmah"}]})
+        db.execute("UPDATE tags SET is_active=0, merged_into=? WHERE id=?",
+                   (keep, gone))
+        db.connection.commit()
+        stack["patrol"].run_errand("seam_audit")
+        assert _obs(db, "tag_twin") == {}
+
+    def test_a_twin_whose_PARTNER_was_merged_is_retracted(self, stack):
+        """The half that survives still names the half that did not."""
+        db = stack["db"]
+        keep, gone = _tag(db, "chochmah"), _tag(db, "chokhmah")
+        _attach(db, "m1", keep)
+        self._obs(db, "tag_twin", "chochmah",
+                  {"tag_id": keep, "twins": [{"other": "chokhmah"}]})
+        db.execute("UPDATE tags SET is_active=0, merged_into=? WHERE id=?",
+                   (keep, gone))
+        db.connection.commit()
+        stack["patrol"].run_errand("seam_audit")
+        assert _obs(db, "tag_twin") == {}, "a pair dies when either end does"
+
+    def test_a_twin_with_both_ends_alive_stands(self, stack):
+        db = stack["db"]
+        a, b = _tag(db, "chochmah"), _tag(db, "chokhmah")
+        _attach(db, "m1", a)
+        _attach(db, "m2", b)
+        self._obs(db, "tag_twin", "chochmah",
+                  {"tag_id": a, "twins": [{"other": "chokhmah"}]})
+        stack["patrol"].run_errand("seam_audit")
+        assert "chochmah" in _obs(db, "tag_twin")
+
+    def test_a_tag_content_row_for_a_dead_tag_is_retracted(self, stack):
+        db = stack["db"]
+        gone, keep = _tag(db, "probes"), _tag(db, "probe")
+        _attach(db, "m1", keep)
+        self._obs(db, "tag_content", "probes",
+                  {"tag_id": gone, "distinctive": [], "sampled": 30})
+        db.execute("UPDATE tags SET is_active=0, merged_into=? WHERE id=?",
+                   (keep, gone))
+        db.connection.commit()
+        stack["patrol"].run_errand("seam_audit")
+        assert _obs(db, "tag_content") == {}
+
+    def test_a_variant_whose_gap_was_closed_is_retracted(self, stack):
+        db = stack["db"]
+        tid = _tag(db, "bereshit")
+        _attach(db, "m1", tid)
+        self._obs(db, "tag_gap_variant", "bereshit",
+                  {"tag_id": tid, "variants": [{"gap": "beresheet"}]})
+        db.connection.commit()   # no such gap and no such tag
+        stack["patrol"].run_errand("seam_audit")
+        assert _obs(db, "tag_gap_variant") == {}
