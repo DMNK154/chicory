@@ -1719,6 +1719,188 @@ register(Errand(
 ))
 
 
+def _tag_gap_variants(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Find an indexed term's unindexed twin — the blind spot between two bridges.
+
+    Two variant-detectors already exist and neither can see this.  The
+    meta-shelf bridge compares GAP to GAP; tag_twins compares TAG to TAG.
+    Nothing compares a tag to a gap — and the moment one spelling becomes
+    a tag it is retracted from the gap net, so fixing one variant makes
+    its twin permanently invisible to both.
+
+    That is not hypothetical.  This library holds three English editions
+    of the Zohar with different romanisation conventions: `gvurah`,
+    `sfirot`, `malchut`, `chochmah` in one, `gevurah`, `sefirot`,
+    `malkhut`, `chokhmah` in another, `hesed` in a third.  Counts are
+    near-categorical — gvurah 707 to 2 in the first, gevurah 80 to 0 in
+    the second — so the split is a convention rather than noise.  The
+    first edition got tagged and the sefirot charter was built on it.
+    Twelve volumes and 5,719 chunks of the second are unreachable by
+    their own vocabulary, and the gap net recorded every one of those
+    terms without anything ever joining them up.
+
+    Spelling proposes and the material narrows: cosine between the tag's
+    co-occurring tags and the gap's `around` counter, both being "the tags
+    carried by the memories that mention this".
+
+    That second test is a TRIAGE CUT and not a verdict, which the numbers
+    insist on.  Over 717 candidates the scores run continuous — the widest
+    break is 0.033 — with true and false interleaved the whole way down:
+    `mazal`/`azael` at 0.884 and `power`/`tower` at 0.839 both outscore
+    `shechinah`/`shekhinah` at 0.795, and `adsorption`/`absorption` sits
+    at 0.801 while meaning the opposite process.
+
+    So it records with both numbers and decides nothing, the way tag_twins
+    does.  Reading a candidate is the only thing that settles it.
+    """
+    from difflib import SequenceMatcher
+
+    ids = [int(x) for x in memory_ids if str(x).isdigit()]
+    if not ids:
+        return {}
+    verdicts: dict[str, tuple[str, str | None]] = {
+        str(i): ("skipped", "too short to compare") for i in ids
+    }
+    ph = ",".join("?" * len(ids))
+    mine = db.execute(
+        f"SELECT id, name FROM tags WHERE id IN ({ph}) AND is_active = 1 "
+        f"AND LENGTH(name) > 4", tuple(ids),
+    ).fetchall()
+    if not mine:
+        return verdicts
+
+    # Names only: loading every gap's JSON per batch would re-read megabytes
+    # to score a handful of candidates.  The `around` counter is fetched
+    # below, for the few names that survive the spelling test.
+    gap_names = [r["subject"] for r in db.execute(
+        "SELECT subject FROM patrol_observations "
+        "WHERE kind = 'concept_gap' AND retracted = 0"
+    ).fetchall()]
+    live_tags = {r["name"] for r in db.execute(
+        "SELECT name FROM tags WHERE is_active = 1")}
+    by_len: dict[int, list[str]] = {}
+    for g in gap_names:
+        if g not in live_tags and len(g) > 4:
+            by_len.setdefault(len(g), []).append(g)
+
+    ratio_min = config.meta_shelf_variant_ratio
+    arc_min = config.variant_context_min
+    matcher = SequenceMatcher(autojunk=False)
+
+    for r in mine:
+        key, name = str(r["id"]), r["name"]
+        if name.startswith(_STRUCTURAL_TAG_PREFIXES):
+            verdicts[key] = ("skipped", "a clock stamp")
+            continue
+        matcher.set_seq2(name)
+        cand = []
+        for delta in (-2, -1, 0, 1, 2):
+            for g in by_len.get(len(name) + delta, ()):
+                if g == name:
+                    continue
+                matcher.set_seq1(g)
+                if matcher.real_quick_ratio() < ratio_min \
+                        or matcher.quick_ratio() < ratio_min:
+                    continue
+                score = matcher.ratio()
+                if score >= ratio_min:
+                    cand.append((round(score, 4), g))
+        if not cand:
+            verdicts[key] = ("ok", "no unindexed variant")
+            continue
+
+        near = _tag_context(db, r["id"])
+        found = []
+        for score, g in sorted(cand, reverse=True)[:6]:
+            row = db.execute(
+                "SELECT data FROM patrol_observations WHERE kind = 'concept_gap' "
+                "AND subject = ? AND retracted = 0", (g,),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                data = json.loads(row["data"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            around = {k: v for k, v in (data.get("around") or {}).items()
+                      if not k.startswith(_STRUCTURAL_TAG_PREFIXES) and len(k) > 1}
+            arc = _profile_cosine(near, around)
+            if arc >= arc_min:
+                found.append({"gap": g, "ratio": score, "arc": round(arc, 4),
+                              "mentions": data.get("mentions", 0),
+                              "documents": (data.get("documents") or [])[:4]})
+        if not found:
+            verdicts[key] = ("ok", "spelling matched, material did not")
+            continue
+        best = found[0]
+        patrol.observe(
+            errand="tag_gap_variants",
+            kind="tag_gap_variant",
+            subject=name,
+            detail=(
+                f"{name!r} is indexed; {best['gap']!r} is not, and the two sit "
+                f"in the same material (spelling {best['ratio']}, context "
+                f"{best['arc']}). {best['mentions']} mentions are unreachable "
+                f"by that spelling."
+            ),
+            weight=round(1.0 - best["arc"], 6),
+            data={"tag_id": r["id"], "variants": found},
+            lap=state.lap,
+        )
+        verdicts[key] = ("acted", f"{len(found)} unindexed variant(s)")
+    return verdicts
+
+
+def _tag_context(db: DatabaseEngine, tag_id: int) -> dict[str, int]:
+    """The tags carried by the memories that carry this one.
+
+    The same shape as a gap observation's `around` counter, deliberately:
+    that is what makes the two sides comparable at all.
+    """
+    return {
+        r["name"]: r["k"] for r in db.execute(
+            "SELECT t2.name, COUNT(*) AS k FROM memory_tags a "
+            "JOIN memory_tags b ON b.memory_id = a.memory_id "
+            "JOIN tags t2 ON t2.id = b.tag_id "
+            "WHERE a.tag_id = ? AND b.tag_id != ? AND LENGTH(t2.name) > 1 "
+            "GROUP BY t2.id ORDER BY k DESC LIMIT 24",
+            (tag_id, tag_id),
+        ).fetchall()
+        if not r["name"].startswith(_STRUCTURAL_TAG_PREFIXES)
+    }
+
+
+def _profile_cosine(a: dict, b: dict) -> float:
+    if not a or not b:
+        return 0.0
+    shared = a.keys() & b.keys()
+    if not shared:
+        return 0.0
+    num = sum(a[k] * b[k] for k in shared)
+    na = sum(v * v for v in a.values()) ** 0.5
+    nb = sum(v * v for v in b.values()) ** 0.5
+    return num / (na * nb) if na and nb else 0.0
+
+
+register(Errand(
+    name="tag_gap_variants",
+    description="Find an indexed term's unindexed spelling — editions the shelf misses",
+    run=_tag_gap_variants,
+    domain="tags",
+    # Compares each tag against the whole standing gap net, so it waits.
+    when="idle",
+))
+
+
 register(Errand(
     name="concept_gaps",
     description="Record concepts the library discusses but holds no tag for",

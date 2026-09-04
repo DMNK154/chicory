@@ -469,6 +469,25 @@ class ChicoryConfig(BaseModel):
     # shelved — one lab's cellulose vocabulary is genuine discourse — so
     # it narrows the queue rather than emptying it.
     meta_shelf_min_prose: float = Field(default=0.15)
+    # An indexed term's UNINDEXED spelling: a triage cut, not a verdict.
+    #
+    # Deliberately not meta_shelf_arc_min. That gate compares two `around`
+    # counters; this compares a tag's co-occurring tags against a gap's
+    # `around`, which is a different distribution shape, and 0.90 rejected
+    # every true case measured — chochmah/chokhmah at 0.841,
+    # shechinah/shekhinah at 0.795, malchut/malkhut at 0.889.
+    #
+    # Nor is there a threshold that WOULD work. Over 717 candidate pairs
+    # the scores are continuous, the largest break is 0.033 wide, and true
+    # and false are interleaved throughout: `mazal`/`azael` scores 0.884
+    # and `power`/`tower` 0.839, both above `shechinah`/`shekhinah` at
+    # 0.795, while `adsorption`/`absorption` and
+    # `nitrocellulose`/`nanocellulose` — opposite processes and different
+    # materials — sit at 0.801 and 0.798.
+    #
+    # So this only clears the floor (the tail sits at 0.000) and hands the
+    # rest to a reader with both numbers attached, the way tag_twins does.
+    variant_context_min: float = Field(default=0.50)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the

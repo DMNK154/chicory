@@ -514,3 +514,73 @@ class TestSeamAudit:
         stack["config"].subject_hub_tag_max_fraction = 0.2
         stack["patrol"].run_errand("seam_audit")
         assert _obs(db, "tag_seam") == {}
+
+
+class TestTagGapVariants:
+    """The blind spot between two bridges.
+
+    meta_shelves compares gap<->gap; tag_twins compares tag<->tag; nothing
+    compared tag<->gap. And a spelling leaves the gap net the moment it
+    becomes a tag, so fixing one variant made its twin invisible to both.
+    Measured: three Zohar editions, one indexed, `chokhmah` / `malkhut` /
+    `sefirot` / `hesed` recorded as gaps and never joined to anything.
+    """
+
+    def _gap(self, db, subject: str, around: dict, mentions: int = 200):
+        db.execute(
+            "INSERT INTO patrol_observations (errand, kind, subject, detail, "
+            "weight, data, confirmations) "
+            "VALUES ('concept_gaps','concept_gap',?,'',0.1,?,4)",
+            (subject, json.dumps({"around": around, "mentions": mentions,
+                                  "documents": ["ed_b.pdf"], "co": {"binah": 3}})))
+        db.connection.commit()
+
+    def _indexed(self, db, tag: str, context: list[str], n: int = 6):
+        t = _tag(db, tag)
+        others = [_tag(db, c) for c in context]
+        for i in range(n):
+            mid = f"{tag}{i}"
+            _attach(db, mid, t)
+            for o in others:
+                _attach(db, mid, o)
+        _centroid(db, t)
+        db.connection.commit()
+        return t
+
+    def test_it_finds_the_unindexed_spelling(self, stack):
+        db = stack["db"]
+        self._indexed(db, "chochmah", ["kabbalah", "zohar", "hebrew"])
+        self._gap(db, "chokhmah", {"kabbalah": 40, "zohar": 30, "hebrew": 20})
+        stack["patrol"].run_errand("tag_gap_variants")
+        seen = _obs(db, "tag_gap_variant")
+        assert "chochmah" in seen
+        v = json.loads(seen["chochmah"]["data"])["variants"][0]
+        assert v["gap"] == "chokhmah"
+        assert v["ratio"] >= 0.8 and v["arc"] >= 0.9
+
+    def test_spelling_alone_is_not_enough(self, stack):
+        """The material has to agree, or `device-dependent` matches its opposite."""
+        db = stack["db"]
+        self._indexed(db, "chochmah", ["kabbalah", "zohar", "hebrew"])
+        self._gap(db, "chokhmah", {"polymer": 40, "cellulose": 30})
+        stack["patrol"].run_errand("tag_gap_variants")
+        assert _obs(db, "tag_gap_variant") == {}
+
+    def test_a_gap_that_is_already_a_tag_is_not_a_finding(self, stack):
+        db = stack["db"]
+        self._indexed(db, "chochmah", ["kabbalah", "zohar"])
+        self._indexed(db, "chokhmah", ["kabbalah", "zohar"])
+        self._gap(db, "chokhmah", {"kabbalah": 40, "zohar": 30})
+        stack["patrol"].run_errand("tag_gap_variants")
+        assert _obs(db, "tag_gap_variant") == {}, "it is indexed already"
+
+    def test_it_only_records(self, stack):
+        db = stack["db"]
+        self._indexed(db, "chochmah", ["kabbalah", "zohar", "hebrew"])
+        self._gap(db, "chokhmah", {"kabbalah": 40, "zohar": 30, "hebrew": 20})
+        tags = db.execute("SELECT COUNT(*) n FROM tags WHERE is_active=1").fetchone()["n"]
+        links = db.execute("SELECT COUNT(*) n FROM memory_tags").fetchone()["n"]
+        stack["patrol"].run_errand("tag_gap_variants")
+        assert db.execute(
+            "SELECT COUNT(*) n FROM tags WHERE is_active=1").fetchone()["n"] == tags
+        assert db.execute("SELECT COUNT(*) n FROM memory_tags").fetchone()["n"] == links
