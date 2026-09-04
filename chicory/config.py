@@ -571,6 +571,22 @@ class ChicoryConfig(BaseModel):
     # Below this a side is too small for a rate to mean anything.
     asymmetry_min_population: int = Field(default=50)
     asymmetry_max_per_pair: int = Field(default=60)
+
+    # Content against the tag it was filed under.  A lexical diff of
+    # content against the tag NAME is useless — `mysticism` never appears
+    # in the material it labels — so the test is whether a tag's memories
+    # share vocabulary the library at large does not.
+    #
+    # Measured: `plato` yields socrates, glaucon, republic; `biosemiotics`
+    # yields pattee; `whirly-art` and `essay`, 1,552 memories apiece,
+    # yield nothing whatever.
+    tag_content_baseline_sample: int = Field(default=3000)
+    tag_content_sample: int = Field(default=400)
+    tag_content_min_memories: int = Field(default=25)
+    # A term has to be this common in the tag's material...
+    tag_content_min_rate: float = Field(default=0.15)
+    # ...and this much commoner there than in the library at large.
+    tag_content_lift: float = Field(default=4.0)
     # One ask is enough, because the SCORE now carries the judgment.
     #
     # These two gates were calibrated backwards.  Repetition was doing the

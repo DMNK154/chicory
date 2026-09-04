@@ -139,3 +139,95 @@ class CorpusAsymmetry:
                         "right_chunks": result["right_chunks"],
                         "top": kept[:6]})
         return {"pairs": out}
+
+
+class TagContentAsymmetry:
+    """What a tag's material is about, against what the tag claims.
+
+    The other comparison here diffs two POPULATIONS.  This one diffs two
+    REPRESENTATIONS of the same memories: the words they use, and the tag
+    they were filed under.
+
+    A lexical diff of content against tag NAME would be useless — an
+    abstraction like `mysticism` never appears in the material it labels,
+    and would look like a mismatch every time.  What separates a real
+    subject from a label is whether its memories share vocabulary that the
+    library at large does not.  `plato` yields socrates, glaucon,
+    republic; `biosemiotics` yields pattee.  `whirly-art` and `essay`,
+    1,552 memories each, yield nothing at all — the index claims a subject
+    where the content has none.
+
+    Walks tags a batch at a time rather than sweeping, because profiling
+    every tag's memories at once is millions of chunk reads.  The baseline
+    is sampled once per batch: a rate estimated from a few thousand chunks
+    is precise enough to say whether a term is distinctive.
+    """
+
+    def __init__(self, config, db) -> None:
+        self._config = config
+        self._db = db
+        self._baseline: tuple[Counter, int] | None = None
+
+    def baseline(self) -> tuple[Counter, int]:
+        """Term rates across the library, sampled.
+
+        ORDER BY id rather than RANDOM(): a random sort over six figures
+        of rows costs more than the profiling does, and the sample only
+        needs to be representative of VOCABULARY, which a spread of ids is.
+        """
+        if self._baseline is None:
+            from chicory.layer4.wander import _CONCEPT_STOPWORDS
+            n = self._config.tag_content_baseline_sample
+            counts: Counter = Counter()
+            seen = 0
+            for row in self._db.execute(
+                "SELECT content FROM memories WHERE is_archived = 0 "
+                "AND id IN (SELECT id FROM memories WHERE is_archived = 0 "
+                f"ORDER BY id LIMIT {int(n)} OFFSET (SELECT MAX(0, "
+                f"(COUNT(*) - {int(n)}) / 2) FROM memories))"
+            ):
+                seen += 1
+                for t in {x.lower() for x in _TERM_RE.findall(row["content"] or "")}:
+                    if t not in _CONCEPT_STOPWORDS:
+                        counts[t] += 1
+            self._baseline = (counts, max(seen, 1))
+        return self._baseline
+
+    def examine(self, tag_id: int, name: str) -> dict | None:
+        """Whether this tag's memories share vocabulary the library lacks."""
+        from chicory.layer4.wander import _CONCEPT_STOPWORDS
+
+        cfg = self._config
+        base, bn = self.baseline()
+        rows = self._db.execute(
+            "SELECT m.content FROM memories m "
+            "JOIN memory_tags mt ON mt.memory_id = m.id "
+            "WHERE mt.tag_id = ? AND m.is_archived = 0 LIMIT ?",
+            (tag_id, cfg.tag_content_sample),
+        ).fetchall()
+        if len(rows) < cfg.tag_content_min_memories:
+            return None
+        counts: Counter = Counter()
+        for r in rows:
+            for t in {x.lower() for x in _TERM_RE.findall(r["content"] or "")}:
+                if t not in _CONCEPT_STOPWORDS:
+                    counts[t] += 1
+        n = len(rows)
+        distinctive = []
+        for term, k in counts.items():
+            rate = k / n
+            if rate < cfg.tag_content_min_rate:
+                continue
+            b = base.get(term, 0) / bn
+            if b * cfg.tag_content_lift <= rate:
+                distinctive.append({"term": term, "rate": round(rate, 4),
+                                    "baseline": round(b, 4)})
+        distinctive.sort(key=lambda d: -d["rate"])
+        return {"tag": name, "tag_id": tag_id, "sampled": n,
+                "distinctive": distinctive[:12],
+                # Does the tag name itself turn up in what its material is
+                # about?  Absent is not a fault — `mysticism` is a real
+                # subject nobody writes the word for — but present is a
+                # strong sign the label was earned rather than assigned.
+                "names_itself": any(d["term"] == name.lower()
+                                    for d in distinctive)}

@@ -2032,6 +2032,91 @@ register(Errand(
 ))
 
 
+def _tag_content(
+    *,
+    db: DatabaseEngine,
+    config: ChicoryConfig,
+    memory_ids: list[str],
+    state: WanderRecord,
+    patrol: "Patrol",
+    should_stop: Callable[[], bool] | None = None,
+    **_: object,
+) -> dict[str, tuple[str, str | None]]:
+    """Ask whether a tag's material is about what the tag says it is.
+
+    Two representations of the same memories — the words they use, and the
+    label they were filed under.  Comparing content against the tag NAME
+    would say nothing: `mysticism` never appears in the material it
+    labels.  What distinguishes a subject from a label is whether its
+    memories share vocabulary the library at large does not.
+
+    Measured: `plato` yields socrates, glaucon, republic.  `biosemiotics`
+    yields pattee.  `whirly-art` and `essay`, 1,552 memories each, yield
+    nothing whatever — a tag on a great deal of material that is not about
+    anything in particular.
+
+    Records both outcomes.  A tag with no distinctive vocabulary is not
+    necessarily wrong — it may be a genuine catch-all — but it cannot be
+    routed to, and nothing else in the system notices that.
+    """
+    from chicory.layer4.asymmetry import TagContentAsymmetry
+
+    ids = [int(x) for x in memory_ids if str(x).isdigit()]
+    if not ids:
+        return {}
+    verdicts: dict[str, tuple[str, str | None]] = {
+        str(i): ("skipped", "not an eligible tag") for i in ids
+    }
+    ph = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"SELECT id, name FROM tags WHERE id IN ({ph}) AND is_active = 1 "
+        f"AND LENGTH(name) > 1", tuple(ids),
+    ).fetchall()
+    if not rows:
+        return verdicts
+    checker = TagContentAsymmetry(config, db)
+    for r in rows:
+        if r["name"].startswith(_STRUCTURAL_TAG_PREFIXES):
+            verdicts[str(r["id"])] = ("skipped", "a clock stamp")
+            continue
+        found = checker.examine(r["id"], r["name"])
+        if found is None:
+            verdicts[str(r["id"])] = ("skipped", "too few memories to profile")
+            continue
+        if found["distinctive"]:
+            top = ", ".join(d["term"] for d in found["distinctive"][:5])
+            patrol.observe(
+                errand="tag_content", kind="tag_content", subject=r["name"],
+                detail=f"its material is about: {top}",
+                weight=round(1.0 / (1.0 + len(found["distinctive"])), 6),
+                data=found, lap=state.lap,
+            )
+            verdicts[str(r["id"])] = ("ok", f"about: {top[:40]}")
+        else:
+            patrol.observe(
+                errand="tag_content", kind="tag_content", subject=r["name"],
+                detail=(
+                    f"{found['sampled']} memories carry this tag and share no "
+                    f"vocabulary the library does not — it labels material "
+                    f"without naming a subject, so nothing can be routed to it"
+                ),
+                weight=1.0, data=found, lap=state.lap,
+            )
+            verdicts[str(r["id"])] = ("acted", "no distinctive vocabulary")
+    db.connection.commit()
+    return verdicts
+
+
+register(Errand(
+    name="tag_content",
+    description="Ask whether a tag's material is about what the tag claims",
+    run=_tag_content,
+    domain="tags",
+    # Reads the content behind every tag it visits, so it waits for quiet.
+    when="idle",
+))
+
+
 register(Errand(
     name="concept_gaps",
     description="Record concepts the library discusses but holds no tag for",

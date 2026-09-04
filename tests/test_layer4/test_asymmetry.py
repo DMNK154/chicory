@@ -38,6 +38,8 @@ def stack():
         wander_interval_minutes=0.0, wander_errands=["corpus_asymmetry"],
         asymmetry_pairs=[PAIR], asymmetry_min_rate=0.2,
         asymmetry_max_other=0.05, asymmetry_min_population=4,
+        tag_content_baseline_sample=200, tag_content_sample=100,
+        tag_content_min_memories=10,
     )
     db = DatabaseEngine(config)
     db.connect()
@@ -153,3 +155,82 @@ class TestErrand:
         assert db.execute("SELECT COUNT(*) n FROM tags").fetchone()["n"] == tags
         assert db.execute(
             "SELECT COUNT(*) n FROM memory_tags").fetchone()["n"] == links
+
+
+class TestTagContent:
+    """A tag's material against the label it was filed under.
+
+    Comparing content to the tag NAME says nothing — `mysticism` never
+    appears in the material it labels. What separates a subject from a
+    label is whether its memories share vocabulary the library at large
+    does not: `plato` yields socrates, glaucon, republic; `whirly-art`,
+    on 1,552 memories, yields nothing at all.
+    """
+
+    def _library(self, db, n=300):
+        """Big enough that the tag under test is a small share of it.
+
+        The baseline is a sample of the whole library, so a tag's own
+        memories are in it. On the real corpus a 400-memory tag is 0.3% of
+        124,363 and contributes nothing; in a fixture of ninety it would
+        dominate the baseline it is being compared against.
+        """
+        for i in range(n):
+            _mem(db, f"lib{i}", "misc.pdf",
+                 f"Ordinary material about Nothing Particular here {i}")
+
+    def test_a_real_subject_names_what_it_is_about(self, stack):
+        db = stack["db"]
+        self._library(db)
+        tid = db.execute("INSERT INTO tags (name) VALUES ('plato')").lastrowid
+        for i in range(30):
+            _mem(db, f"p{i}", "rep.pdf", f"Socrates asked Glaucon in Republic {i}")
+            db.execute("INSERT INTO memory_tags (memory_id, tag_id, assigned_by) "
+                       "VALUES (?, ?, 'test')", (f"p{i}", tid))
+        db.connection.commit()
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        got = TagContentAsymmetry(stack["config"], db).examine(tid, "plato")
+        terms = {d["term"] for d in got["distinctive"]}
+        assert "socrates" in terms and "glaucon" in terms
+
+    def test_a_label_with_no_subject_is_reported(self, stack):
+        db = stack["db"]
+        self._library(db)
+        tid = db.execute("INSERT INTO tags (name) VALUES ('whirly-art')").lastrowid
+        for i in range(30):
+            _mem(db, f"w{i}", "misc.pdf",
+                 f"Ordinary material about Nothing Particular here {i+900}")
+            db.execute("INSERT INTO memory_tags (memory_id, tag_id, assigned_by) "
+                       "VALUES (?, ?, 'test')", (f"w{i}", tid))
+        db.connection.commit()
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        got = TagContentAsymmetry(stack["config"], db).examine(tid, "whirly-art")
+        assert got["distinctive"] == [], (
+            "material indistinguishable from the library carries no subject"
+        )
+
+    def test_an_abstraction_is_not_penalised_for_not_naming_itself(self, stack):
+        """`mysticism` is a real subject nobody writes the word for."""
+        db = stack["db"]
+        self._library(db)
+        tid = db.execute("INSERT INTO tags (name) VALUES ('mysticism')").lastrowid
+        for i in range(30):
+            _mem(db, f"m{i}", "z.pdf", f"Rabbi Shimon and Hashem and Malchut {i}")
+            db.execute("INSERT INTO memory_tags (memory_id, tag_id, assigned_by) "
+                       "VALUES (?, ?, 'test')", (f"m{i}", tid))
+        db.connection.commit()
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        got = TagContentAsymmetry(stack["config"], db).examine(tid, "mysticism")
+        assert got["distinctive"], "it has a subject even without its own name"
+        assert got["names_itself"] is False
+
+    def test_too_few_memories_is_no_finding(self, stack):
+        db = stack["db"]
+        self._library(db)
+        tid = db.execute("INSERT INTO tags (name) VALUES ('tiny')").lastrowid
+        _mem(db, "t1", "misc.pdf", "One Solitary Chunk")
+        db.execute("INSERT INTO memory_tags (memory_id, tag_id, assigned_by) "
+                   "VALUES ('t1', ?, 'test')", (tid,))
+        db.connection.commit()
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        assert TagContentAsymmetry(stack["config"], db).examine(tid, "tiny") is None
