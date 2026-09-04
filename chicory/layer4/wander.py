@@ -1304,9 +1304,12 @@ def _tag_seams(
                (SELECT COUNT(*) FROM memory_tags mt WHERE mt.tag_id = t.id) AS held,
                EXISTS(SELECT 1 FROM tag_centroids c WHERE c.tag_id = t.id) AS has_centroid,
                EXISTS(SELECT 1 FROM centroid_edges e
-                      WHERE e.tag_a_id = t.id OR e.tag_b_id = t.id) AS has_edge
+                      WHERE (e.tag_a_id = t.id OR e.tag_b_id = t.id)
+                        AND e.edge_strength >= ?
+                        AND e.co_retrieval_count >= ?) AS has_edge
             FROM tags t WHERE t.id IN ({ph})""",
-        tuple(ids),
+        (config.subject_min_edge_strength,
+         config.subject_edge_merge_min_count, *ids),
     ).fetchall()
 
     shelved: set[int] = set()
@@ -1346,7 +1349,14 @@ def _tag_seams(
         if not r["has_centroid"]:
             faults.append("no centroid")
         if not r["has_edge"]:
-            faults.append("no edge")
+            # "No edge the ROSTER would walk", not "no edge".  The
+            # hysteresis keeps an edge below subject_edge_merge_min_count
+            # only when both ends shared a prior root, so a tag that has
+            # never been shelved needs a qualifying edge to get in at all.
+            # Measured: `archaeology` (1,659 memories) carries seven edges,
+            # every one at co_retrieval_count 1 or 2, and is invisible to
+            # the roster despite looking connected.
+            faults.append("no qualifying edge")
         if r["id"] not in shelved:
             faults.append("on no shelf")
         parent = _redundant_parent(db, r["id"], name)

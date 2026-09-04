@@ -163,7 +163,7 @@ class TestTagSeams:
         assert "malchut" in seen
         faults = json.loads(seen["malchut"]["data"])["faults"]
         assert "no centroid" in faults
-        assert "no edge" in faults
+        assert "no qualifying edge" in faults
         assert "on no shelf" in faults
 
     def test_a_clock_stamp_is_not_a_seam(self, stack):
@@ -370,3 +370,48 @@ class TestEveryExaminedObjectIsStamped:
         second = {r["memory_id"] for r in db.execute(
             "SELECT memory_id FROM patrol_visits WHERE errand='tag_twins'")}
         assert len(second) > len(first), "the walk must reach new tags"
+
+
+class TestQualifyingEdges:
+    """An edge the roster will not walk is not an edge, for this purpose.
+
+    _connected_components keeps an edge below subject_edge_merge_min_count
+    only when both ends sat in the same prior root. A tag that has never
+    been shelved therefore needs a QUALIFYING edge to enter the tree at
+    all. Measured on the live library: `archaeology`, 1,659 memories,
+    carries seven edges all at co_retrieval_count 1 or 2 and is invisible
+    to the roster while looking perfectly connected.
+    """
+
+    def _weak_edge(self, db, a, b, count):
+        db.execute(
+            "INSERT OR REPLACE INTO centroid_edges "
+            "(tag_a_id, tag_b_id, edge_strength, co_retrieval_count) "
+            "VALUES (?,?,0.5,?)", (min(a, b), max(a, b), count))
+
+    def test_an_edge_below_the_merge_floor_does_not_count(self, stack):
+        db = stack["db"]
+        a, b = _tag(db, "archaeology"), _tag(db, "knowledge")
+        for t in (a, b):
+            _attach(db, f"m{t}", t)
+            _centroid(db, t)
+        self._weak_edge(db, a, b, count=2)      # below merge_min of 3
+        _shelf(db, "s", [a, b])
+        db.connection.commit()
+        stack["patrol"].run_errand("tag_seams")
+        seen = _obs(db, "tag_seam")
+        assert "archaeology" in seen
+        assert "no qualifying edge" in json.loads(
+            seen["archaeology"]["data"])["faults"]
+
+    def test_an_edge_at_the_floor_counts(self, stack):
+        db = stack["db"]
+        a, b = _tag(db, "archaeology"), _tag(db, "knowledge")
+        for t in (a, b):
+            _attach(db, f"m{t}", t)
+            _centroid(db, t)
+        self._weak_edge(db, a, b, count=3)
+        _shelf(db, "s", [a, b])
+        db.connection.commit()
+        stack["patrol"].run_errand("tag_seams")
+        assert _obs(db, "tag_seam") == {}
