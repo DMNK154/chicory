@@ -557,30 +557,102 @@ class ChicoryConfig(BaseModel):
     # ── Corpus asymmetry ───────────────────────────────────────────────
     #
     # Pairs of populations that describe the SAME thing, so that where
-    # their vocabularies diverge means something.  Both sides are SQL
-    # predicates over `memories`.
+    # their vocabularies diverge means something.
     #
+    # A side used to be a SQL LIKE over `source_path`, and naming files is
+    # what made this module's own flagship example false.  Twenty-nine
+    # works arrived on 2026-09-04; two were the Pritzker Zohar, which IS
+    # primary text and matched no pattern, so "the primary text" quietly
+    # became four files out of eight.  `companions` went on standing at
+    # 39.2% of the scholarship against 0.03% of the primary text while
+    # sitting in 5.79% of Pritzker — 95 chunks of what it was said to be
+    # absent from.  `shekhinah` was reported absent from a primary text
+    # holding it at 45.95%.
+    #
+    # So a side names ROLES, and a role is carried by the document rather
+    # than by its filename.  `corpus_documents` below is the registry.
+    corpus_documents: list[dict] = Field(default_factory=lambda: [
+        # Identity is a digest over the document's chunk hashes, so the
+        # same work under a new filename keeps its role and two copies of
+        # it are one document.  That is not hypothetical: `A River Flows
+        # from Eden` arrived a second time as `dokumen.pub_a-river-flows-
+        # from-eden-...`, 546 chunks byte-identical to the copy already
+        # shelved, and only the LIKE pattern's failure to match the new
+        # name kept the scholarship side from doubling.
+        #
+        # A title is required because a digest is unreadable, and because
+        # an entry that stops matching has to be nameable in the report
+        # that says so.
+        {"role": "zohar-kabbalah-centre", "digest": "4b3f5ca7acc12160",
+         "title": "The Zohar, volumes 1-23 (Kabbalah Centre)"},
+
+        {"role": "zohar-bilingual-12", "digest": "fe23c99249151aa6",
+         "title": "The Holy Zohar, book 1"},
+        {"role": "zohar-bilingual-12", "digest": "3782299de4af12dc",
+         "title": "The Holy Zohar, book 2"},
+        {"role": "zohar-bilingual-12", "digest": "75766b103c3d6bc2",
+         "title": "The Holy Zohar, book 3"},
+        {"role": "zohar-bilingual-12", "digest": "72357925e76a210a",
+         "title": "The Holy Zohar, book 4"},
+        {"role": "zohar-bilingual-12", "digest": "7b20057e024bf9f5",
+         "title": "The Holy Zohar, book 5"},
+        {"role": "zohar-bilingual-12", "digest": "5762b0dca1056629",
+         "title": "The Holy Zohar, book 6"},
+        {"role": "zohar-bilingual-12", "digest": "76b60a52636d3547",
+         "title": "The Holy Zohar, book 7"},
+        {"role": "zohar-bilingual-12", "digest": "2777a094c830b824",
+         "title": "The Holy Zohar, book 8"},
+        {"role": "zohar-bilingual-12", "digest": "363e2a3d4c9a5cb1",
+         "title": "The Holy Zohar, book 9"},
+        {"role": "zohar-bilingual-12", "digest": "cf6c7b7b14053696",
+         "title": "The Holy Zohar, book 10"},
+        {"role": "zohar-bilingual-12", "digest": "30cace067efc0300",
+         "title": "The Holy Zohar, book 11"},
+        {"role": "zohar-bilingual-12", "digest": "cfb8531c5b459979",
+         "title": "The Holy Zohar, book 12"},
+
+        {"role": "zohar-sefer", "digest": "cdfb673e549a8c49",
+         "title": "Sefer ha-Zohar (English)"},
+
+        # Ingested 2026-09-04, primary text, and in no pair until now.
+        {"role": "zohar-pritzker", "digest": "46c3e7e6e23d6b56",
+         "title": "The Zohar, Pritzker edition, volume 1"},
+        {"role": "zohar-pritzker", "digest": "8242972f689d3ce8",
+         "title": "The Zohar, Pritzker edition, volume 2"},
+
+        # Also primary text, and also new — but Hebrew-script, so they
+        # bear no capitalised Latin term at all: 0 of 1,571 chunks.  They
+        # carry a role because they ARE the primary text; the comparison
+        # drops them because a chunk with no term is denominator and
+        # nothing else.  Declaring what a thing is and deciding what a
+        # given measurement can use it for are different jobs.
+        {"role": "zohar-hebrew", "digest": "77f7d1dfa091e0e3",
+         "title": "Sefer ha-Zohar, volume 11 (Hebrew)"},
+        {"role": "zohar-hebrew", "digest": "1679e4c99544fe0f",
+         "title": "Zohar al ha-Torah, volume 1 (Hebrew)"},
+
+        {"role": "zohar-scholarship", "digest": "f992c7b3e17ccbf4",
+         "title": "Melila Hellner-Eshed, A River Flows from Eden"},
+    ])
     # The defaults are the two comparisons that were measured rather than
     # guessed: three English Zohar editions whose key vocabulary is nearly
     # disjoint, and a body of scholarship against the primary texts it is
-    # about, which share almost no words at all — `companions` is in 39.2%
-    # of the scholarship and 0.03% of the primary text.
+    # about, which share almost no words at all.
     asymmetry_pairs: list[dict] = Field(default_factory=lambda: [
         {
             "name": "zohar-editions",
             "left_label": "the Kabbalah Centre edition",
-            "left": "source_path LIKE '%vdoc.pub_the-zohar%'",
+            "left_roles": ["zohar-kabbalah-centre"],
             "right_label": "the twelve-volume bilingual edition",
-            "right": "source_path LIKE 'THE HOLY ZOHAR%'",
+            "right_roles": ["zohar-bilingual-12"],
         },
         {
             "name": "zohar-scholarship",
             "left_label": "the scholarship",
-            "left": "source_path LIKE '%Hellner-Eshed%'",
+            "left_roles": ["zohar-scholarship"],
             "right_label": "the primary text",
-            "right": ("source_path LIKE '%vdoc.pub_the-zohar%' OR "
-                      "source_path LIKE 'THE HOLY ZOHAR%' OR "
-                      "source_path LIKE '%eng_t_ml-sefer-zohar%'"),
+            "right_roles": ["zohar-kabbalah-centre", "zohar-bilingual-12",
+                            "zohar-sefer", "zohar-pritzker", "zohar-hebrew"],
         },
     ])
     # A term must be this common on one side...

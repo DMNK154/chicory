@@ -523,6 +523,10 @@ class Patrol:
                     prior = {}
                 for k, v in prior.items():
                     cur = merged.get(k)
+                    if k in _STAMP_KEYS:
+                        # Never merged: see _STAMP_KEYS.  The newer stamp
+                        # is the only one that describes this reading.
+                        continue
                     if isinstance(v, list) and isinstance(cur, list):
                         try:
                             merged[k] = sorted(set(v) | set(cur))
@@ -1064,6 +1068,18 @@ _CONCEPT_RE = re.compile(r"\b([A-Z][a-zA-Z]{4,})\b")
 # here, because a walk sees one batch at a time and cannot total such a
 # thing any other way.
 _ACCUMULATING_KEYS = frozenset({"mentions"})
+
+# Keys that stamp WHICH definition a measurement was taken under, rather
+# than carrying a measurement.  These always take the newer reading: a
+# union of two stamps describes a population neither pass ever looked at,
+# and the stamp exists precisely so a reader can tell those apart.  The
+# hazard is real because a row is reused across a retraction — a withdrawn
+# observation keeps its data until the same subject is seen again — so the
+# old membership is still sitting there when the new one is written.
+_STAMP_KEYS = frozenset({
+    "left_documents", "right_documents", "duplicates_excluded",
+    "unresolved_registry_entries", "basis",
+})
 
 # Observation kinds anchored on a tag, and therefore invalidated when that
 # tag is merged or deactivated.  The audit covered only `tag_seam` and kept
@@ -2074,6 +2090,23 @@ def _corpus_asymmetry(
     )
     db.connection.commit()
     total = sum(p.get("recorded", 0) for p in result.get("pairs", []))
+    # Which documents each side resolved to, every lap.  The comparison
+    # was wrong for a day because nothing said which files were in it,
+    # and a count with no population behind it is what hid that.
+    for p in result.get("pairs", []):
+        _log.info(
+            "Corpus asymmetry %s (%s): left %d chunks over %d documents, "
+            "right %d over %d; %d recorded, %d withdrawn%s%s",
+            p.get("pair"), p.get("skipped") or "compared",
+            p.get("left_chunks", 0), len(p.get("left_documents", [])),
+            p.get("right_chunks", 0), len(p.get("right_documents", [])),
+            p.get("recorded", 0), p.get("withdrawn", 0),
+            (f"; {len(p['duplicates_excluded'])} duplicate copies excluded"
+             if p.get("duplicates_excluded") else ""),
+            (f"; registry names {', '.join(p['unresolved_registry_entries'])}"
+             f" but the library holds no such document"
+             if p.get("unresolved_registry_entries") else ""),
+        )
     _log.info("Corpus asymmetry: %d findings across %d pairs",
               total, len(result.get("pairs", [])))
     return {mid: ("ok", f"asymmetries={total}") for mid in memory_ids}
