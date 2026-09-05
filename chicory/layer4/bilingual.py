@@ -38,6 +38,23 @@ source, the mapping can be LEARNED rather than supplied: a skeleton and
 its English word appear in the same chunks, and Dice over that
 co-occurrence recovers משה→Moshe, מטטרון→Metatron, המנונא→Hamnuna and
 אדהכי→Meanwhile without a dictionary.
+
+FACING is the load-bearing word, and it is not the same as bilingual.
+Two more Zohar editions arrived and this pass lost 41 of its best
+entries — סנהדרין/Sanhedrin fell from dice 0.865 to 0.260, סוטה/Sotah
+from 0.952 to 0.317.  Nothing about their alignment had weakened: for
+סנהדרין the chunk count `n` stayed at 16 and the shared count stayed at
+16.  What moved was `m`, from 21 to 107, and 86 of the 107 were the
+Pritzker volumes — English commentary carrying inline Hebrew citations,
+median 2 Hebrew words per chunk against this edition's 191.  Such a
+chunk clears "has a skeleton" on its one citation and then contributes
+its entire English vocabulary to a denominator it can never help.
+
+So the population is chunks where the Hebrew IS the text, measured by
+`hebrew_share`, and not chunks that merely contain Hebrew.  Two other
+new volumes turned out to be inert rather than harmful: lacking the
+zero-width separator, they glue each chunk into one over-long skeleton
+and were already being dropped.
 """
 
 from __future__ import annotations
@@ -71,6 +88,10 @@ PREFIX_LETTERS = "והבלמשכד"
 MIN_SKELETON, MAX_SKELETON = 3, 9
 
 _ENGLISH_RE = re.compile(r"\b([A-Z][a-zA-Z]{3,})\b")
+
+# Every English word, not just the ones that could be terms.  Used only
+# to measure how much of a chunk is Hebrew — see `hebrew_share`.
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 
 # Capitalised words that carry no subject in this material: sentence
 # openers, the apparatus of the edition, and the names that appear on
@@ -125,6 +146,34 @@ def english_terms(text: str) -> set[str]:
         w for w in _ENGLISH_RE.findall(text)
         if w.lower() not in _ENGLISH_STOP
     }
+
+
+def hebrew_share(text: str) -> float:
+    """How much of this chunk is Hebrew, as a share of its vocabulary.
+
+    The test for facing text.  ``english_terms`` is the wrong denominator
+    here — capitalised, stop-listed and deduplicated, it is small enough
+    that a page of commentary still scores 0.062, and a gate that admits
+    that admits 200 of 722 commentary chunks.  Every distinct word on
+    both sides is the comparison the separation was measured on.
+
+    TYPES rather than tokens on the English side, so the numerator and
+    the denominator are counted the same way — and because an apparatus
+    grows its token count linearly and its vocabulary sublinearly, a
+    token denominator would put the whole of a footnote-heavy edition
+    under the gate at roughly five times this edition's English per
+    chunk, where types survive to about eighteen.
+
+    Deliberately independent of ``attested``: the attestation pass is
+    what BUILDS that set, and it needs gating too — ungated it admits
+    463 fragments glued out of unseparated commentary Hebrew, which then
+    license prefix strips on real facing-text words.
+    """
+    heb = {w for w in hebrew_words(text)
+           if MIN_SKELETON <= len(w) <= MAX_SKELETON}
+    eng = {w.lower() for w in _ENGLISH_WORD_RE.findall(text)}
+    total = len(heb) + len(eng)
+    return (len(heb) / total) if total else 0.0
 
 
 def skeleton_counts(text: str, attested: set[str] | None = None) -> Counter:
@@ -198,18 +247,34 @@ class BilingualLexicon:
                "AND content GLOB '*[\u05D0-\u05EA]*'")
         if limit:
             sql += f" LIMIT {int(limit)}"
+        # Containing Hebrew is not the same as BEING facing text, and the
+        # difference is what broke this pass.  A chunk below the share is
+        # commentary with a citation in it: it can carry the English term
+        # but not the Hebrew that names it, so it is denominator and
+        # nothing else.  Gated on BOTH passes, because attestation reading
+        # a wider corpus than the count is how ``\u05D5\u05EA\u05D9\u05D4`` becomes a word.
+        floor = self._config.bilingual_min_hebrew_share
+        skipped = {"below_share": 0, "no_skeletons": 0}
+        kept: list[str] = []
+        for row in self._db.execute(sql):
+            text = row["content"] or ""
+            if hebrew_share(text) < floor:
+                skipped["below_share"] += 1
+                continue
+            kept.append(text)
+
         # First pass: which words does the corpus use on their own?  That
         # is the only thing that separates a prefix from a root letter.
         attested: set[str] = set()
-        for row in self._db.execute(sql):
-            for w in hebrew_words(row["content"] or ""):
+        for text in kept:
+            for w in hebrew_words(text):
                 if MIN_SKELETON <= len(w) <= MAX_SKELETON:
                     attested.add(w)
 
-        for row in self._db.execute(sql):
-            text = row["content"] or ""
+        for text in kept:
             skeletons = set(skeleton_counts(text, attested))
             if not skeletons:
+                skipped["no_skeletons"] += 1
                 continue
             english = english_terms(text)
             seen += 1
@@ -222,7 +287,11 @@ class BilingualLexicon:
                 for e in english:
                     pair[e] += 1
         return {"chunks": seen, "hebrew": heb_chunks,
-                "english": eng_chunks, "together": together}
+                "english": eng_chunks, "together": together,
+                # What it refused, because a sweep that reports only what
+                # it counted is how 722 diluting chunks went unnoticed for
+                # a month: the number fell and nothing said why.
+                "skipped": skipped}
 
     def align(self, counts: dict) -> list[dict]:
         """Pair each skeleton with the English word that tracks it.
@@ -322,6 +391,7 @@ class BilingualLexicon:
             self._db.connection.commit()
         return {
             "chunks_scanned": counts["chunks"],
+            "skipped": counts.get("skipped", {}),
             "skeletons": len(counts["hebrew"]),
             "english_terms": len(counts["english"]),
             "aligned": len(entries),

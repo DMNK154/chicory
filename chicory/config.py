@@ -531,6 +531,28 @@ class ChicoryConfig(BaseModel):
     # whole cluster is dropped rather than trimmed — the block gives no
     # reason to prefer any member of it.
     bilingual_max_forms_per_term: int = Field(default=3)
+    # How much of a chunk has to BE Hebrew before it counts as facing
+    # text.  A volume can carry the English and be unable to carry the
+    # Hebrew: the Pritzker Zohar is English commentary with inline
+    # citations, median 2 Hebrew words per chunk against the bilingual
+    # edition's 191.  Such a chunk passes "has a skeleton" on one word,
+    # then contributes its whole English vocabulary to Dice's
+    # denominator, where it can never contribute to the numerator.
+    #
+    # Measured when 722 of them arrived: `n` and `shared` for סנהדרין
+    # did not move at all — 16 and 16 — while `m` went 21 to 107, and 86
+    # of the 107 were commentary.  Dice fell 0.865 to 0.260 and the
+    # entry was retracted, with 40 others.
+    #
+    # The two populations separate by two orders of magnitude in the
+    # bulk — facing text p10 0.385, commentary p90 0.019 — but NOT in
+    # the tails, which overlap: facing text runs down to 0.041 and
+    # commentary up to 0.273.  So this is a minimum-error operating
+    # point on a bimodal distribution, near its geometric midpoint, and
+    # not a free choice anywhere in a wide band.  At 0.10 it discards 19
+    # genuine facing chunks of 5,684 and admits 2 commentary chunks of
+    # 722; at 0.20 it discards 31; by 0.29 it discards 354.
+    bilingual_min_hebrew_share: float = Field(default=0.10)
 
     # ── Corpus asymmetry ───────────────────────────────────────────────
     #

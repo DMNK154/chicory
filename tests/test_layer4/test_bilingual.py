@@ -21,6 +21,7 @@ from chicory.layer4.bilingual import (
     base_forms,
     dice,
     english_terms,
+    hebrew_share,
     hebrew_words,
     skeleton_counts,
 )
@@ -41,7 +42,7 @@ def stack():
         embedding_dimension=32, wander_batch_size=10,
         wander_interval_minutes=0.0, wander_errands=["hebrew_lexicon"],
         bilingual_min_chunks=2, bilingual_min_dice=0.45,
-        bilingual_ubiquity_max=0.90,
+        bilingual_ubiquity_max=0.90, bilingual_min_hebrew_share=0.10,
     )
     db = DatabaseEngine(config)
     db.connect()
@@ -306,3 +307,211 @@ class TestAttestation:
         got = {e["hebrew"] for e in lex.align(lex.scan()) if e["english"] == "Binah"}
         assert "בינה" in got
         assert "ינה" not in got
+
+
+class TestCommentaryDilution:
+    """A volume can carry the English and be unable to carry the Hebrew.
+
+    Twenty-nine works were ingested and this pass LOST 41 of its best
+    entries. סנהדרין fell from dice 0.865 to 0.260 and סוטה from 0.952
+    to 0.317 — not because their alignment weakened but because the
+    English side got heavier. For סנהדרין, `n` stayed 16 and `shared`
+    stayed 16; `m` went 21 to 107, and 86 of the 107 are the two
+    Pritzker volumes: English commentary with inline Hebrew citations,
+    median 2 distinct Hebrew words per chunk against the bilingual
+    edition's 191. They carry the English term, their Hebrew cannot
+    align, and every one of those 722 chunks is pure Dice denominator.
+
+    39 of the 41 come back under the gate. The other two, מדרש and
+    הנעלם, recover their dice — 0.638 and 0.633, well clear of the 0.45
+    floor — and are then folded onto דרש and נעלם by the longest-form
+    rule. That is a fold artifact, not a gate failure, and a test that
+    demanded them back would be testing the fold.
+    """
+
+    # Three Hebrew words against nine English: share 0.250, deliberately
+    # near the low end of the real facing band (p10 0.385, median 0.475).
+    FACING = (ZWSP.join(["אמר", "סנהדרין", "קרבן"])
+              + " the offering of the court, if they erred. Sanhedrin.")
+    # One bare citation in a page of English: share 0.033, inside the
+    # measured commentary band (p90 0.019, max 0.273).
+    COMMENTARY = (
+        "בבלי See the discussion of this passage in Sanhedrin, where the "
+        "matter of the court and its offering is treated at length by the "
+        "later authorities and again in the printed commentaries."
+    )
+    FILLER = "אמר" + ZWSP + "דבר plainly. Yehuda listened."
+
+    def _lex(self, stack, share=None):
+        cfg = stack["config"]
+        if share is not None:
+            cfg.bilingual_min_hebrew_share = share
+        return BilingualLexicon(cfg, stack["db"])
+
+    def test_a_dense_facing_chunk_is_counted(self, stack):
+        for i in range(4):
+            _mem(stack["db"], f"f{i}", self.FACING)
+        assert self._lex(stack).scan()["chunks"] == 4
+
+    def test_a_commentary_chunk_with_one_citation_is_not_counted(self, stack):
+        """One Hebrew word in a page of English is a citation, not a
+        translation. Measured, those chunks sit at median share 0.008 and
+        722 of them were being counted."""
+        for i in range(4):
+            _mem(stack["db"], f"c{i}", self.COMMENTARY)
+        assert self._lex(stack).scan()["chunks"] == 0
+
+    def test_a_term_lost_to_the_denominator_comes_back(self, stack):
+        """The signature of this failure is that only `m` moves.
+
+        סנהדרין held n=16 and shared=16 through the whole ingest; `m`
+        went 21 to 107 and dice went 0.865 to 0.260. Reproduced here at
+        four and four: twelve commentary chunks carry `Sanhedrin` without
+        the Hebrew it names, `m` goes 4 to 16, and dice 1.000 to 0.400
+        drops the entry under the 0.45 floor. Excluding them restores it
+        untouched.
+        """
+        db = stack["db"]
+        for i in range(4):
+            _mem(db, f"f{i}", self.FACING)
+        for i in range(12):
+            _mem(db, f"c{i}", self.COMMENTARY)
+        for i in range(9):
+            _mem(db, f"z{i}", self.FILLER)
+
+        loose = self._lex(stack, share=0.0)
+        assert "סנהדרין" not in {e["hebrew"] for e in loose.align(loose.scan())}
+
+        lex = self._lex(stack, share=0.10)
+        rec = {e["hebrew"]: e for e in lex.align(lex.scan())}["סנהדרין"]
+        assert rec["english"] == "Sanhedrin"
+        assert (rec["chunks"], rec["shared"], rec["english_chunks"]) == (4, 4, 4)
+
+    def test_the_commentary_does_not_name_its_own_citation(self, stack):
+        """Dilution is only half of it.
+
+        The commentary carries `Sanhedrin` beside one unrelated inline
+        citation, so that citation co-occurs with the term perfectly:
+        ungated, בבלי takes `Sanhedrin` while the word the English is
+        actually translating is cut. The losing entry and the winning one
+        are the same event.
+        """
+        db = stack["db"]
+        for i in range(4):
+            _mem(db, f"f{i}", self.FACING)
+        for i in range(12):
+            _mem(db, f"c{i}", self.COMMENTARY)
+        for i in range(9):
+            _mem(db, f"z{i}", self.FILLER)
+        loose = self._lex(stack, share=0.0)
+        assert "בבלי" in {e["hebrew"] for e in loose.align(loose.scan())
+                          if e["english"] == "Sanhedrin"}
+        lex = self._lex(stack, share=0.10)
+        got = {e["hebrew"] for e in lex.align(lex.scan())
+               if e["english"] == "Sanhedrin"}
+        assert "סנהדרין" in got
+        assert "בבלי" not in got, "a citation is not a translation"
+
+    def test_the_share_counts_english_words_not_english_terms(self):
+        """The denominator is every distinct English word, not the terms
+        the extractor keeps.
+
+        Both readings separate the editions, at very different scales.
+        Over the whole vocabulary the commentary sits near 0.008 against
+        the facing text's 0.475. Over `english_terms` — capitalised,
+        stop-listed, deduplicated — it rises to 0.062 against 0.903, and
+        the same 0.10 gate that keeps 2 commentary chunks of 722 would
+        keep 200. The knob would read the same and do almost nothing.
+        """
+        text = self.COMMENTARY
+        assert hebrew_share(text) < 0.10
+        by_terms = 1 / (1 + len(english_terms(text)))
+        assert by_terms > 0.10, (
+            "the wrong denominator puts this chunk on the wrong side"
+        )
+
+    def test_a_page_with_no_english_is_still_counted(self, stack):
+        """The gate asks how much of the chunk is Hebrew, not whether an
+        English side exists. Gating on the presence of English was
+        measured and is identical to no gate at all — every commentary
+        chunk has English — while gating it the other way would drop
+        genuine facing chunks that carry very little.
+        """
+        pure = ZWSP.join(["אמר", "סנהדרין", "קרבן"])
+        _mem(stack["db"], "pure", pure)
+        assert hebrew_share(pure) == 1.0
+        assert self._lex(stack).scan()["chunks"] == 1
+
+    def test_a_chunk_exactly_at_the_threshold_is_kept(self):
+        """The comparison is `>=`.
+
+        It never bites in production — the two populations' bulk sits two
+        orders of magnitude apart — but their tails DO overlap, facing
+        text down to 0.041 and commentary up to 0.273, so the boundary is
+        a real edge and not a formality.
+        """
+        text = "אמר one two three four five six seven eight nine"
+        assert hebrew_share(text) == pytest.approx(0.1)
+        assert hebrew_share(text) >= 0.10
+
+    def test_a_gate_of_zero_counts_everything(self, stack):
+        """The knob needs an off position or the measurement that
+        produced it cannot be repeated: 365 aligned ungated against 380
+        at 0.10 is the comparison, and the ungated half has to stay
+        reachable from config.
+        """
+        db = stack["db"]
+        for i in range(4):
+            _mem(db, f"c{i}", self.COMMENTARY)
+        assert self._lex(stack, share=0.0).scan()["chunks"] == 4
+
+    def test_raising_the_gate_excludes_a_thinner_chunk(self, stack):
+        """Not just on and off. The facing fixture scores 0.250 and the
+        filler 0.400, so a gate of 0.35 keeps only the filler."""
+        db = stack["db"]
+        for i in range(3):
+            _mem(db, f"f{i}", self.FACING)
+        for i in range(3):
+            _mem(db, f"z{i}", self.FILLER)
+        assert self._lex(stack, share=0.10).scan()["chunks"] == 6
+        assert self._lex(stack, share=0.35).scan()["chunks"] == 3
+
+    def test_the_scan_says_what_it_left_out(self, stack):
+        """This failure was invisible because the sweep reports what it
+        counted and not what it refused: the number fell 6,436 to 5,667
+        with nothing saying why."""
+        db = stack["db"]
+        for i in range(4):
+            _mem(db, f"f{i}", self.FACING)
+        for i in range(12):
+            _mem(db, f"c{i}", self.COMMENTARY)
+        out = self._lex(stack).scan()
+        assert out["chunks"] == 4
+        assert out["skipped"]["below_share"] == 12
+
+    def test_a_commentary_fragment_is_not_a_word_the_corpus_uses(self, stack):
+        """Attestation is only as good as the population it reads.
+
+        The rule that separates a prefix from a root letter is that a
+        real prefix is OPTIONAL, so its bare form turns up on its own.
+        Commentary Hebrew breaks that: with no zero-width separator whole
+        phrases arrive glued into one token, and 463 fragments entered
+        the attested set as if they were words — then licensed strips on
+        nine words of real facing text, כותיה to ותיה across 21 chunks.
+        That is `ינה` again, through a different door.
+
+        The aligned count is the same whether the first pass is gated or
+        not, so nothing about the headline number tells you which
+        population attestation read.
+        """
+        db = stack["db"]
+        for i in range(4):
+            _mem(db, f"f{i}", ZWSP.join(["כותיה", "אמר", "קרבן"])
+                 + " the offering, he said. Sanhedrin.")
+        # Glued commentary Hebrew: no separator, so this arrives as one
+        # standalone token and would otherwise be attested as a word.
+        for i in range(6):
+            _mem(db, f"c{i}", "ותיה and the later authorities discuss this "
+                              "passage of the court at considerable length "
+                              "in their printed commentaries again.")
+        assert "ותיה" not in set(self._lex(stack).scan()["hebrew"])

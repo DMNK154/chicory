@@ -2016,8 +2016,11 @@ def _hebrew_lexicon(
         (marker, "hebrew_lexicon"),
     )
     db.connection.commit()
-    _log.info("Bilingual lexicon: %d pairs from %d chunks",
-              result.get("aligned", 0), result.get("chunks_scanned", 0))
+    sk = result.get("skipped") or {}
+    _log.info("Bilingual lexicon: %d pairs from %d chunks "
+              "(%d below the Hebrew share, %d with no usable skeleton)",
+              result.get("aligned", 0), result.get("chunks_scanned", 0),
+              sk.get("below_share", 0), sk.get("no_skeletons", 0))
     return {mid: ("ok", f"aligned={result.get('aligned', 0)}")
             for mid in memory_ids}
 
