@@ -1088,6 +1088,24 @@ _STAMP_KEYS = frozenset({
 # variant candidate, all naming tags that no longer exist.
 _TAG_ANCHORED_KINDS = ("tag_seam", "tag_twin", "tag_gap_variant", "tag_content")
 
+# Kinds that record a fact about something the producing errand may never
+# look at again, and which are therefore exempt from the lap test.
+#
+# `source_provenance` is a REPAIR errand: it empties its own population as
+# it fixes it, and `_observe_document` re-observes only documents a batch
+# actually touched.  So once the last unattributed chunk is repaired the
+# errand can never re-report any document, and its lap still advances —
+# `_lap_complete` takes the empty-queue branch.  Measured on the live
+# library: population 0, wander_state.lap 1, and all 122,532 visits plus
+# all 1,979 observations at lap 0.  One newly ingested chunked document
+# stamps a visit at lap 1, the next tick advances the lap to 2, and the
+# lap test then reads `0 < 2 - 2 + 1` as true for every one of those
+# 1,979 rows and retracts them as "the walk no longer reports it" — which
+# is false.  The walk has nothing left to walk.  Nothing re-creates them.
+#
+# A lap that advanced over an empty queue is not evidence about anything.
+_TERMINAL_KINDS = ("document_coverage", "revision_shadow")
+
 _STRUCTURAL_TAG_PREFIXES = ("month-", "day-", "minute-", "hour-",
                             "week-", "year-")
 
@@ -1653,6 +1671,15 @@ def _seam_audit(
         return verdicts
     errand_lap = {r["errand"]: r["lap"] for r in db.execute(
         "SELECT errand, lap FROM wander_state")}
+    # The latest lap at which each errand actually deposited something.
+    # `wander_state.lap` says how far the cursor has gone, which is not the
+    # same as the errand having run and reported: an errand whose queue is
+    # empty advances its lap without producing anything, and reading that
+    # as "it walked past this and stopped reporting it" is how the audit
+    # came to threaten 1,979 records it had no evidence against.
+    reported_lap = {r["errand"]: r["lap"] for r in db.execute(
+        "SELECT errand, MAX(lap) AS lap FROM patrol_observations "
+        "WHERE retracted = 0 GROUP BY errand")}
 
     live = db.execute(
         "SELECT COUNT(*) AS n FROM memories WHERE is_archived = 0").fetchone()
@@ -1693,10 +1720,25 @@ def _seam_audit(
         # The one test available to every kind, including those with no
         # tag to look up: did the errand still find this on its last lap?
         current = errand_lap.get(r["errand"])
-        if current is not None and r["lap"] < current - config.audit_stale_laps + 1:
+        reported = reported_lap.get(r["errand"])
+        stale_by_lap = (
+            current is not None
+            and r["lap"] < current - config.audit_stale_laps + 1
+            # Two things the bare lap number does not establish, and
+            # without which "it stopped reporting this" is not a claim the
+            # record supports.  The errand must be one that re-derives its
+            # findings by walking (see _TERMINAL_KINDS), and it must have
+            # reported SOMETHING since — an errand that has deposited
+            # nothing at a later lap has not demonstrated it would have
+            # re-reported this one.
+            and r["kind"] not in _TERMINAL_KINDS
+            and reported is not None and reported > r["lap"]
+        )
+        if stale_by_lap:
             retract(r["id"],
                     f"the walk no longer reports it (last seen on lap "
-                    f"{r['lap']}, now on {current})")
+                    f"{r['lap']}, now on {current}, and it has reported "
+                    f"as recently as lap {reported})")
             verdicts[key] = ("acted", "retracted: no longer found")
             continue
 

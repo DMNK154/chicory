@@ -766,11 +766,57 @@ class TestLapLagStaleness:
         db.connection.commit()
 
     def test_a_finding_the_last_lap_missed_is_retracted(self, stack):
+        """For a lap to have MISSED something it must have found something.
+
+        The companion row at lap 5 is what makes this a miss rather than
+        an absence of evidence — see the terminal-kind tests below.
+        """
         db = stack["db"]
         self._at_lap(db, "corpus_asymmetry", 5)
         self._obs(db, "corpus_asymmetry", "corpus_asymmetry", "pair:gone", 3)
+        self._obs(db, "corpus_asymmetry", "corpus_asymmetry", "pair:still", 5)
         stack["patrol"].run_errand("seam_audit")
-        assert _obs(db, "corpus_asymmetry") == {}
+        standing = _obs(db, "corpus_asymmetry")
+        assert "pair:gone" not in standing
+        assert "pair:still" in standing
+
+    def test_an_errand_that_has_reported_nothing_since_retracts_nothing(self, stack):
+        """A lap number is not a report.
+
+        An errand whose queue is empty advances its lap without walking
+        anything: `_lap_complete` takes the empty-queue branch. Reading
+        that as "it walked past this and stopped reporting it" is the
+        inference that put 1,979 live records one ingest away from being
+        destroyed.
+        """
+        db = stack["db"]
+        self._at_lap(db, "corpus_asymmetry", 9)
+        self._obs(db, "corpus_asymmetry", "corpus_asymmetry", "pair:alone", 3)
+        stack["patrol"].run_errand("seam_audit")
+        assert "pair:alone" in _obs(db, "corpus_asymmetry"), (
+            "nothing was reported after lap 3, so nothing was missed"
+        )
+
+    def test_a_repair_errands_records_are_never_lap_retracted(self, stack):
+        """`source_provenance` empties its own population as it repairs it.
+
+        `_observe_document` re-observes only documents a batch touched, so
+        once the last unattributed chunk is fixed the errand can never
+        re-report any document — while its lap still advances. Measured on
+        the live library: population 0, lap 1, and all 1,979 observations
+        at lap 0. One newly ingested chunked document advances the lap to
+        2 and the old test would then retract every one of them, with a
+        reason that is not true.
+        """
+        db = stack["db"]
+        self._at_lap(db, "source_provenance", 9)
+        self._obs(db, "document_coverage", "source_provenance", "a.pdf", 0)
+        self._obs(db, "revision_shadow", "source_provenance", "b.pdf", 0)
+        # Even with a later report on the record, a terminal kind stands.
+        self._obs(db, "document_coverage", "source_provenance", "c.pdf", 8)
+        stack["patrol"].run_errand("seam_audit")
+        assert set(_obs(db, "document_coverage")) == {"a.pdf", "c.pdf"}
+        assert "b.pdf" in _obs(db, "revision_shadow")
 
     def test_the_off_by_one_is_not_treated_as_stale(self, stack):
         """observe() stamps the lap read at the START of a run and
