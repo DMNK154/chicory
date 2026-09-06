@@ -1707,10 +1707,23 @@ def _seam_audit(
         "SELECT errand, MAX(lap) AS lap FROM patrol_observations "
         "WHERE retracted = 0 GROUP BY errand")}
 
-    live = db.execute(
-        "SELECT COUNT(*) AS n FROM memories WHERE is_archived = 0").fetchone()
-    hub_cap = config.subject_hub_tag_max_fraction * max(
-        (live["n"] if live else 0), 1)
+    # Deferred, because it is a full count of a six-figure table and the
+    # only thing that reads it is the hub check on a tag-anchored row.
+    # This errand walks the whole observation record, of which 10,635 of
+    # 12,515 rows are not tag-anchored — so ~85% of batches were paying
+    # 0.5s for a number they never looked at, all of it inside the
+    # foreground lock, which is ~128s a lap spent on nothing.
+    _hub_cap: list[float] = []
+
+    def hub_cap() -> float:
+        if not _hub_cap:
+            live = db.execute(
+                "SELECT COUNT(*) AS n FROM memories WHERE is_archived = 0"
+            ).fetchone()
+            _hub_cap.append(config.subject_hub_tag_max_fraction * max(
+                (live["n"] if live else 0), 1))
+        return _hub_cap[0]
+
     shelved: set[int] = set()
     for r in db.execute(
         "SELECT member_tag_ids FROM subjects WHERE status = 'active'"
@@ -1817,7 +1830,7 @@ def _seam_audit(
         held = db.execute(
             "SELECT COUNT(*) AS n FROM memory_tags WHERE tag_id = ?", (tag_id,)
         ).fetchone()["n"]
-        if held == 0 or held > hub_cap:
+        if held == 0 or held > hub_cap():
             retract(r["id"], "holds nothing" if held == 0
                     else f"a hub tag ({held:,}), off the tree by design")
             verdicts[key] = ("acted", "retracted: no longer applicable")

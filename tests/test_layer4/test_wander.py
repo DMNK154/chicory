@@ -894,6 +894,30 @@ class TestWhatIsActuallyScheduled:
         unknown = [n for n in self._shipped() if n not in ERRANDS]
         assert unknown == [], f"scheduled but not registered: {unknown}"
 
+    def test_the_observation_record_has_an_auditor(self):
+        """seam_audit is the only thing that retracts an observation whose
+        subject has gone. Without it the record only grows: 124 corpus
+        asymmetry rows stood against a primary text that had silently
+        become four files out of eight, and 8,128 concept_gap rows sat
+        under nobody's audit."""
+        assert "seam_audit" in self._shipped()
+
+    def test_the_tag_errands_are_scheduled(self):
+        """They propose and never act — one authored row per tag, capped
+        by UNIQUE(errand, kind, subject). Off the list they had laps only
+        because sessions drove them by hand."""
+        assert {"tag_seams", "tag_twins", "tag_gap_variants",
+                "tag_content"} <= set(self._shipped())
+
+    def test_an_auditor_is_scheduled_after_what_it_audits(self):
+        """Order matters here: within one pass seam_audit should see the
+        laps the producers just advanced, not the previous ones."""
+        order = self._shipped()
+        producers = [order.index(n) for n in
+                     ("concept_gaps", "corpus_asymmetry", "tag_seams",
+                      "tag_twins", "tag_gap_variants", "tag_content")]
+        assert order.index("seam_audit") > max(producers)
+
     def test_corpus_asymmetry_is_scheduled(self):
         """It compares two accounts of one thing and withdraws findings
         whose populations have moved. Off this list it did neither: 124

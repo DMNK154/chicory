@@ -851,10 +851,32 @@ class ChicoryConfig(BaseModel):
     # wander_interval_minutes, and the patrol phase holds the foreground
     # lock, so the exposure is a single uninterrupted ~3.4s hold on the
     # rare batch where the guard opens.
+    # The four tag errands all PROPOSE and none of them acts: each writes
+    # one authored `patrol_observations` row per tag and nothing else.
+    # Their lifetime `acted` counts — 3,951 / 5,097 / 1,269 / 1,056 — are
+    # re-confirmations, not changes: `acted` is the verdict returned right
+    # after `patrol.observe`, and the UNIQUE(errand, kind, subject)
+    # constraint caps each at one row per tag.  tag_gap_variants' 1,269
+    # events are ~142 distinct proposals rewritten once per lap.
+    #
+    # `seam_audit` is last because it audits what the others deposit, and
+    # it is the reason the rest can be trusted: nothing else retracts an
+    # observation whose subject has gone.  It carries one derived write —
+    # `rebuild_centroid_for_tag` backfills a missing tag centroid — which
+    # is admitted deliberately.  It is guarded to backfill only, is a pure
+    # function of memory_tags and embeddings, and is the same class of
+    # write as `missing_embedding`, which has always been dispatched.
+    #
+    # Two registered errands stay off this list: `hebrew_lexicon`, which
+    # is safe but whose whole-corpus build nobody has asked to run
+    # unattended, and `meta_shelf_proposals`, whose queue only grows —
+    # three days of it produced 155 shelves and one confirmation.
     wander_errands: list[str] = Field(
         default_factory=lambda: [
             "missing_embedding", "source_provenance", "concept_gaps",
             "corpus_asymmetry",
+            "tag_seams", "tag_twins", "tag_gap_variants", "tag_content",
+            "seam_audit",
         ]
     )
     # Only one process patrols a library at a time.  Every MCP client
