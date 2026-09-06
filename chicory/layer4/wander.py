@@ -2054,6 +2054,50 @@ register(Errand(
 ))
 
 
+def _asymmetry_definition(config: ChicoryConfig) -> str:
+    """A fingerprint of the DECLARED comparison — pairs and registry.
+
+    Folded into the once-per-lap marker so that editing a role, a pair or
+    a registry entry re-derives on the next batch instead of standing on
+    the old definition until the lap turns.  A lap here is the whole
+    memories domain: 148,654 stampings were outstanding when this was
+    written, ~2,974 batches at the default fifty, and new material pushes
+    the boundary out as it arrives.  Waiting that long to notice an edit
+    the author made deliberately is the same defect in miniature as the
+    one the registry exists to fix.
+
+    Config only, so it costs no query.  A document joining or leaving a
+    role *in the library* still waits for the lap, because detecting that
+    means digesting every document; ``_withdraw_stale`` is what catches
+    it when the comparison does run.
+    """
+    import hashlib
+
+    payload = json.dumps(
+        [config.asymmetry_pairs, config.corpus_documents],
+        sort_keys=True, default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _unstamped_asymmetries(db: DatabaseEngine) -> bool:
+    """Whether a standing finding carries no record of what it compared.
+
+    One indexed lookup, and it opens the guard exactly once: a finding
+    written before the registry existed says nothing about which
+    documents were on either side, so it cannot be audited and must be
+    re-derived rather than left to age out.  124 rows were in that state
+    when this shipped, and the lap guard would have held them there.
+
+    After the first pass every standing row is stamped, so this is a
+    LIMIT 1 miss on an index for the rest of the errand's life.
+    """
+    return db.execute(
+        "SELECT 1 FROM patrol_observations WHERE kind = 'corpus_asymmetry' "
+        "AND retracted = 0 AND data NOT LIKE '%\"basis\"%' LIMIT 1"
+    ).fetchone() is not None
+
+
 def _corpus_asymmetry(
     *,
     db: DatabaseEngine,
@@ -2079,8 +2123,8 @@ def _corpus_asymmetry(
     """
     from chicory.layer4.asymmetry import CorpusAsymmetry
 
-    marker = f"lap{state.lap}"
-    if (state.cursor_hint or "") == marker:
+    marker = f"lap{state.lap}:{_asymmetry_definition(config)}"
+    if (state.cursor_hint or "") == marker and not _unstamped_asymmetries(db):
         return {mid: ("skipped", "already compared this lap") for mid in memory_ids}
     result = CorpusAsymmetry(config, db).run(patrol=patrol, lap=state.lap)
     db.execute(

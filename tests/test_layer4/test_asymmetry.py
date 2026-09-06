@@ -28,7 +28,7 @@ from chicory.layer4.asymmetry import (
     CorpusRegistry,
     document_digest,
 )
-from chicory.layer4.wander import Patrol
+from chicory.layer4.wander import Patrol, _asymmetry_definition
 from tests.conftest import MockEmbeddingEngine
 
 PAIR = {
@@ -423,6 +423,87 @@ class TestWithdrawal:
             "'editions:kudsha'").fetchone()["data"])
         assert d["right_documents"] == ["b.pdf", "b2.pdf"]
         assert d["left_documents"] == ["a.pdf"]
+
+
+class TestLapGuard:
+    """When the once-per-lap guard must stand aside.
+
+    The guard exists so a whole-corpus diff runs once per lap rather than
+    once per batch. But a lap here is the entire memories domain: 148,654
+    stampings were outstanding when this was written, ~2,974 batches at
+    the default fifty, and new material pushes the boundary out as it
+    arrives. Holding a correction behind that is the same defect the
+    registry exists to fix — an answer standing long after the thing it
+    was an answer about has moved.
+    """
+
+    def _seed(self, stack):
+        _sides(stack, [f"Kudsha here {i}" for i in range(6)],
+               [f"Sovereign here {i}" for i in range(6)])
+
+    def _run(self, stack):
+        return stack["patrol"].run_errand("corpus_asymmetry")
+
+    def test_a_second_pass_in_the_same_lap_is_skipped(self, stack):
+        """The guard still does its job when nothing has changed."""
+        self._seed(stack)
+        self._run(stack)
+        before = dict(stack["db"].execute(
+            "SELECT updated_at, confirmations FROM patrol_observations "
+            "WHERE subject = 'editions:kudsha'").fetchone())
+        self._run(stack)
+        after = dict(stack["db"].execute(
+            "SELECT updated_at, confirmations FROM patrol_observations "
+            "WHERE subject = 'editions:kudsha'").fetchone())
+        assert after == before, (
+            "a whole-corpus diff must not re-derive once per batch"
+        )
+
+    def test_a_finding_with_no_stamp_opens_the_guard(self, stack):
+        """The 124 rows standing when the registry shipped. Each said a
+        rate about a population nobody recorded, and the guard would have
+        held them at retracted=0 until the lap turned."""
+        db = stack["db"]
+        self._seed(stack)
+        db.execute(
+            "INSERT INTO patrol_observations (errand, kind, subject, detail, "
+            "weight, lap, data) VALUES ('corpus_asymmetry', "
+            "'corpus_asymmetry', 'editions:antique', 'from before the "
+            "registry', 0.01, 0, ?)",
+            (json.dumps({"term": "antique", "rate": 0.4, "other_rate": 0.0}),))
+        # Arm the guard exactly as a completed lap would.
+        db.execute(
+            "UPDATE wander_state SET cursor_hint = ? WHERE errand = ?",
+            (f"lap0:{_asymmetry_definition(stack['config'])}",
+             "corpus_asymmetry"))
+        db.connection.commit()
+        self._run(stack)
+        assert db.execute(
+            "SELECT retracted FROM patrol_observations WHERE subject = "
+            "'editions:antique'").fetchone()["retracted"] == 1
+
+    def test_editing_the_registry_opens_the_guard(self, stack):
+        """A role or pair the author changed on purpose must not wait for
+        a whole-corpus lap to take effect."""
+        db = stack["db"]
+        self._seed(stack)
+        self._run(stack)
+        armed = db.execute(
+            "SELECT cursor_hint FROM wander_state WHERE errand = "
+            "'corpus_asymmetry'").fetchone()["cursor_hint"]
+        # A third volume is declared on the right side.
+        _doc(stack, "b2.pdf", [f"Sovereign again {i}" for i in range(6)],
+             role="edition-b")
+        assert _asymmetry_definition(stack["config"]) not in armed
+        self._run(stack)
+        d = json.loads(db.execute(
+            "SELECT data FROM patrol_observations WHERE subject = "
+            "'editions:kudsha'").fetchone()["data"])
+        assert d["right_documents"] == ["b.pdf", "b2.pdf"]
+
+    def test_the_marker_is_stable_when_nothing_is_edited(self, stack):
+        cfg = stack["config"]
+        assert _asymmetry_definition(cfg) == _asymmetry_definition(cfg)
 
 
 class TestTagContent:
