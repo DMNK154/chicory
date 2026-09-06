@@ -902,15 +902,21 @@ class ChicoryConfig(BaseModel):
     # function of memory_tags and embeddings, and is the same class of
     # write as `missing_embedding`, which has always been dispatched.
     #
-    # Two registered errands stay off this list: `hebrew_lexicon`, which
-    # is safe but whose whole-corpus build nobody has asked to run
-    # unattended, and `meta_shelf_proposals`, whose queue only grows —
-    # three days of it produced 155 shelves and one confirmation.
+    # `hebrew_lexicon` joined once its cursor stopped costing a full scan
+    # per batch (see idx_memories_hebrew).  Its own work is one ~21s build
+    # per lap, it writes nothing derived, and scheduling it is also what
+    # clears the 28 stale entries standing at lap 4 — those retract only
+    # once the errand advances a lap having reported at a later one.
+    #
+    # `meta_shelf_proposals` stays off: its queue only grows — three days
+    # of hand-driving produced 155 shelves and one confirmation — so the
+    # desk fills faster than a person empties it.
     wander_errands: list[str] = Field(
         default_factory=lambda: [
             "missing_embedding", "source_provenance", "concept_gaps",
             "corpus_asymmetry",
             "tag_seams", "tag_twins", "tag_gap_variants", "tag_content",
+            "hebrew_lexicon",
             "seam_audit",
         ]
     )

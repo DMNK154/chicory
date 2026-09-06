@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 46
+SCHEMA_VERSION = 47
 
 TABLES = [
     # -- Schema version tracking --
@@ -58,6 +58,49 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed)",
     "CREATE INDEX IF NOT EXISTS idx_memories_source_path ON memories(source_path) WHERE source_path IS NOT NULL",
+
+    # The hebrew_lexicon cursor's population, indexed rather than scanned.
+    # Its predicate cannot be answered from any index over content, so
+    # every batch was a full SCAN of 156,654 rows READING content —
+    # measured 7.6s — and the errand does its real work once per lap, so
+    # 169 of every 170 batches paid that under the foreground lock to
+    # select 50 ids it discards.  ~17 minutes of held lock per lap.
+    #
+    # The WHERE here is byte-identical to what Patrol.select_with_laps
+    # builds (DOMAIN_MEMORIES.where AND the errand's population), which is
+    # the whole point: the registration refused a cheaper predicate on the
+    # ground that the cursor and the sweep would then disagree about what
+    # the population IS.  Indexing the predicate rather than replacing it
+    # settles that objection by construction — the row set cannot differ
+    # from itself.  Measured on a representative 156,654-row table: 7,578ms
+    # to 8.1ms, sub-megabyte, ~6s to build once, and ~16ns per character of
+    # content on the insert path — 34us on a row of average length, against
+    # 750-2,400us for one commit on the same file.  The UPDATE hot path is
+    # untouched: update_on_access compiles to byte-identical bytecode with
+    # and without it, and only `SET is_archived = 1` pays, twice, rarely.
+    #
+    # Both columns, and both terms of the WHERE, are load-bearing.  On a
+    # mid-lap cursor over a representative table: no index 6,336ms, (id)
+    # 28.5ms, (created_at, id) 25.4ms, (id, created_at) 8.1ms — `id` for
+    # the join and `created_at` for the ORDER BY, or every row needs a
+    # table seek to sort.  And dropping `is_archived = 0` from the index
+    # WHERE costs 3.8x (30.7ms), because the term then has to be
+    # re-checked against the table for all 8,469 rows: keeping this
+    # byte-identical to the predicate is both the honest option and the
+    # fast one.
+    #
+    # It is not only the cursor.  The same index answers the two other
+    # places that spell this predicate: BilingualLexicon.scan's own sweep
+    # (6,217ms to 40ms) and Patrol.population_size, whose docstring calls
+    # itself "3.4s on a six-figure library, every batch" (6,218ms to
+    # ~0ms).  That settles the disagreement the two comments were having.
+    # The sweep refused the aleph shortcut because it cannot afford to
+    # miss a chunk, and priced the refusal at 3.4s against 0.4s; the index
+    # gives it the full-range predicate for less than the shortcut cost,
+    # so the approximation never has to be adopted anywhere.
+    "CREATE INDEX IF NOT EXISTS idx_memories_hebrew "
+    "ON memories(id, created_at) "
+    "WHERE is_archived = 0 AND content GLOB '*[\u05D0-\u05EA]*'",
     "CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(ingestion_tier) WHERE ingestion_tier != 'critical'",
     "CREATE INDEX IF NOT EXISTS idx_memories_swept_at ON memories(swept_at)",
 
@@ -1304,6 +1347,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v44_to_v45(db)
             if current_version <= 45:
                 _migrate_v45_to_v46(db)
+            if current_version <= 46:
+                _migrate_v46_to_v47(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -2149,6 +2194,19 @@ def _migrate_v44_to_v45(db: DatabaseEngine) -> None:
     if "prose" not in cols:
         db.execute("ALTER TABLE meta_shelves ADD COLUMN prose REAL")
     db.connection.commit()
+
+
+def _migrate_v46_to_v47(db: DatabaseEngine) -> None:
+    """A partial index on the Hebrew population; the TABLES loop makes it.
+
+    Nothing to migrate — CREATE INDEX IF NOT EXISTS runs on every
+    apply_schema, so an existing install picks it up at the next startup
+    exactly as a fresh one does. Recorded as a version because building it
+    is a one-time full read of `content` (~8s measured on a table this
+    size), which is worth someone finding in the history rather than
+    wondering why the first startup after an upgrade paused.
+    """
+    return
 
 
 def _migrate_v45_to_v46(db: DatabaseEngine) -> None:

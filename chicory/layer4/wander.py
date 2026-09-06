@@ -2139,6 +2139,17 @@ register(Errand(
     # eight times faster and finds 5,729 of the 5,765, but the two would
     # then disagree about what the population IS — and `משה` has no aleph,
     # so the cheap version is an approximation rather than an index hint.
+    #
+    # It is now an index hint anyway: `idx_memories_hebrew` is a partial
+    # index whose WHERE is byte-identical to this, so the cursor is
+    # answered from the index without the predicate changing at all —
+    # 7,578ms to 29ms measured on a representative table.  The objection
+    # above was the right one and it did not have to be paid for: the
+    # errand discards these rows, only the lap guard and `scan()` matter,
+    # so the cost was 169 wasted full scans per lap under the foreground
+    # lock.  The sweep gains too — it spells the same predicate, and the
+    # index answers it at less than the aleph shortcut would have cost,
+    # so the approximation this comment refused never has to be adopted.
     population="m.content GLOB '*[א-ת]*'",
     when="idle",
 ))

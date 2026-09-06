@@ -1126,3 +1126,79 @@ class TestRetractionAndRevival:
         self._obs(p)
         r = self._row(db)
         assert r["retracted"] == 0 and r["revived_count"] == 1
+
+
+class TestPopulationIsIndexAnswerable:
+    """An errand's population must not cost a full scan per batch.
+
+    hebrew_lexicon's predicate cannot be answered from any index over
+    content, so every batch was a SCAN of 156,654 rows reading content —
+    7.6s measured — and the errand does its real work once per lap, so
+    169 of every 170 batches paid it under the foreground lock to select
+    50 ids it discards. The predicate is deliberately unchanged; what
+    changed is that `idx_memories_hebrew` is a partial index whose WHERE
+    is byte-identical to it, so the cursor is answered from the index and
+    the population cannot differ from itself.
+
+    A partial index only helps while SQLite's matcher recognises it, which
+    is syntactic — so this asserts the PLAN, not a duration.
+    """
+
+    def _plan(self, db, errand):
+        from chicory.layer4.wander import DOMAINS, DOMAIN_MEMORIES
+        dom = DOMAINS.get(errand.domain, DOMAIN_MEMORIES)
+        where = dom.where
+        if errand.population:
+            where += f" AND ({errand.population})"
+        sql = (f"SELECT {dom.id_expr} AS oid, v.lap FROM {dom.table} "
+               f"LEFT JOIN patrol_visits v ON v.memory_id = {dom.id_expr} "
+               f"AND v.errand = ? WHERE {where} "
+               f"ORDER BY v.visited_at ASC, {dom.tiebreak} ASC LIMIT ?")
+        return " | ".join(r["detail"] for r in db.execute(
+            "EXPLAIN QUERY PLAN " + sql, (errand.name, 50)))
+
+    def test_the_hebrew_cursor_is_answered_from_the_index(self, stack):
+        db = stack["db"]
+        for i in range(30):
+            make_memory(db, f"h{i}", "אמר רבי שמעון בריך הוא")
+            make_memory(db, f"e{i}", "plain english content here")
+        plan = self._plan(db, ERRANDS["hebrew_lexicon"])
+        assert "idx_memories_hebrew" in plan, (
+            f"the population fell back to a full scan: {plan}"
+        )
+
+    def test_the_index_selects_exactly_the_predicate(self, stack):
+        """The point of indexing the predicate rather than replacing it:
+        the row set cannot drift from what the sweep counts."""
+        db = stack["db"]
+        for i in range(20):
+            make_memory(db, f"h{i}", "משה ומטטרון")      # no aleph: an
+            make_memory(db, f"a{i}", "אמר רבי")           # aleph shortcut
+            make_memory(db, f"e{i}", "english only")      # would miss the
+        db.connection.commit()                            # first of these
+        via_index = {r["id"] for r in db.execute(
+            "SELECT id FROM memories WHERE is_archived = 0 "
+            "AND content GLOB '*[א-ת]*'")}
+        by_hand = {r["id"] for r in db.execute(
+            "SELECT id, content FROM memories WHERE is_archived = 0")
+            if any("\u05d0" <= ch <= "\u05ea" for ch in r["content"])}
+        assert via_index == by_hand
+        assert len(via_index) == 40
+
+    def test_every_scheduled_memory_errand_avoids_a_content_scan(self):
+        """The cost this fixes is generic: a population predicate over
+        `content` is a full read of a six-figure table, and the patrol
+        holds the foreground lock while it runs."""
+        from chicory.config import ChicoryConfig
+        cfg = ChicoryConfig(db_path=Path(":memory:"), anthropic_api_key="t",
+                            llm_model="m", embedding_model="mock")
+        offenders = []
+        for name in cfg.wander_errands:
+            e = ERRANDS.get(name)
+            if e is None or not e.population:
+                continue
+            if "content" in e.population and name != "hebrew_lexicon":
+                offenders.append(name)
+        assert offenders == [], (
+            f"population reads content with no index behind it: {offenders}"
+        )
