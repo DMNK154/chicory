@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 45
+SCHEMA_VERSION = 46
 
 TABLES = [
     # -- Schema version tracking --
@@ -1061,6 +1061,19 @@ TABLES = [
         data          TEXT NOT NULL DEFAULT '{}',
         confirmations INTEGER NOT NULL DEFAULT 1,
         retracted     INTEGER NOT NULL DEFAULT 0,
+        -- Who withdrew it, and how often it has come back.  `observe`
+        -- upserts on (errand, kind, subject) and sets retracted = 0, so a
+        -- finding the walk reports again returns silently: withdrawn and
+        -- resurrected looked exactly like never withdrawn, and the only
+        -- trace -- `detail` -- is overwritten by the new reading.
+        --
+        -- Reviving a machine judgement is usually right: seam_audit
+        -- retracts because "the walk no longer reports it", and the walk
+        -- reporting it is precisely that reason evaporating.  What was
+        -- missing is the record.  A 'human:' prefix is sticky instead --
+        -- a person's withdrawal is not a measurement that can go stale.
+        retracted_by  TEXT,
+        revived_count INTEGER NOT NULL DEFAULT 0,
         created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
         updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
         UNIQUE(errand, kind, subject)
@@ -1289,6 +1302,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v43_to_v44(db)
             if current_version <= 44:
                 _migrate_v44_to_v45(db)
+            if current_version <= 45:
+                _migrate_v45_to_v46(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -2133,6 +2148,26 @@ def _migrate_v44_to_v45(db: DatabaseEngine) -> None:
         "PRAGMA table_info(meta_shelves)").fetchall()}
     if "prose" not in cols:
         db.execute("ALTER TABLE meta_shelves ADD COLUMN prose REAL")
+    db.connection.commit()
+
+
+def _migrate_v45_to_v46(db: DatabaseEngine) -> None:
+    """Record who withdrew an observation, and that it came back.
+
+    Additive only.  Existing rows get retracted_by NULL, which reads as
+    "withdrawn by something that did not say" — true of every retraction
+    made before this column existed, and revivable, which is the same
+    behaviour they had.
+    """
+    if not _has_table(db, "patrol_observations"):
+        return
+    cols = {r["name"] for r in db.execute(
+        "PRAGMA table_info(patrol_observations)").fetchall()}
+    if "retracted_by" not in cols:
+        db.execute("ALTER TABLE patrol_observations ADD COLUMN retracted_by TEXT")
+    if "revived_count" not in cols:
+        db.execute("ALTER TABLE patrol_observations ADD COLUMN "
+                   "revived_count INTEGER NOT NULL DEFAULT 0")
     db.connection.commit()
 
 

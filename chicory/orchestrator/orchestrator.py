@@ -2501,6 +2501,7 @@ class Orchestrator:
                 (tag_id, shelf_id, concept))
             self._db.execute(
                 "UPDATE patrol_observations SET retracted = 1, "
+                "retracted_by = 'librarian:tag_applied', "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
                 "WHERE kind = 'concept_gap' AND subject = ?", (concept,))
             self._db.connection.commit()

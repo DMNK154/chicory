@@ -196,3 +196,49 @@ def test_background_phases_are_rate_limited():
         src = inspect.getsource(getattr(Orchestrator, method))
         assert marker in src, f"{method} does not consult {marker}"
         assert "return" in src, f"{method} has no early-out path"
+
+
+def test_an_existing_table_gains_its_new_columns_on_upgrade():
+    """The upgrade path the drift test above cannot see.
+
+    `test_fresh_and_migrated_schemas_agree` walks the ladder from a
+    minimal v1 database, where `patrol_observations` does not exist yet —
+    so `CREATE TABLE IF NOT EXISTS` in TABLES builds it complete and the
+    ALTER never runs. Unhooking `_migrate_v45_to_v46` from the dispatcher
+    leaves that test green.
+
+    But a real install already HAS the table, without the columns, and
+    for it the ALTER is the only thing that adds them. That is the case
+    that matters: 12,612 standing observations on the live library, and a
+    missing column there is an OperationalError on the first upsert.
+    """
+    conn = sqlite3.connect(":memory:")
+    db = _Engine(conn)
+    apply_schema(db)
+
+    # Rewind to v45: an install that predates retraction provenance.
+    conn.execute("ALTER TABLE patrol_observations DROP COLUMN retracted_by")
+    conn.execute("ALTER TABLE patrol_observations DROP COLUMN revived_count")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version (version) VALUES (45)")
+    conn.execute(
+        "INSERT INTO patrol_observations (errand, kind, subject, detail, "
+        "weight, lap, retracted) VALUES ('e', 'k', 's', 'd', 0.1, 1, 1)")
+    conn.commit()
+
+    apply_schema(db)
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(patrol_observations)")}
+    assert {"retracted_by", "revived_count"} <= cols, (
+        "an upgraded install is missing columns a fresh one has"
+    )
+    row = conn.execute(
+        "SELECT retracted, retracted_by, revived_count "
+        "FROM patrol_observations").fetchone()
+    assert tuple(row) == (1, None, 0), (
+        "a row retracted before the column existed must read as withdrawn "
+        "by something that did not say, and stay revivable"
+    )
+    assert conn.execute(
+        "SELECT MAX(version) FROM schema_version").fetchone()[0] == SCHEMA_VERSION
+    conn.close()

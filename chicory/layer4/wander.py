@@ -563,7 +563,21 @@ class Patrol:
             "memory_ids = excluded.memory_ids, lap = excluded.lap, "
             "data = excluded.data, "
             "confirmations = patrol_observations.confirmations + 1, "
-            "retracted = 0, "
+            # Seeing it again revives a machine withdrawal, and says so.
+            # seam_audit retracts because "the walk no longer reports it";
+            # the walk reporting it is that reason evaporating, so coming
+            # back is correct — what was missing is any trace that it
+            # happened.  A person's withdrawal is not a measurement that
+            # can go stale, so 'human:' is sticky and the row stays down.
+            "retracted = CASE WHEN patrol_observations.retracted_by "
+            "                 LIKE 'human:%' THEN 1 ELSE 0 END, "
+            "revived_count = patrol_observations.revived_count + CASE WHEN "
+            "    patrol_observations.retracted = 1 AND COALESCE("
+            "        patrol_observations.retracted_by, '') NOT LIKE 'human:%' "
+            "    THEN 1 ELSE 0 END, "
+            "retracted_by = CASE WHEN patrol_observations.retracted_by "
+            "                    LIKE 'human:%' THEN patrol_observations.retracted_by "
+            "               ELSE NULL END, "
             "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')",
             (errand, kind, subject, detail, weight,
              json.dumps(sorted(memory_ids or [])), lap, f"patrol:{errand}",
@@ -1238,6 +1252,7 @@ def _concept_gaps(
             # numbers, re-proposed forever and never leaving the desk.
             db.execute(
                 "UPDATE patrol_observations SET retracted = 1, "
+                "retracted_by = 'patrol:concept_gaps', "
                 "detail = ?, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
                 "WHERE kind = 'concept_gap' AND subject = ? AND retracted = 0",
@@ -1716,7 +1731,8 @@ def _seam_audit(
 
     def retract(obs_id: int, why: str) -> None:
         db.execute(
-            "UPDATE patrol_observations SET retracted = 1, detail = ?, "
+            "UPDATE patrol_observations SET retracted = 1, "
+            "retracted_by = 'patrol:seam_audit', detail = ?, "
             "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
             (f"resolved: {why}", obs_id),
         )

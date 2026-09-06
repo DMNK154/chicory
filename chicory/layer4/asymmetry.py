@@ -406,6 +406,7 @@ class CorpusAsymmetry:
         for why, obs_id in stale:
             self._db.execute(
                 "UPDATE patrol_observations SET retracted = 1, "
+                "retracted_by = 'patrol:corpus_asymmetry', "
                 "detail = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
                 "WHERE id = ?", (f"withdrawn: {why}", obs_id))
         return len(stale)

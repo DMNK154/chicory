@@ -1015,3 +1015,90 @@ def _probe_yield(seen, *, memory_ids, should_stop=None, **_):
         seen.append(mid)
         verdicts[mid] = ("ok", None)
     return verdicts
+
+
+class TestRetractionAndRevival:
+    """A withdrawn finding that comes back must say so.
+
+    `observe` upserts on (errand, kind, subject) and reset `retracted = 0`,
+    so a finding seam_audit had withdrawn returned silently — withdrawn
+    and resurrected looked exactly like never withdrawn, and the only
+    trace, `detail`, is overwritten by the new reading. Reviving a machine
+    judgement is usually right: seam_audit retracts because "the walk no
+    longer reports it", and the walk reporting it is that reason
+    evaporating. What was missing is the record.
+    """
+
+    def _obs(self, p, subject="malchut", detail="first sighting"):
+        p.observe(errand="probe", kind="concept_gap", subject=subject,
+                  detail=detail, weight=0.5, lap=1)
+        p._db.connection.commit()
+
+    def _row(self, db, subject="malchut"):
+        return db.execute(
+            "SELECT retracted, retracted_by, revived_count, confirmations, "
+            "detail FROM patrol_observations WHERE subject = ?", (subject,)
+        ).fetchone()
+
+    def _retract(self, db, by, subject="malchut"):
+        db.execute(
+            "UPDATE patrol_observations SET retracted = 1, retracted_by = ? "
+            "WHERE subject = ?", (by, subject))
+        db.connection.commit()
+
+    def test_a_fresh_observation_has_no_retraction_history(self, stack):
+        self._obs(stack["patrol"])
+        r = self._row(stack["db"])
+        assert r["retracted"] == 0
+        assert r["retracted_by"] is None
+        assert r["revived_count"] == 0
+
+    def test_a_machine_withdrawal_is_revived_and_counted(self, stack):
+        db, p = stack["db"], stack["patrol"]
+        self._obs(p)
+        self._retract(db, "patrol:seam_audit")
+        self._obs(p, detail="seen again")
+        r = self._row(db)
+        assert r["retracted"] == 0, "the walk reports it again; it should stand"
+        assert r["revived_count"] == 1, "the resurrection left no trace"
+        assert r["retracted_by"] is None, "a revived row still names a retractor"
+
+    def test_revivals_accumulate(self, stack):
+        db, p = stack["db"], stack["patrol"]
+        self._obs(p)
+        for _ in range(3):
+            self._retract(db, "patrol:seam_audit")
+            self._obs(p)
+        assert self._row(db)["revived_count"] == 3
+
+    def test_re_confirming_a_standing_row_is_not_a_revival(self, stack):
+        db, p = stack["db"], stack["patrol"]
+        self._obs(p)
+        self._obs(p)
+        r = self._row(db)
+        assert r["revived_count"] == 0, "a plain re-sighting is not a revival"
+        assert r["confirmations"] == 2
+
+    def test_a_human_withdrawal_is_sticky(self, stack):
+        """A person's withdrawal is not a measurement that can go stale,
+        so the walk seeing it again must not quietly overturn it."""
+        db, p = stack["db"], stack["patrol"]
+        self._obs(p)
+        self._retract(db, "human:wrwarren15@gmail.com")
+        self._obs(p, detail="the walk found it again")
+        r = self._row(db)
+        assert r["retracted"] == 1, "an errand overturned a person's decision"
+        assert r["retracted_by"] == "human:wrwarren15@gmail.com"
+        assert r["revived_count"] == 0
+
+    def test_a_retraction_with_no_recorded_author_still_revives(self, stack):
+        """Every row retracted before this column existed reads NULL. They
+        keep the behaviour they had rather than becoming sticky."""
+        db, p = stack["db"], stack["patrol"]
+        self._obs(p)
+        db.execute("UPDATE patrol_observations SET retracted = 1 "
+                   "WHERE subject = 'malchut'")
+        db.connection.commit()
+        self._obs(p)
+        r = self._row(db)
+        assert r["retracted"] == 0 and r["revived_count"] == 1
