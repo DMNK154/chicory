@@ -602,9 +602,22 @@ class MetaShelfProposer:
                 (seed, record["docj"], record["ref_hi"], record["arc_mean"],
                  record.get("prose"), record["n"], shelf_id),
             )
+            # Scoped by AUTHOR, not only by tag_id.  The docstring above
+            # claims to touch "nothing a person has acted on", but the
+            # guard was `status != 'proposed'` and `tag_id IS NULL`, which
+            # says nothing about who wrote the row.  Measured on the live
+            # library before this line was scoped: 256 of the 260
+            # `librarian:consolidate` members sat on proposed shelves with
+            # a null tag_id, so the next pass would have deleted them and
+            # re-inserted whatever survived as `added_by = 'patrol'` —
+            # losing the record and re-attributing what remained.
+            #
+            # The re-insert below is INSERT OR IGNORE against
+            # PRIMARY KEY (shelf_id, concept), so a member this leaves
+            # alone keeps its own author rather than being overwritten.
             self._db.execute(
                 "DELETE FROM meta_shelf_members WHERE shelf_id = ? "
-                "AND tag_id IS NULL", (shelf_id,),
+                "AND tag_id IS NULL AND added_by = 'patrol'", (shelf_id,),
             )
 
         variants = {a: b for a, b in bridges} | {b: a for a, b in bridges}

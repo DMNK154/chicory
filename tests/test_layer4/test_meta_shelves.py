@@ -454,3 +454,71 @@ class TestSplitSeeding:
         ids = _scatter(db, [f"c{i}" for i in range(12)], 90)
         got = stack["roster"]._split_in_centroid_space(set(ids))
         assert sum(len(g) for g in got) == len(ids)
+
+
+class TestProposalRefilingProvenance:
+    """Re-filing a proposal must not destroy membership it did not write.
+
+    `_file`'s docstring says it touches "nothing a person has acted on",
+    but the guard was `status != 'proposed'` plus `tag_id IS NULL` — which
+    says nothing about WHO wrote a member row. Measured on the live
+    library before this was scoped: 256 of the 260 `librarian:consolidate`
+    members sat on proposed shelves with a null tag_id, so the next pass
+    would have deleted them and re-inserted the survivors as
+    `added_by='patrol'` — silent loss plus re-attribution, on the first
+    dispatch rather than eventually.
+    """
+
+    RECORD = {"slug": "church", "members": ["prophets", "salvation", "grace"],
+              "docj": 0.5, "ref_hi": 0.5, "arc_mean": 0.5, "prose": 0.1, "n": 3}
+
+    def _shelf(self, db, members):
+        db.execute(
+            "INSERT INTO meta_shelves (slug, status, origin, seed_json, docj, "
+            "ref_hi, arc_mean, n_core) VALUES ('church', 'proposed', 'patrol', "
+            "'{}', 0.5, 0.5, 0.5, 3)")
+        sid = db.execute(
+            "SELECT id FROM meta_shelves WHERE slug='church'").fetchone()["id"]
+        for concept, author in members:
+            db.execute(
+                "INSERT INTO meta_shelf_members (shelf_id, concept, added_by) "
+                "VALUES (?, ?, ?)", (sid, concept, author))
+        db.connection.commit()
+        return sid
+
+    def _members(self, db, sid):
+        return {r["concept"]: r["added_by"] for r in db.execute(
+            "SELECT concept, added_by FROM meta_shelf_members WHERE shelf_id = ?",
+            (sid,))}
+
+    def test_it_does_not_delete_a_member_another_author_wrote(self, stack):
+        db = stack["db"]
+        sid = self._shelf(db, [("prophets", "librarian:consolidate"),
+                               ("purgatory", "librarian:consolidate"),
+                               ("grace", "patrol")])
+        _proposer().__class__(stack["config"], db)._file(self.RECORD, set())
+        got = self._members(db, sid)
+        assert "purgatory" in got, (
+            "a member the patrol never wrote was deleted and not restored"
+        )
+        assert got["purgatory"] == "librarian:consolidate"
+
+    def test_a_surviving_member_keeps_its_author(self, stack):
+        """INSERT OR IGNORE against PRIMARY KEY (shelf_id, concept), so a
+        row left alone is not overwritten with added_by='patrol'."""
+        db = stack["db"]
+        sid = self._shelf(db, [("prophets", "librarian:consolidate"),
+                               ("grace", "patrol")])
+        _proposer().__class__(stack["config"], db)._file(self.RECORD, set())
+        assert self._members(db, sid)["prophets"] == "librarian:consolidate", (
+            "provenance was laundered: a consolidate row became a patrol row"
+        )
+
+    def test_it_still_refreshes_its_own_membership(self, stack):
+        """The scoping must not stop the pass doing its actual job."""
+        db = stack["db"]
+        sid = self._shelf(db, [("stale", "patrol"), ("grace", "patrol")])
+        _proposer().__class__(stack["config"], db)._file(self.RECORD, set())
+        got = self._members(db, sid)
+        assert "stale" not in got, "its own superseded member should be dropped"
+        assert set(got) >= {"prophets", "salvation", "grace"}
