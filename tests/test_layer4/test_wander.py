@@ -25,6 +25,7 @@ from chicory.layer4.wander import (
     Heartbeat,
     Patrol,
     WanderState,
+    register,
 )
 from tests.conftest import MockEmbeddingEngine
 
@@ -867,3 +868,64 @@ def test_a_tabular_chunk_is_skipped_not_paired(stack):
     assert row["verdict"] == "skipped"
     assert "tabular" in row["detail"]
     assert [o["subject"] for o in p.observations(kind="concept_gap")] == ["malchut"]
+
+
+class TestWhatIsActuallyScheduled:
+    """Registering an errand does not schedule it.
+
+    `_run_due_locked` iterates `config.wander_errands` and nothing else,
+    and no environment variable can add to it. Seven registered errands
+    were absent from that list on the live install and carried real laps
+    only because sessions had driven them by hand — the tell was
+    `last_result: examined=4000`, a batch size the heartbeat cannot
+    produce, since it passes none and so uses fifty. An errand left off
+    the list has no background existence at all, and nothing in the code
+    says so at the point where an errand is registered.
+    """
+
+    def _shipped(self):
+        return ChicoryConfig(
+            db_path=Path(":memory:"), anthropic_api_key="test",
+            llm_model="test-model", embedding_model="mock",
+        ).wander_errands
+
+    def test_every_scheduled_name_is_a_registered_errand(self):
+        """A typo here is silent: run_due logs and skips an unknown name."""
+        unknown = [n for n in self._shipped() if n not in ERRANDS]
+        assert unknown == [], f"scheduled but not registered: {unknown}"
+
+    def test_corpus_asymmetry_is_scheduled(self):
+        """It compares two accounts of one thing and withdraws findings
+        whose populations have moved. Off this list it did neither: 124
+        observations stood for a day against a primary text that had
+        silently become four files out of eight."""
+        assert "corpus_asymmetry" in self._shipped()
+
+    def test_a_scheduled_errand_is_reachable_through_run_due(self, stack):
+        """The property the list actually buys: run_due dispatches it.
+
+        Asserted through the real dispatcher rather than by reading the
+        list back, because the list being right and the walk reaching the
+        errand are two different claims.
+        """
+        seen = []
+        register(Errand(
+            name="probe-scheduled",
+            description="records that it was dispatched",
+            run=lambda **kw: (seen.append(len(kw["memory_ids"])) or
+                              {m: ("ok", None) for m in kw["memory_ids"]}),
+        ))
+        try:
+            db, p = stack["db"], stack["patrol"]
+            make_memory(db, "m1")
+            p._config.wander_errands = ["probe-scheduled"]
+            p.run_due(idle=True)
+            assert seen, "a scheduled errand was never dispatched"
+
+            seen.clear()
+            p._config.wander_errands = []
+            p._last_run.clear()
+            p.run_due(idle=True)
+            assert not seen, "an unscheduled errand was dispatched anyway"
+        finally:
+            ERRANDS.pop("probe-scheduled", None)

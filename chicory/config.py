@@ -832,9 +832,29 @@ class ChicoryConfig(BaseModel):
     wander_interval_minutes: float = Field(default=5.0)
     # Errands the patrol runs, in order.  Names must be registered in
     # chicory.layer4.wander.ERRANDS; unknown names are logged and skipped.
+    #
+    # Registering an errand does NOT schedule it — this list is the only
+    # thing `_run_due_locked` iterates, and there is no environment
+    # override for it.  Seven registered errands were absent from it and
+    # had laps only because sessions had driven them by hand; the tell was
+    # `last_result: examined=4000`, which the heartbeat cannot produce
+    # because it passes no batch_size and so uses fifty.  An errand left
+    # off this list has no background existence at all.
+    #
+    # `corpus_asymmetry` is the heaviest of these and still cheap, because
+    # the expensive part runs once per lap rather than once per batch.
+    # Measured on the live library (156,654 memories, 1,926 works): the
+    # whole-corpus pass — digesting every document, then profiling both
+    # pairs — is 3.43s, of which 0.81s is the digest scan.  Every other
+    # batch is one indexed LIMIT 1 against patrol_observations.  It is
+    # `when="idle"` and rate-limited to one batch per
+    # wander_interval_minutes, and the patrol phase holds the foreground
+    # lock, so the exposure is a single uninterrupted ~3.4s hold on the
+    # rare batch where the guard opens.
     wander_errands: list[str] = Field(
         default_factory=lambda: [
             "missing_embedding", "source_provenance", "concept_gaps",
+            "corpus_asymmetry",
         ]
     )
     # Only one process patrols a library at a time.  Every MCP client
