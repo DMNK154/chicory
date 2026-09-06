@@ -1311,6 +1311,13 @@ def _meta_shelf_proposals(
     if (state.cursor_hint or "") == marker:
         return {mid: ("skipped", "already proposed this lap")
                 for mid in memory_ids}
+    # Checked BEFORE the pass rather than inside it: this one is
+    # all-or-nothing over the whole gap net (measured ~40s), and the patrol
+    # phase holds the foreground lock, which every patron handler acquires
+    # with a bare blocking `with` and no timeout.  cursor_hint is left
+    # unset so a bail is re-attempted rather than recorded as done.
+    if should_stop is not None and should_stop():
+        return {mid: ("skipped", "a patron is waiting") for mid in memory_ids}
     result = MetaShelfProposer(config, db).propose()
     db.execute(
         "UPDATE wander_state SET cursor_hint = ?, "
@@ -1409,6 +1416,8 @@ def _tag_seams(
 
     verdicts: dict[str, tuple[str, str | None]] = {}
     for r in rows:
+        if should_stop is not None and should_stop():
+            break
         key = str(r["id"])
         name, held = r["name"], r["held"]
         if name.startswith(_STRUCTURAL_TAG_PREFIXES):
@@ -1551,6 +1560,8 @@ def _tag_twins(
 
     matcher = SequenceMatcher(autojunk=False)
     for r in mine:
+        if should_stop is not None and should_stop():
+            break
         key, name = str(r["id"]), r["name"]
         if name.startswith(_STRUCTURAL_TAG_PREFIXES):
             verdicts[key] = ("skipped", "a clock stamp")
@@ -1711,6 +1722,8 @@ def _seam_audit(
         )
 
     for r in rows:
+        if should_stop is not None and should_stop():
+            break
         key = str(r["id"])
         try:
             data = _json.loads(r["data"] or "{}")
@@ -1939,6 +1952,8 @@ def _tag_gap_variants(
     matcher = SequenceMatcher(autojunk=False)
 
     for r in mine:
+        if should_stop is not None and should_stop():
+            break
         key, name = str(r["id"]), r["name"]
         if name.startswith(_STRUCTURAL_TAG_PREFIXES):
             verdicts[key] = ("skipped", "a clock stamp")
@@ -2067,6 +2082,10 @@ def _hebrew_lexicon(
     marker = f"lap{state.lap}"
     if (state.cursor_hint or "") == marker:
         return {mid: ("skipped", "already built this lap") for mid in memory_ids}
+    # As above: a whole-corpus build with no partial resume, so the only
+    # useful place to yield is before starting one.
+    if should_stop is not None and should_stop():
+        return {mid: ("skipped", "a patron is waiting") for mid in memory_ids}
     result = BilingualLexicon(config, db).build(patrol=patrol, lap=state.lap)
     db.execute(
         "UPDATE wander_state SET cursor_hint = ?, "
@@ -2168,6 +2187,13 @@ def _corpus_asymmetry(
     marker = f"lap{state.lap}:{_asymmetry_definition(config)}"
     if (state.cursor_hint or "") == marker and not _unstamped_asymmetries(db):
         return {mid: ("skipped", "already compared this lap") for mid in memory_ids}
+    # The pass digests every document and profiles both sides with no
+    # partial resume, so before it is the only useful place to yield —
+    # measured at 3.43s, held under the foreground lock.  cursor_hint stays
+    # unset on a bail, so the comparison is re-attempted rather than
+    # recorded as done for this lap.
+    if should_stop is not None and should_stop():
+        return {mid: ("skipped", "a patron is waiting") for mid in memory_ids}
     result = CorpusAsymmetry(config, db).run(patrol=patrol, lap=state.lap)
     db.execute(
         "UPDATE wander_state SET cursor_hint = ?, "
@@ -2251,6 +2277,8 @@ def _tag_content(
         return verdicts
     checker = TagContentAsymmetry(config, db)
     for r in rows:
+        if should_stop is not None and should_stop():
+            break
         if r["name"].startswith(_STRUCTURAL_TAG_PREFIXES):
             verdicts[str(r["id"])] = ("skipped", "a clock stamp")
             continue

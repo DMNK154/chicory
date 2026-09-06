@@ -929,3 +929,89 @@ class TestWhatIsActuallyScheduled:
             assert not seen, "an unscheduled errand was dispatched anyway"
         finally:
             ERRANDS.pop("probe-scheduled", None)
+
+
+class TestYieldingToTheForeground:
+    """Every dispatched errand must be able to stop mid-batch.
+
+    The patrol phase runs holding _foreground_db_lock, and every patron
+    handler acquires that lock with a bare blocking `with` and no timeout.
+    An errand that ignores should_stop therefore makes a waiting patron
+    wait out its whole batch — measured at 1.1s for tag_gap_variants at
+    batch 50, ~3.4s for a corpus_asymmetry pass, ~40s for a meta-shelf
+    proposal pass. run_due only checks between errands, so the check has
+    to be inside.
+    """
+
+    PER_ROW = ["tag_seams", "tag_twins", "tag_gap_variants", "tag_content",
+               "seam_audit", "missing_embedding", "source_provenance",
+               "concept_gaps"]
+    WHOLE_CORPUS = ["hebrew_lexicon", "meta_shelf_proposals",
+                    "corpus_asymmetry"]
+
+    def test_every_shipped_errand_consults_should_stop(self):
+        """Asserted over the registry rather than a hand-kept list, so a
+        new errand cannot quietly arrive without one.
+
+        Scoped to run functions defined in the wander module: tests
+        register probe errands into the same global ERRANDS dict and do
+        not all clean up, so an unscoped assertion measures the test suite
+        rather than the shipped code.
+        """
+        import inspect
+        missing = []
+        for name, errand in ERRANDS.items():
+            if getattr(errand.run, "__module__", None) != "chicory.layer4.wander":
+                continue                      # a probe registered by a test
+            if "should_stop()" not in inspect.getsource(errand.run):
+                missing.append(name)
+        assert missing == [], f"shipped errands that cannot yield: {missing}"
+        assert len(ERRANDS) >= 11, "the registry lost errands; scoping is wrong"
+
+    def test_a_per_row_errand_stops_and_leaves_the_rest_unstamped(self, stack):
+        """Stopping must not consume the queue. An object with no verdict
+        keeps its old visited_at and stays at the head, so the work is
+        resumed rather than skipped."""
+        db, p = stack["db"], stack["patrol"]
+        for i in range(5):
+            make_memory(db, f"m{i}", "some content here")
+        seen = []
+        register(Errand(
+            name="probe-yield",
+            description="stops after the first row",
+            run=lambda **kw: _probe_yield(seen, **kw),
+        ))
+        try:
+            out = p.run_errand("probe-yield", batch_size=5,
+                               should_stop=lambda: len(seen) >= 2)
+            assert out["examined"] < 5, "it consumed the whole batch anyway"
+            stamped = db.execute(
+                "SELECT COUNT(*) n FROM patrol_visits WHERE errand='probe-yield'"
+            ).fetchone()["n"]
+            assert stamped == out["examined"] < 5
+        finally:
+            ERRANDS.pop("probe-yield", None)
+
+    def test_a_whole_corpus_errand_does_not_record_the_lap_when_it_bails(self, stack):
+        """cursor_hint must stay unset, or a bail is remembered as a pass
+        and the lap's work is silently skipped."""
+        db, p = stack["db"], stack["patrol"]
+        make_memory(db, "m0", "content")
+        p._config.wander_errands = ["hebrew_lexicon"]
+        p.run_errand("hebrew_lexicon", batch_size=5, should_stop=lambda: True)
+        hint = db.execute(
+            "SELECT cursor_hint FROM wander_state WHERE errand='hebrew_lexicon'"
+        ).fetchone()
+        assert hint is None or hint["cursor_hint"] is None, (
+            "a bail was recorded as a completed lap"
+        )
+
+
+def _probe_yield(seen, *, memory_ids, should_stop=None, **_):
+    verdicts = {}
+    for mid in memory_ids:
+        if should_stop is not None and should_stop():
+            break
+        seen.append(mid)
+        verdicts[mid] = ("ok", None)
+    return verdicts
