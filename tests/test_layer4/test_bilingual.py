@@ -43,6 +43,10 @@ def stack():
         wander_interval_minutes=0.0, wander_errands=["hebrew_lexicon"],
         bilingual_min_chunks=2, bilingual_min_dice=0.45,
         bilingual_ubiquity_max=0.90, bilingual_min_hebrew_share=0.10,
+        # Scaled to the fixtures the way min_chunks is: these corpora are
+        # a handful of chunks, so the shipped joint-evidence floor of 6
+        # would reject every pair in this file.
+        bilingual_min_shared=2,
     )
     db = DatabaseEngine(config)
     db.connect()
@@ -324,8 +328,10 @@ class TestCommentaryDilution:
 
     39 of the 41 come back under the gate. The other two, מדרש and
     הנעלם, recover their dice — 0.638 and 0.633, well clear of the 0.45
-    floor — and are then folded onto דרש and נעלם by the longest-form
-    rule. That is a fold artifact, not a gate failure, and a test that
+    floor — and were then folded onto דרש and נעלם by the fold's
+    shortest-form rule. That was a fold artifact, not a gate failure, and
+    both are back now that the fold asks for evidence; see
+    TestFoldResidual. A test that
     demanded them back would be testing the fold.
     """
 
@@ -515,3 +521,114 @@ class TestCommentaryDilution:
                               "passage of the court at considerable length "
                               "in their printed commentaries again.")
         assert "ותיה" not in set(self._lex(stack).scan()["hebrew"])
+
+
+class TestFoldResidual:
+    """The shorter form has to earn its seat, not win by arriving first.
+
+    Prefix-stripping is a guess, so a skeleton and its debris both align
+    to the same English word and only one can be kept. Which one is the
+    artifact flips with the cause and the shapes are identical, so the
+    fold used position as a stand-in for evidence — and on the live
+    library that put 35 fragments on the record: מצרים as צרים, שכינתא as
+    ינתא, המנונא as נונא, and בריך as the very ריך the docstring cites as
+    the thing to avoid.
+
+    The evidence is already in both records. `shared` counts the chunks
+    that name the English term and carry the form, so the difference is
+    how often the short form was seen there WITHOUT the long one.
+    """
+
+    def _counts(self, hebrew, english, together, chunks=40):
+        return {"chunks": chunks, "hebrew": hebrew,
+                "english": english, "together": together}
+
+    def _lex(self, stack):
+        return BilingualLexicon(stack["config"], stack["db"])
+
+    def test_debris_loses_when_it_is_never_seen_alone(self, stack):
+        """ריך appears only where בריך does, so it is debris and the
+        long form takes the entry."""
+        counts = self._counts(
+            hebrew={"בריך": 20, "ריך": 20},
+            english={"Berikh": 20},
+            together={"בריך": {"Berikh": 20}, "ריך": {"Berikh": 20}})
+        got = {e["hebrew"] for e in self._lex(stack).align(counts)}
+        assert got == {"בריך"}
+
+    def test_a_bare_root_keeps_its_entry_when_it_stands_alone(self, stack):
+        """זעיר occurs in chunks where דזעיר does not, so it is a word in
+        its own right and the construct form folds into it."""
+        counts = self._counts(
+            hebrew={"זעיר": 30, "דזעיר": 20},
+            english={"Anpin": 30},
+            together={"זעיר": {"Anpin": 30}, "דזעיר": {"Anpin": 20}})
+        got = {e["hebrew"] for e in self._lex(stack).align(counts)}
+        assert got == {"זעיר"}
+
+    def test_the_shekhinta_case(self, stack):
+        """The rule's old premise, stated in the code, was that a bare
+        form 'always outnumbers any single prefixed variant'. On the live
+        corpus ינתא at 501 chunks is RARER than both שכינתא (634) and
+        כינתא (633) that were folded onto it."""
+        counts = self._counts(
+            hebrew={"ינתא": 501, "כינתא": 633, "שכינתא": 634},
+            english={"Shekhinta": 640},
+            together={"ינתא": {"Shekhinta": 501},
+                      "כינתא": {"Shekhinta": 633},
+                      "שכינתא": {"Shekhinta": 634}},
+            chunks=1400)
+        got = {e["hebrew"] for e in self._lex(stack).align(counts)}
+        assert "ינתא" not in got, "the rarer fragment kept the entry"
+        assert "שכינתא" in got
+
+    def test_one_chunk_of_its_own_is_enough(self, stack):
+        """The threshold is evidence existing, not evidence being common
+        — a bare form seen once without its parent is still a word."""
+        counts = self._counts(
+            hebrew={"דרש": 21, "מדרש": 20},
+            english={"Midrash": 21},
+            together={"דרש": {"Midrash": 21}, "מדרש": {"Midrash": 20}})
+        got = {e["hebrew"] for e in self._lex(stack).align(counts)}
+        assert got == {"דרש"}
+
+
+class TestClusterCap:
+    """A word translates a word; a quoted verse translates nothing.
+
+    A verse quoted N times makes every content word in it co-occur
+    perfectly, so Dice cannot tell the translation from its neighbours.
+    Ps 119:18 gives ואביטה→'Uncover' a flat 1.000 while גל, the word that
+    actually means uncover, is not in the cluster at all.
+    """
+
+    def _verse(self, n=12):
+        """THREE words that always travel together, as a verse does.
+
+        Three and not four on purpose: the nine clusters this cap change
+        removes are all size three, so a fixture of four would pass at a
+        cap of 3 as well and prove nothing.
+        """
+        words = ["ואביטה", "מתורתך", "נפלאות"]
+        return {"chunks": 40,
+                "hebrew": {w: n for w in words},
+                "english": {"Uncover": n},
+                "together": {w: {"Uncover": n} for w in words}}
+
+    def test_a_verse_block_is_dropped_whole(self, stack):
+        lex = BilingualLexicon(stack["config"], stack["db"])
+        assert lex.align(self._verse()) == [], (
+            "four skeletons for one gloss is a block, not four translations"
+        )
+
+    def test_a_doublet_pair_survives(self, stack):
+        """This corpus really does carry Hebrew/Aramaic doublets — פסח
+        and פסחא, שבת and שבתא — and a cap of 1 would take them."""
+        counts = {"chunks": 40,
+                  "hebrew": {"שבת": 20, "שבתא": 16},
+                  "english": {"Shabbat": 22},
+                  "together": {"שבת": {"Shabbat": 20},
+                               "שבתא": {"Shabbat": 16}}}
+        got = {e["hebrew"] for e in
+               BilingualLexicon(stack["config"], stack["db"]).align(counts)}
+        assert got == {"שבת", "שבתא"}

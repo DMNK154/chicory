@@ -530,7 +530,42 @@ class ChicoryConfig(BaseModel):
     # unrelated skeletons is boilerplate, not a lexicon entry, so the
     # whole cluster is dropped rather than trimmed — the block gives no
     # reason to prefer any member of it.
-    bilingual_max_forms_per_term: int = Field(default=3)
+    # How many chunks must name the English term AND carry the skeleton
+    # before the pairing counts.  This replaces a floor on `m`, the term's
+    # total frequency, which was testing the wrong quantity: the ceiling
+    # above is relative to the counted population and rescales itself,
+    # while an absolute floor on `m` silently tightened by ~12% when the
+    # facing-text gate removed 769 chunks — costing 17 entries whose dice
+    # that same gate had just improved.  `shared` is the joint evidence,
+    # and it is what distinguishes a convention from a coincidence.
+    #
+    # 6 rather than 8, measured: with the m-floor gone, no shared floor at
+    # all admits 527 entries and the tail at shared = 3 is wrong pairings
+    # (עוג/Sihon, תנח/Ararat), while 6 readmits the proper nouns the gate
+    # had been costing — Hermon, Keturah, Israelite, Pardes, Merivah.
+    bilingual_min_shared: int = Field(default=6)
+    #
+    # 2 rather than 3, because 3 sat one notch above the failure it was
+    # written for.  Measured on the live library after the fold learned to
+    # ask for evidence: at 3 the extra nine clusters are all quoted
+    # verses, where every content word co-occurs perfectly and Dice cannot
+    # tell the translation from its neighbours — Ps 119:18 gives
+    # ואביטה→`Uncover` a flat 1.000 while the word that means uncover, גל,
+    # is not even in the cluster.  At 2 what remains are genuine
+    # Hebrew/Aramaic doublets, which this corpus really does contain:
+    # פסח/פסחא, שבת/שבתא, כהן/כהנא, חכמה/חכמתא, ירושלים/ירושלם.  Cutting
+    # to 1 would take those too, and with them המנונא/Hamnuna, which the
+    # bilingual module's own docstring offers as a worked example.
+    #
+    # 404 entries at 3, 377 at 2, 287 at 1.
+    #
+    # A dice cliff looked like it would do better — it would rescue בריך
+    # and קודשא, both 0.98 in a cluster whose next member is 0.67 — but
+    # measured across all eighteen over-cap clusters the gap is a
+    # continuum, 0.000 to 0.414 with nothing in it, and the LARGEST gap
+    # belongs to `Uncover`, which is wrong.  So the flagship pair stays
+    # lost and this stays a cap rather than a judgement.
+    bilingual_max_forms_per_term: int = Field(default=2)
     # How much of a chunk has to BE Hebrew before it counts as facing
     # text.  A volume can carry the English and be unable to carry the
     # Hebrew: the Pritzker Zohar is English commentary with inline

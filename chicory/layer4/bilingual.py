@@ -297,16 +297,31 @@ class BilingualLexicon:
         """Pair each skeleton with the English word that tracks it.
 
         Two cuts that the raw ratio needs.  UBIQUITY: `ספר` and `זהר` sit
-        in 5,090 of 5,719 chunks, so they co-occur with every common word
-        and score 0.985 against `Parashat` while meaning nothing — a term
-        on nearly every page distinguishes nothing, the same reason the
-        roster caps hub tags.  And LONGEST FORM WINS: prefix-stripping is
-        a guess, so `בריך` and its debris `ריך` both align to `Berikh`,
-        and only the longer one is kept.
+        in 5,097 of the 5,667 counted chunks, so they co-occur with every
+        common word and score 0.985 against `Parashat` while meaning
+        nothing — a term on nearly every page distinguishes nothing, the
+        same reason the roster caps hub tags.
+
+        And THE SHORTER FORM MUST EARN ITS SEAT.  Prefix-stripping is a
+        guess, so `בריך` and its debris `ריך` both align to `Berikh` and
+        only one can be kept — but which one is the artifact flips with
+        the cause, and the two shapes are identical.  This once read
+        "longest form wins", and said so in four places after the sort had
+        been changed to keep the SHORTEST: the record then carried 35
+        entries naming a fragment — `מצרים` as `צרים`, `שכינתא` as
+        `ינתא`, `המנונא` as `נונא`, and `בריך` as the very `ריך` this
+        paragraph cites as the thing to avoid.
+
+        What decides it is already in both records.  `shared` counts the
+        chunks that name the English term and carry the form, so
+        `shared(short) - shared(long)` is how often the short form was
+        seen there WITHOUT the long one.  Zero means it was never seen on
+        its own and is debris.
         """
         chunks = max(counts["chunks"], 1)
         ceiling = self._config.bilingual_ubiquity_max * chunks
         floor = self._config.bilingual_min_chunks
+        shared_floor = self._config.bilingual_min_shared
         min_dice = self._config.bilingual_min_dice
 
         best: dict[str, dict] = {}
@@ -316,7 +331,18 @@ class BilingualLexicon:
             top = None
             for term, shared in counts["together"].get(skeleton, {}).items():
                 m = counts["english"].get(term, 0)
-                if m < floor or m > ceiling:
+                # The floor belongs on the JOINT evidence, not on how often
+                # the English word happens to occur.  `m` is a term's total
+                # frequency, and the facing-text gate deliberately shrank
+                # the population it is counted over — the ceiling rescales
+                # itself against `chunks` and the floor did not, so it
+                # silently became ~12% stricter and took 17 entries whose
+                # dice the same gate had just IMPROVED: ישראלית/Israelite
+                # 0.48 to 0.80, אוריאל/Uriel 0.483 to 0.56.  What says
+                # whether a pairing is a convention rather than a
+                # coincidence is how often the two appear TOGETHER, and
+                # the gate does not move that.
+                if m > ceiling or shared < shared_floor:
                     continue
                 d = dice(shared, n, m)
                 if top is None or d > top["dice"]:
@@ -326,8 +352,9 @@ class BilingualLexicon:
             if top and top["dice"] >= min_dice:
                 best[skeleton] = top
 
-        # Longest form wins: drop a skeleton that is a suffix of a longer
-        # one aligned to the same English word.
+        # Two skeletons aligned to the same English word, one a suffix of
+        # the other: keep the one the corpus gives independent evidence
+        # for.  See the residual test below.
         out = []
         by_english: dict[str, list[dict]] = {}
         for rec in best.values():
@@ -340,23 +367,54 @@ class BilingualLexicon:
             # `בריך`; `דזעיר` is a real construct form whose bare word
             # `זעיר` is the one worth keeping.
             #
-            # Count settles it without needing to know.  A bare form is
-            # emitted for every prefixed occurrence as well as its own, so
-            # it always outnumbers any single prefixed variant.  Debris,
-            # emitted only alongside its parent, ties — and the longer form
-            # takes the tie.
-            # Shortest first, now that attestation has done the harder
-            # job.  Debris like ריך and ינה never reaches this point,
-            # because the corpus never uses them alone — so if two forms
-            # are BOTH here and one is a suffix of the other, the shorter
-            # is the bare root and the longer carries a prefix.
+            # Shortest first, but only to fix an order — the residual
+            # test below decides, not the position.
+            #
+            # Two arguments stood here and both were wrong.  "A bare form
+            # is emitted for every prefixed occurrence as well as its own,
+            # so it always outnumbers any single prefixed variant": on the
+            # live corpus that fails outright for `ינתא`, which at 501
+            # chunks is RARER than both `שכינתא` (634) and `כינתא` (633)
+            # that were folded onto it.  And "debris never reaches this
+            # point, because the corpus never uses it alone": measured
+            # over 121 fold pairs, all 121 dropped forms and all 121 kept
+            # forms are attested standing alone, so attestation separates
+            # nothing here.
             recs.sort(key=lambda r: (len(r["hebrew"]), -r["chunks"]))
             kept: list[dict] = []
             for r in recs:
-                if any(k["hebrew"].endswith(r["hebrew"]) or
-                       r["hebrew"].endswith(k["hebrew"])
-                       for k in kept if k["hebrew"] != r["hebrew"]):
+                clash = next((k for k in kept
+                              if k["hebrew"] != r["hebrew"]
+                              and (k["hebrew"].endswith(r["hebrew"])
+                                   or r["hebrew"].endswith(k["hebrew"]))), None)
+                if clash is None:
+                    kept.append(r)
                     continue
+                # The shorter form has to EARN its seat rather than win by
+                # arriving first.  Position was standing in for evidence,
+                # and the evidence is already in both records: `shared` is
+                # how many chunks name the English term and carry the
+                # form, so `shared(short) - shared(long)` is the count of
+                # chunks that name the term and carry the short form
+                # WITHOUT the long one.  Zero of those means the short
+                # form was never seen on its own here, and is debris.
+                #
+                # Measured over 121 fold pairs on the live library: 54
+                # have a residual of exactly 0 and the old rule kept the
+                # short form in every one of them, which is how 35
+                # standing entries came to name a fragment — מצרים as
+                # צרים, שמעון as עון, שכינתא as ינתא, המנונא as נונא, and
+                # בריך as ריך, the very case the docstring cites as the
+                # reason for the rule.  45 pairs have a residual of 8 or
+                # more and are the genuine clitics: דישראל/ישראל 1305,
+                # דקודשא/קודשא 1507.
+                #
+                # Attestation cannot do this job: all 121 dropped forms
+                # AND all 121 kept forms are attested standing alone, so
+                # it separates nothing here.
+                if clash["shared"] - r["shared"] >= 1:
+                    continue                      # the short form earned it
+                kept.remove(clash)                # it did not; take the long
                 kept.append(r)
             # A word translates a word.  If one English term still draws
             # many unrelated skeletons after the suffix fold, they arrived
