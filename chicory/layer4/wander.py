@@ -2108,7 +2108,7 @@ def _hebrew_lexicon(
     """
     from chicory.layer4.bilingual import BilingualLexicon
 
-    marker = f"lap{state.lap}"
+    marker = f"lap{state.lap}:{_lexicon_definition(config)}"
     if (state.cursor_hint or "") == marker:
         return {mid: ("skipped", "already built this lap") for mid in memory_ids}
     # As above: a whole-corpus build with no partial resume, so the only
@@ -2153,6 +2153,29 @@ register(Errand(
     population="m.content GLOB '*[א-ת]*'",
     when="idle",
 ))
+
+
+def _lexicon_definition(config: ChicoryConfig) -> str:
+    """A fingerprint of the cuts the lexicon is built with.
+
+    Same reason as `_asymmetry_definition`, and found the same way: the
+    fold, the floors and the cluster cap were all changed, and the guard
+    below had no way to know.  A lap here is the Hebrew-bearing material,
+    ~170 batches at one per five idle minutes, so the library went on
+    serving a lexicon built under the old cuts — fragments included,
+    `מצרים` filed as `צרים` — for as long as it took the cursor to wrap.
+
+    Config only, so it costs no query.  New MATERIAL still waits for the
+    lap, which is right: that is a corpus change, not an author's.
+    """
+    import hashlib
+
+    payload = json.dumps([
+        config.bilingual_min_chunks, config.bilingual_min_shared,
+        config.bilingual_min_dice, config.bilingual_ubiquity_max,
+        config.bilingual_max_forms_per_term, config.bilingual_min_hebrew_share,
+    ], sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _asymmetry_definition(config: ChicoryConfig) -> str:

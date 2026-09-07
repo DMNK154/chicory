@@ -25,7 +25,7 @@ from chicory.layer4.bilingual import (
     hebrew_words,
     skeleton_counts,
 )
-from chicory.layer4.wander import Patrol
+from chicory.layer4.wander import Patrol, _lexicon_definition
 from tests.conftest import MockEmbeddingEngine
 
 ZWSP = "​"
@@ -632,3 +632,49 @@ class TestClusterCap:
         got = {e["hebrew"] for e in
                BilingualLexicon(stack["config"], stack["db"]).align(counts)}
         assert got == {"שבת", "שבתא"}
+
+
+class TestBuildGuardTracksItsDefinition:
+    """Changing a cut must not wait for the cursor to wrap.
+
+    The build is guarded to once per lap, and a lap here is the whole
+    Hebrew-bearing population — ~170 batches at one per five idle
+    minutes. When the fold, the floors and the cap were changed, the
+    guard had no way to know, so the library went on serving a lexicon
+    built under the old cuts, fragments included, until the cursor
+    happened to come round. Same defect the corpus-asymmetry marker
+    already carries a fingerprint for.
+    """
+
+    def test_the_marker_is_stable_when_nothing_is_edited(self, stack):
+        cfg = stack["config"]
+        assert _lexicon_definition(cfg) == _lexicon_definition(cfg)
+
+    @pytest.mark.parametrize("knob,value", [
+        ("bilingual_max_forms_per_term", 1),
+        ("bilingual_min_dice", 0.6),
+        ("bilingual_min_shared", 9),
+        ("bilingual_min_chunks", 5),
+        ("bilingual_ubiquity_max", 0.7),
+        ("bilingual_min_hebrew_share", 0.2),
+    ])
+    def test_every_cut_changes_the_marker(self, stack, knob, value):
+        """Each of these decides what comes out, so each must re-derive."""
+        cfg = stack["config"]
+        before = _lexicon_definition(cfg)
+        setattr(cfg, knob, value)
+        assert _lexicon_definition(cfg) != before, f"{knob} left the marker alone"
+
+    def test_an_edited_cut_reopens_the_guard(self, stack):
+        db = stack["db"]
+        for i in range(4):
+            _mem(db, f"g{i}", ZWSP.join(["אמר", "בינה"]) + " Rabbi said Binah.")
+        p = stack["patrol"]
+        p.run_errand("hebrew_lexicon")
+        armed = db.execute("SELECT cursor_hint FROM wander_state "
+                           "WHERE errand='hebrew_lexicon'").fetchone()["cursor_hint"]
+        assert armed and armed.endswith(_lexicon_definition(stack["config"]))
+        stack["config"].bilingual_min_dice = 0.99
+        assert not armed.endswith(_lexicon_definition(stack["config"])), (
+            "a changed cut must not match the armed marker"
+        )
