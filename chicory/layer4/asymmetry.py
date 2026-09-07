@@ -64,6 +64,7 @@ against 20,842 of 21,269 everywhere else.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -536,16 +537,15 @@ class TagContentAsymmetry:
 
         Carried on every observation so a finding taken from one sample
         can be told from a finding taken from another — the cuts, and the
-        module that draws the sample.  Same argument as
+        code that draws and scores the sample.  Same argument as
         ``_asymmetry_definition``, and here it is the whole argument: the
         shipped reading of `life` was right about every threshold it
         applied and wrong about which memories it applied them to, and not
         one config value moved when that was fixed.
 
-        Costs one file read per process.
+        The two halves are kept separate in the stamp so a reader can see
+        which moved.
         """
-        from chicory.layer4.wander import _module_fingerprint
-
         payload = json.dumps([
             self._config.tag_content_sample,
             self._config.tag_content_pool_factor,
@@ -554,7 +554,7 @@ class TagContentAsymmetry:
             self._config.tag_content_lift,
         ], sort_keys=True, default=str)
         cuts = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
-        return f"{cuts}.{_module_fingerprint('chicory.layer4.asymmetry')}"
+        return f"{cuts}.{_reading_fingerprint()}"
 
     def withdraw_stale(self) -> int:
         """Retract readings drawn from a sample that no longer stands.
@@ -722,3 +722,42 @@ class TagContentAsymmetry:
                 # strong sign the label was earned rather than assigned.
                 "names_itself": any(d["term"] == name.lower()
                                     for d in distinctive)}
+
+
+# Everything outside the config that decides what a tag reads as, hashed
+# once per process.  See _reading_fingerprint.
+_READING_FINGERPRINT: str | None = None
+
+
+def _reading_fingerprint() -> str:
+    """Source hash of the code a tag reading depends on.
+
+    NOT the module, which is what the two guards in ``wander`` hash.  This
+    file holds two passes that share nothing but a page of text: editing
+    the corpus comparison would withdraw all 966 tag readings beside it,
+    and a withdrawal costs a lap of the tags domain to earn back.  So the
+    scope is the class that draws and scores the sample, plus the two
+    things outside it that decide which words count — the term pattern
+    here, and the 175 stopwords it borrows from the concept walk.
+
+    Named one by one, which is the cost of scoping it: something new the
+    reading comes to depend on has to be added here, and a whole-file hash
+    would have caught it for free.  The trade is deliberate — a guard that
+    fires on unrelated edits gets read as noise, and then it stops being
+    read at all.
+    """
+    global _READING_FINGERPRINT
+    if _READING_FINGERPRINT is None:
+        from chicory.layer4.wander import _CONCEPT_STOPWORDS
+
+        h = hashlib.sha256()
+        try:
+            h.update(inspect.getsource(TagContentAsymmetry).encode("utf-8"))
+        except (OSError, TypeError):    # pragma: no cover - frozen install
+            # No source to hash is not a reason to refuse to run; it only
+            # means a code change cannot reopen the guard on this install.
+            h.update(b"nosource")
+        h.update(_TERM_RE.pattern.encode("utf-8"))
+        h.update(" ".join(sorted(_CONCEPT_STOPWORDS)).encode("utf-8"))
+        _READING_FINGERPRINT = h.hexdigest()[:12]
+    return _READING_FINGERPRINT

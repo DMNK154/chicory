@@ -657,6 +657,24 @@ class TestTagContent:
             "nothing is withdrawn twice"
         )
 
+    def test_the_stamp_moves_when_a_cut_moves_and_not_otherwise(self, stack):
+        """966 readings turn on this stamp, so it has to move when anything
+        deciding the sample does — and it has to sit still when nothing
+        does, because a withdrawal costs a lap of the tags domain to earn
+        back."""
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        checker = TagContentAsymmetry(stack["config"], stack["db"])
+        before = checker.sampling_basis()
+        assert checker.sampling_basis() == before
+
+        stack["config"].tag_content_pool_factor += 1
+        after = checker.sampling_basis()
+        assert after != before
+        assert after.split(".")[1] == before.split(".")[1], (
+            "the two halves are separate so a reader can see which moved, "
+            "and no code changed here"
+        )
+
     def test_the_walk_brings_a_withdrawn_reading_back(self, stack):
         """A withdrawal says the reading was taken over the wrong material,
         not that the tag has no subject. `plato` still yields socrates when
