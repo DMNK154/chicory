@@ -105,6 +105,45 @@ verse portion chapter section page volume english aramaic hebrew
 """.split())
 
 
+# A word ending in ח or ע carrying a FURTIVE PATACH — the vowel Hebrew
+# writes under a final guttural — comes out of this edition's PDF with
+# that guttural first, the line break behind it, and the rest of the word
+# after.  See `_unrotate`.
+_FURTIVE = re.compile(r"^([\u05d7\u05e2]\u05b7)\s*\n(.+)$", re.S)
+
+
+def _unrotate(piece: str) -> str:
+    """Undo the facing edition's line-broken furtive-patach words.
+
+    `יְהוֹשֻׁעַ` is stored as ``'עַ\nְַיהֹוֻׁש'`` — ע plus its patach, a
+    newline, then the rest — and reads out as `עיהוש`.  Measured on the
+    live library: 3,766 occurrences, every one in the twelve HOLY ZOHAR
+    volumes, recovering רוח 703 times, נח 167, רקיע 140, מזבח 116,
+    יהושע 97, ריח 90, כח 72, משיח 70, שומע 40, יודע 37.
+
+    Only ח and ע, because only they carry it here.  Judged against a
+    96,955-token control built from the two Hebrew editions that have no
+    zero-width separator (split those on whitespace; splitting them on
+    the separator yields one token per chunk and no control at all): ח
+    repairs 156 words against 122 it would break, ע 226 against 106.  ה
+    is EXCLUDED on the same evidence — 27 occurrences, 0 repaired and 3
+    broken — so the class is measured rather than derived from the
+    grammar, which would have admitted it.
+
+    Deliberately narrow.  "Swap whenever a piece holds a newline" is
+    false: over 17,552 such pieces the stored form is the attested one by
+    1,889 to 414.  The furtive patach is what separates a word the
+    extractor rotated from a line break that did no harm.
+    """
+    m = _FURTIVE.match(piece)
+    if m is None:
+        return piece
+    lead, rest = m.group(1), m.group(2)
+    if not any(_CONSONANT_MIN <= ch <= _CONSONANT_MAX for ch in rest):
+        return piece                      # nothing to put in front of it
+    return rest + lead
+
+
 def hebrew_words(text: str) -> list[str]:
     """Consonantal skeletons, in order.
 
@@ -112,11 +151,17 @@ def hebrew_words(text: str) -> list[str]:
     whitespace instead shreds every word into letters, which is why a
     naive scan finds גבורה three times in a corpus that contains it 213
     times.
+
+    Repairs the facing edition's rotated furtive-patach words on the way
+    through — see `_unrotate`.  This is the only place anything in the
+    package tokenises Hebrew, so it is the only place the repair has to
+    live.
     """
     out: list[str] = []
     for piece in text.split(_WORD_SEP):
         skeleton = "".join(
-            ch for ch in piece if _CONSONANT_MIN <= ch <= _CONSONANT_MAX
+            ch for ch in _unrotate(piece)
+            if _CONSONANT_MIN <= ch <= _CONSONANT_MAX
         )
         if skeleton:
             out.append(skeleton)

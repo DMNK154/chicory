@@ -678,3 +678,63 @@ class TestBuildGuardTracksItsDefinition:
         assert not armed.endswith(_lexicon_definition(stack["config"])), (
             "a changed cut must not match the armed marker"
         )
+
+
+class TestFurtivePatachRotation:
+    """The facing edition rotates a line-broken furtive-patach word.
+
+    Hebrew writes a patach under a word-final ח or ע — the furtive
+    patach. When such a word is broken across a PDF line this edition
+    emits that guttural FIRST, the break behind it, then the rest, so
+    `יְהוֹשֻׁעַ` reads out as `עיהוש`. Measured on the live library: 3,766
+    occurrences, all twelve HOLY ZOHAR volumes, recovering רוח 703 times,
+    רקיע 140, יהושע 97, משיח 70.
+
+    The repair belongs here because `hebrew_words` is the only place
+    anything in the package tokenises Hebrew.
+    """
+
+    PATACH = "\u05b7"
+
+    def _rotated(self, guttural, rest):
+        """As the extractor emits it: guttural, its patach, break, rest."""
+        return guttural + self.PATACH + "\n" + rest
+
+    def test_it_recovers_the_word(self):
+        assert hebrew_words(self._rotated("ע", "יהוש")) == ["יהושע"]
+        assert hebrew_words(self._rotated("ח", "רו")) == ["רוח"]
+        assert hebrew_words(self._rotated("ע", "רקי")) == ["רקיע"]
+
+    def test_it_survives_the_interleaved_points(self):
+        """Real text carries niqqud, and the marks after the break are
+        orphaned from their consonants — the skeleton ignores them."""
+        piece = "עַ\n\u05b0\u05b7יה\u05b9ו\u05c1\u05bbש"
+        assert hebrew_words(piece) == ["יהושע"]
+
+    def test_a_break_without_the_patach_is_left_alone(self):
+        """The patach is the whole signal. Over 17,552 newline-bearing
+        pieces the stored form is the attested one by 1,889 to 414, so a
+        rule that swapped on the break alone would do more harm."""
+        assert hebrew_words("ע\nיהוש") == ["עיהוש"]
+
+    def test_a_patach_without_a_break_is_left_alone(self):
+        assert hebrew_words("ע" + self.PATACH + "יהוש") == ["עיהוש"]
+
+    def test_he_is_excluded(self):
+        """Grammar would admit ה with mappiq; the corpus does not. 27
+        occurrences, 0 repaired and 3 broken, so it stays out."""
+        assert hebrew_words(self._rotated("ה", "אלו")) == ["האלו"]
+
+    def test_a_guttural_with_nothing_behind_it_is_left_alone(self):
+        assert hebrew_words(self._rotated("ע", "   ")) == ["ע"]
+
+    def test_only_the_leading_position_counts(self):
+        """The rotation puts the guttural at the FRONT of the piece; a
+        patach-bearing ח in the middle is ordinary text."""
+        assert hebrew_words("רו" + "ח" + self.PATACH + "\nמ") == ["רוחמ"]
+
+    def test_it_reaches_the_share_gate_too(self):
+        """hebrew_share counts through hebrew_words, so a repaired chunk
+        is measured on its real vocabulary."""
+        piece = ZWSP.join([self._rotated("ח", "רו"), "אמר"])
+        assert set(hebrew_words(piece)) == {"רוח", "אמר"}
