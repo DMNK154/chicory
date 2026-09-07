@@ -476,6 +476,29 @@ class TagContentAsymmetry:
     every tag's memories at once is millions of chunk reads.  The baseline
     is sampled once per batch: a rate estimated from a few thousand chunks
     is precise enough to say whether a term is distinctive.
+
+    And the tag's own reading has to be a SAMPLE.  A bare ``LIMIT 400``
+    over the tag join returns rows in ``memory_tags`` insertion order,
+    which is ingest order, so a tag is profiled from whichever document
+    arrived under it first: 399 of `zohar`'s 400 rows came from
+    ``A_River_Flows_from_Eden`` — scholarship about the Zohar, not the
+    Zohar — and all 400 of `life`'s from one book of its 267.
+
+    That is not a smaller reading of the same thing, it is a reading of a
+    different thing.  Scored as shipped, `zohar` is about ``zohar, rabbi,
+    torah, shim, companions, matt``; scored over a sample spread across
+    its nineteen documents it is about ``parashat, rabbi, hashem, kudsha,
+    berikh, bereshit``, and the two lists agree on three terms.
+
+    And the answer it took away is worth more than the one it gave.
+    `life` as shipped is about ``reflection, magician, whitcomb, bill`` —
+    the vocabulary of The Magician's Reflection, 400 of its 400 rows —
+    where a sample spread over 184 of its documents finds nothing
+    whatever.  `philosophy` was ``hence``, 342 rows of Origin of Species;
+    `spirituality` was ``consciousness, love, self``, 326 rows of one book
+    of its 34.  All three are contentless catch-alls, which is the finding
+    this pass exists to make, and all three were on the record as
+    subjects.
     """
 
     def __init__(self, config, db) -> None:
@@ -508,26 +531,172 @@ class TagContentAsymmetry:
             self._baseline = (counts, max(seen, 1))
         return self._baseline
 
+    def sampling_basis(self) -> str:
+        """A fingerprint of how a reading's sample was drawn.
+
+        Carried on every observation so a finding taken from one sample
+        can be told from a finding taken from another — the cuts, and the
+        module that draws the sample.  Same argument as
+        ``_asymmetry_definition``, and here it is the whole argument: the
+        shipped reading of `life` was right about every threshold it
+        applied and wrong about which memories it applied them to, and not
+        one config value moved when that was fixed.
+
+        Costs one file read per process.
+        """
+        from chicory.layer4.wander import _module_fingerprint
+
+        payload = json.dumps([
+            self._config.tag_content_sample,
+            self._config.tag_content_pool_factor,
+            self._config.tag_content_baseline_sample,
+            self._config.tag_content_min_rate,
+            self._config.tag_content_lift,
+        ], sort_keys=True, default=str)
+        cuts = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+        return f"{cuts}.{_module_fingerprint('chicory.layer4.asymmetry')}"
+
+    def withdraw_stale(self) -> int:
+        """Retract readings drawn from a sample that no longer stands.
+
+        Refreshing them is not enough.  The walk reaches a tag once per
+        lap, and a tag it no longer profiles — one that has fallen under
+        the floor, or been merged away — it never reaches again, so a
+        stale reading stands indefinitely over material nobody read.  966
+        rows were in that state when the sample was fixed, each naming a
+        subject taken from whichever document was ingested first under the
+        tag.
+
+        A row comes back on its own when the walk next reaches its tag:
+        ``observe`` revives a machine withdrawal and counts the revival.
+        """
+        basis = self.sampling_basis()
+        stale: list[tuple[str, int]] = []
+        for row in self._db.execute(
+            "SELECT id, data FROM patrol_observations "
+            "WHERE kind = 'tag_content' AND retracted = 0"
+        ):
+            try:
+                data = json.loads(row["data"] or "{}")
+            except (ValueError, TypeError):
+                data = {}
+            was = data.get("sampling")
+            if was == basis:
+                continue
+            stale.append((
+                f"the sample behind it was drawn differently "
+                f"(under {was}, now {basis})" if was else
+                "it was profiled from whichever document was ingested "
+                "first under the tag, not from the tag's material",
+                row["id"]))
+        for why, obs_id in stale:
+            self._db.execute(
+                "UPDATE patrol_observations SET retracted = 1, "
+                "retracted_by = 'patrol:tag_content', "
+                "detail = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') "
+                "WHERE id = ?", (f"withdrawn: {why}", obs_id))
+        return len(stale)
+
+    def _sample(self, tag_id: int) -> tuple[list[str], int, int, int]:
+        """The tag's material, spread over the documents it was filed from.
+
+        Two stages, because neither half is affordable alone.  Capping
+        rows per document needs each candidate's ``source_path``, and
+        reading that for every row a large tag holds costs 3.28s on
+        `zohar`'s 26,360 — forty times the whole reading it replaces.  So
+        the candidates come from ``memory_tags``, whose rows carry no
+        content to step over (0.20s); a stride over their sorted ids takes
+        a pool of ten times the sample, ids being UUIDs and therefore
+        uncorrelated with ingest order — the property ``baseline``
+        already leans on; and only that pool pays for a document lookup.
+
+        The pool is proportional, so a big document still dominates it.
+        The cap is what makes the sample fair: one row per document per
+        pass, round robin, until the sample is full.  `zohar` lands on 19
+        documents rather than effectively one, its largest contributor
+        falling from 399 rows of 400 to 23; `life` on 184.  The whole
+        reading costs 0.43s and 0.39s against 0.07s for the one it
+        replaces — which is what reading one book instead of a library
+        was buying.
+
+        Returns the contents, how many documents they came from, how many
+        candidates were pooled, and the largest number any one document
+        contributed.
+        """
+        cfg = self._config
+        ids = [r["memory_id"] for r in self._db.execute(
+            "SELECT memory_id FROM memory_tags WHERE tag_id = ?", (tag_id,))]
+        # A floor on the tagged rows is a floor on the sample drawn from
+        # them, so this returns early without touching the memories table
+        # for the many tags that hold almost nothing.
+        if len(ids) < cfg.tag_content_min_memories:
+            return [], 0, 0, 0
+        ids.sort()
+
+        want = max(int(cfg.tag_content_sample), 1)
+        pool_size = max(want * max(int(cfg.tag_content_pool_factor), 1), want)
+        # Ceiling division, so the stride spans the whole id range rather
+        # than stopping short of its tail.
+        stride = max(1, -(-len(ids) // pool_size))
+        pool = ids[::stride]
+
+        lanes: dict[str, list[str]] = defaultdict(list)
+        for start in range(0, len(pool), _PATH_BATCH):
+            batch = pool[start:start + _PATH_BATCH]
+            ph = ",".join("?" * len(batch))
+            for row in self._db.execute(
+                f"SELECT id, source_path FROM memories "
+                f"WHERE id IN ({ph}) AND is_archived = 0", batch
+            ):
+                # Memories stored rather than ingested carry no path, and
+                # they share one lane: they are not a document that can
+                # crowd the others out.
+                lanes[row["source_path"] or ""].append(row["id"])
+        for lane in lanes.values():
+            lane.sort()
+
+        picked: list[str] = []
+        share: Counter = Counter()
+        order = sorted(lanes.items())
+        depth = 0
+        while order and len(picked) < want:
+            drew = False
+            for path, lane in order:
+                if depth >= len(lane):
+                    continue
+                picked.append(lane[depth])
+                share[path] += 1
+                drew = True
+                if len(picked) >= want:
+                    break
+            if not drew:
+                break
+            depth += 1
+
+        contents: list[str] = []
+        for start in range(0, len(picked), _PATH_BATCH):
+            batch = picked[start:start + _PATH_BATCH]
+            ph = ",".join("?" * len(batch))
+            contents.extend(
+                row["content"] or "" for row in self._db.execute(
+                    f"SELECT content FROM memories WHERE id IN ({ph})", batch))
+        return contents, len(share), len(pool), max(share.values(), default=0)
+
     def examine(self, tag_id: int, name: str) -> dict | None:
         """Whether this tag's memories share vocabulary the library lacks."""
         from chicory.layer4.wander import _CONCEPT_STOPWORDS
 
         cfg = self._config
         base, bn = self.baseline()
-        rows = self._db.execute(
-            "SELECT m.content FROM memories m "
-            "JOIN memory_tags mt ON mt.memory_id = m.id "
-            "WHERE mt.tag_id = ? AND m.is_archived = 0 LIMIT ?",
-            (tag_id, cfg.tag_content_sample),
-        ).fetchall()
-        if len(rows) < cfg.tag_content_min_memories:
+        contents, documents, pooled, widest = self._sample(tag_id)
+        if len(contents) < cfg.tag_content_min_memories:
             return None
         counts: Counter = Counter()
-        for r in rows:
-            for t in {x.lower() for x in _TERM_RE.findall(r["content"] or "")}:
+        for text in contents:
+            for t in {x.lower() for x in _TERM_RE.findall(text)}:
                 if t not in _CONCEPT_STOPWORDS:
                     counts[t] += 1
-        n = len(rows)
+        n = len(contents)
         distinctive = []
         for term, k in counts.items():
             rate = k / n
@@ -539,6 +708,13 @@ class TagContentAsymmetry:
                                     "baseline": round(b, 4)})
         distinctive.sort(key=lambda d: -d["rate"])
         return {"tag": name, "tag_id": tag_id, "sampled": n,
+                # What the reading was taken over.  A subject drawn from
+                # one document of eighteen is an artefact of ingest order,
+                # and the shipped reading carried no field that would have
+                # shown that.
+                "documents_sampled": documents, "pooled": pooled,
+                "largest_document_share": round(widest / n, 4),
+                "sampling": self.sampling_basis(),
                 "distinctive": distinctive[:12],
                 # Does the tag name itself turn up in what its material is
                 # about?  Absent is not a fault — `mysticism` is a real

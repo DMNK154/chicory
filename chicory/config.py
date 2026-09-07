@@ -711,6 +711,15 @@ class ChicoryConfig(BaseModel):
     # yield nothing whatever.
     tag_content_baseline_sample: int = Field(default=3000)
     tag_content_sample: int = Field(default=400)
+    # How many candidates that sample is drawn FROM.  A tag's rows come
+    # back in ingest order, so a bare LIMIT reads one document: 399 of
+    # `zohar`'s 400 came from one book of its eighteen, and all 400 of
+    # `life`'s from one of its 267.  The pool is a stride over sorted ids,
+    # which are UUIDs and so uncorrelated with ingest order, and the
+    # per-document cap is applied inside it — this is how much room that
+    # cap has to work in.  Ten measured 0.43s on `zohar` against 0.07s
+    # for the reading it replaces, and 3.28s for capping with no pool.
+    tag_content_pool_factor: int = Field(default=10)
     tag_content_min_memories: int = Field(default=25)
     # A term has to be this common in the tag's material...
     tag_content_min_rate: float = Field(default=0.15)

@@ -1098,6 +1098,11 @@ _ACCUMULATING_KEYS = frozenset({"mentions"})
 _STAMP_KEYS = frozenset({
     "left_documents", "right_documents", "duplicates_excluded",
     "unresolved_registry_entries", "basis",
+    # tag_content's stamp, and the case the hazard above describes
+    # exactly: a reading is withdrawn when the sample it was drawn from
+    # stops standing, and the withdrawn row keeps its old `sampling`
+    # until the walk reaches that tag again.
+    "sampling",
 })
 
 # Observation kinds anchored on a tag, and therefore invalidated when that
@@ -2379,6 +2384,12 @@ def _tag_content(
     Records both outcomes.  A tag with no distinctive vocabulary is not
     necessarily wrong — it may be a genuine catch-all — but it cannot be
     routed to, and nothing else in the system notices that.
+
+    Which is why the sample has to reach every document the tag was filed
+    from.  Read in ingest order, `life` yielded `reflection, magician,
+    whitcomb` — one book of the 267 it spans — so the one tag in that
+    sweep that WAS a contentless catch-all was recorded as a subject, and
+    the finding this pass exists to make was the finding it lost.
     """
     from chicory.layer4.asymmetry import TagContentAsymmetry
 
@@ -2393,9 +2404,18 @@ def _tag_content(
         f"SELECT id, name FROM tags WHERE id IN ({ph}) AND is_active = 1 "
         f"AND LENGTH(name) > 1", tuple(ids),
     ).fetchall()
-    if not rows:
-        return verdicts
     checker = TagContentAsymmetry(config, db)
+    # Withdraw before reading.  A standing reading drawn from a sample
+    # that no longer stands is a claim about material nobody profiled,
+    # and the walk will not reach its tag for a lap — or ever, if the
+    # tag has since fallen under the floor or been merged away.
+    withdrawn = checker.withdraw_stale()
+    if withdrawn:
+        _log.info("tag_content withdrew %d reading(s) drawn from a sample "
+                  "that no longer stands", withdrawn)
+    if not rows:
+        db.connection.commit()
+        return verdicts
     for r in rows:
         if should_stop is not None and should_stop():
             break
@@ -2410,7 +2430,11 @@ def _tag_content(
             top = ", ".join(d["term"] for d in found["distinctive"][:5])
             patrol.observe(
                 errand="tag_content", kind="tag_content", subject=r["name"],
-                detail=f"its material is about: {top}",
+                detail=(
+                    f"its material is about: {top} — read over "
+                    f"{found['sampled']} memories from "
+                    f"{found['documents_sampled']} of its documents"
+                ),
                 weight=round(1.0 / (1.0 + len(found["distinctive"])), 6),
                 data=found, lap=state.lap,
             )
@@ -2419,9 +2443,11 @@ def _tag_content(
             patrol.observe(
                 errand="tag_content", kind="tag_content", subject=r["name"],
                 detail=(
-                    f"{found['sampled']} memories carry this tag and share no "
-                    f"vocabulary the library does not — it labels material "
-                    f"without naming a subject, so nothing can be routed to it"
+                    f"{found['sampled']} memories carry this tag, drawn from "
+                    f"{found['documents_sampled']} of its documents, and they "
+                    f"share no vocabulary the library does not — it labels "
+                    f"material without naming a subject, so nothing can be "
+                    f"routed to it"
                 ),
                 weight=1.0, data=found, lap=state.lap,
             )

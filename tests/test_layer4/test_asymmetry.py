@@ -573,6 +573,125 @@ class TestTagContent:
         assert got["distinctive"], "it has a subject even without its own name"
         assert got["names_itself"] is False
 
+    def test_a_tag_spanning_many_documents_is_not_read_from_one_of_them(
+            self, stack):
+        """`zohar` holds 26,360 memories over eighteen documents and 399 of
+        its 400 sampled rows came from one: A_River_Flows_from_Eden, the
+        scholarship about the Zohar rather than the Zohar. The join returns
+        rows in memory_tags insertion order, so a tag is profiled from
+        whichever document was ingested under it first."""
+        db = stack["db"]
+        cfg = stack["config"]
+        # Big enough that neither vocabulary below reaches the baseline's
+        # middle-by-id window, which is what makes them distinctive at all.
+        self._library(db, n=500)
+        tid = db.execute("INSERT INTO tags (name) VALUES ('spanning')").lastrowid
+
+        def file(mid, path, text, count, start=0):
+            for i in range(start, start + count):
+                _mem(db, f"{mid}{i}", path, f"{text} {i}")
+                db.execute("INSERT INTO memory_tags (memory_id, tag_id, "
+                           "assigned_by) VALUES (?, ?, 'test')", (f"{mid}{i}", tid))
+
+        # The crowder is filed first and holds as much as all the rest.
+        file("one", "one.pdf", "Amsterdam and Antwerp again", 120)
+        for d in range(20):
+            file(f"many{d:02d}_", f"many{d:02d}.pdf", "Socrates asked Glaucon", 6)
+        db.connection.commit()
+
+        first = db.execute(
+            "SELECT m.source_path AS src FROM memories m "
+            "JOIN memory_tags mt ON mt.memory_id = m.id "
+            "WHERE mt.tag_id = ? AND m.is_archived = 0 LIMIT ?",
+            (tid, cfg.tag_content_sample)).fetchall()
+        assert {r["src"] for r in first} == {"one.pdf"}, (
+            "the fixture has to reproduce the trap or the test proves nothing"
+        )
+
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        got = TagContentAsymmetry(cfg, db).examine(tid, "spanning")
+        terms = {d["term"] for d in got["distinctive"]}
+        assert "socrates" in terms and "glaucon" in terms, (
+            "twenty of the tag's twenty-one documents say so, and the "
+            "reading never reached them"
+        )
+        assert "amsterdam" not in terms, (
+            "one document of twenty-one is not what the tag is about"
+        )
+        assert got["documents_sampled"] == 21
+        assert got["largest_document_share"] <= 0.05
+
+    def test_a_reading_from_a_sample_that_no_longer_stands_is_withdrawn(
+            self, stack):
+        """966 rows were standing when the sample was fixed. Refreshing
+        them on the next visit is not enough: the walk reaches a tag once
+        a lap, and a tag it no longer profiles — one under the floor, or
+        merged away — it never reaches again."""
+        db = stack["db"]
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        checker = TagContentAsymmetry(stack["config"], db)
+        stack["patrol"].observe(
+            errand="tag_content", kind="tag_content", subject="life",
+            detail="its material is about: reflection, magician, whitcomb",
+            data={"distinctive": [{"term": "reflection"}]}, lap=0)
+        stack["patrol"].observe(
+            errand="tag_content", kind="tag_content", subject="plato",
+            detail="its material is about: socrates",
+            data={"distinctive": [{"term": "socrates"}],
+                  "sampling": checker.sampling_basis()}, lap=0)
+        db.connection.commit()
+
+        assert checker.withdraw_stale() == 1
+        rows = {r["subject"]: r for r in db.execute(
+            "SELECT subject, retracted, retracted_by, detail FROM "
+            "patrol_observations WHERE kind = 'tag_content'")}
+        assert rows["life"]["retracted"] == 1
+        assert rows["life"]["retracted_by"] == "patrol:tag_content"
+        assert "ingested" in rows["life"]["detail"], (
+            "a withdrawal a reader cannot account for is a deletion"
+        )
+        assert rows["plato"]["retracted"] == 0, (
+            "a reading taken under the sample in force is not stale"
+        )
+        assert checker.withdraw_stale() == 0, (
+            "nothing is withdrawn twice"
+        )
+
+    def test_the_walk_brings_a_withdrawn_reading_back(self, stack):
+        """A withdrawal says the reading was taken over the wrong material,
+        not that the tag has no subject. `plato` still yields socrates when
+        it is read again — and the row records that it went and came back."""
+        db = stack["db"]
+        self._library(db)
+        tid = db.execute("INSERT INTO tags (name) VALUES ('plato')").lastrowid
+        for i in range(30):
+            _mem(db, f"p{i}", "rep.pdf", f"Socrates asked Glaucon in Republic {i}")
+            db.execute("INSERT INTO memory_tags (memory_id, tag_id, assigned_by) "
+                       "VALUES (?, ?, 'test')", (f"p{i}", tid))
+        stack["patrol"].observe(
+            errand="tag_content", kind="tag_content", subject="plato",
+            detail="its material is about: whatever arrived first",
+            data={"distinctive": [{"term": "whatever"}]}, lap=0)
+        db.connection.commit()
+
+        from chicory.layer4.asymmetry import TagContentAsymmetry
+        checker = TagContentAsymmetry(stack["config"], db)
+        assert checker.withdraw_stale() == 1
+        got = checker.examine(tid, "plato")
+        stack["patrol"].observe(
+            errand="tag_content", kind="tag_content", subject="plato",
+            detail="its material is about: socrates", data=got, lap=1)
+        db.connection.commit()
+
+        row = db.execute(
+            "SELECT retracted, revived_count, data FROM patrol_observations "
+            "WHERE kind = 'tag_content' AND subject = 'plato'").fetchone()
+        assert row["retracted"] == 0
+        assert row["revived_count"] == 1
+        assert json.loads(row["data"])["sampling"] == checker.sampling_basis(), (
+            "the stamp is the newer reading's, never the withdrawn one's"
+        )
+
     def test_too_few_memories_is_no_finding(self, stack):
         db = stack["db"]
         self._library(db)
