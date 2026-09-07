@@ -21,6 +21,8 @@ from chicory.db.engine import DatabaseEngine
 from chicory.db.schema import apply_schema
 from chicory.layer4.wander import (
     ERRANDS,
+    _asymmetry_definition,
+    _lexicon_definition,
     Errand,
     Heartbeat,
     Patrol,
@@ -1202,3 +1204,95 @@ class TestPopulationIsIndexAnswerable:
         assert offenders == [], (
             f"population reads content with no index behind it: {offenders}"
         )
+
+
+class TestGuardsNoticeCodeChanges:
+    """A build guard must reopen when the CODE that decides its output
+    changes, not only when a threshold does.
+
+    Measured gap, not a hypothetical: f091183 taught `hebrew_words` to
+    un-rotate the facing edition's furtive-patach words — `עיהוש` back to
+    `יהושע` — and `_lexicon_definition`, hashing only the six numeric
+    cuts, went on skipping. The library kept serving the damaged lexicon
+    after the fix had shipped and the servers had been restarted, until
+    the laps were driven by hand.
+    """
+
+    def _fresh(self):
+        from chicory.config import ChicoryConfig
+        return ChicoryConfig(db_path=Path(":memory:"), anthropic_api_key="t",
+                             llm_model="m", embedding_model="mock")
+
+    def test_the_marker_names_both_halves(self):
+        """Kept separate so a reader can see which one moved."""
+        cfg = self._fresh()
+        for fp in (_lexicon_definition(cfg), _asymmetry_definition(cfg)):
+            declared, _, source = fp.partition(".")
+            assert declared and source, fp
+            assert declared != source
+
+    def test_a_source_edit_changes_the_fingerprint(self):
+        """The property that was missing. Written against a real module on
+        disk, because the mechanism is a file read."""
+        import importlib.util, shutil, sys, tempfile
+        from pathlib import Path as _P
+        import chicory.layer4.wander as w
+        tmp = _P(tempfile.mkdtemp())
+        mod = tmp / "probe_module.py"
+        mod.write_text("VALUE = 1\n", encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("probe_module", mod)
+        sys.modules["probe_module"] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sys.modules["probe_module"])
+        try:
+            w._MODULE_FINGERPRINTS.clear()
+            before = w._module_fingerprint("probe_module")
+            mod.write_text("VALUE = 2\n", encoding="utf-8")
+            w._MODULE_FINGERPRINTS.clear()
+            after = w._module_fingerprint("probe_module")
+            assert before != after, "a code change left the fingerprint alone"
+            assert before != "nosource" and after != "nosource"
+        finally:
+            sys.modules.pop("probe_module", None)
+            w._MODULE_FINGERPRINTS.clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_comment_only_edit_also_re_derives(self):
+        """Accepted cost of hashing whole source rather than bytecode.
+        It buys catching a module-level constant, which `co_code` cannot
+        see because functions reach those by name. One extra pass, since
+        the fingerprint sits inside a marker that is per-lap."""
+        import importlib.util, shutil, sys, tempfile
+        from pathlib import Path as _P
+        import chicory.layer4.wander as w
+        tmp = _P(tempfile.mkdtemp())
+        mod = tmp / "probe_c.py"
+        mod.write_text("VALUE = 1\n", encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("probe_c", mod)
+        sys.modules["probe_c"] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sys.modules["probe_c"])
+        try:
+            w._MODULE_FINGERPRINTS.clear()
+            before = w._module_fingerprint("probe_c")
+            mod.write_text("# a note\nVALUE = 1\n", encoding="utf-8")
+            w._MODULE_FINGERPRINTS.clear()
+            assert w._module_fingerprint("probe_c") != before
+        finally:
+            sys.modules.pop("probe_c", None)
+            w._MODULE_FINGERPRINTS.clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_it_is_cached_per_process(self):
+        """One file read per process; a running process cannot edit its
+        own source."""
+        import chicory.layer4.wander as w
+        w._MODULE_FINGERPRINTS.clear()
+        first = w._module_fingerprint("chicory.layer4.bilingual")
+        assert "chicory.layer4.bilingual" in w._MODULE_FINGERPRINTS
+        assert w._module_fingerprint("chicory.layer4.bilingual") == first
+
+    def test_an_unreadable_module_does_not_stop_the_errand(self):
+        """No source to hash means a code change cannot reopen the guard
+        on that install — not that the errand refuses to run."""
+        import chicory.layer4.wander as w
+        w._MODULE_FINGERPRINTS.clear()
+        assert w._module_fingerprint("chicory.layer4.no_such_module") == "nosource"

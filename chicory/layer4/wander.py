@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 import os
 import re
 import socket
@@ -1081,6 +1082,10 @@ _CONCEPT_RE = re.compile(r"\b([A-Z][a-zA-Z]{4,})\b")
 # a field that genuinely counts occurrences over the whole corpus belongs
 # here, because a walk sees one batch at a time and cannot total such a
 # thing any other way.
+# Source hashes of the modules that decide an errand's output, one
+# read per process.  See _module_fingerprint.
+_MODULE_FINGERPRINTS: dict[str, str] = {}
+
 _ACCUMULATING_KEYS = frozenset({"mentions"})
 
 # Keys that stamp WHICH definition a measurement was taken under, rather
@@ -2155,6 +2160,48 @@ register(Errand(
 ))
 
 
+def _module_fingerprint(dotted: str) -> str:
+    """A hash of the source of the module that decides an errand's output.
+
+    The config fingerprints below reopen a build guard when an AUTHOR
+    edits a threshold.  They do not notice a code change, and that gap is
+    not hypothetical: f091183 taught `hebrew_words` to un-rotate this
+    edition's furtive-patach words — `עיהוש` back to `יהושע` — and the
+    guard, hashing only the six numeric cuts, went on skipping.  The
+    library kept serving the damaged lexicon after the fix had shipped
+    and the servers had been restarted, until the laps were driven by
+    hand.
+
+    Whole source rather than bytecode, deliberately.  Hashing `co_code`
+    would ignore comments and docstrings, but it also ignores every
+    module-level constant a function reaches by name — `MIN_SKELETON`,
+    `PREFIX_LETTERS`, `_FURTIVE` — so it would have missed exactly the
+    kind of edit this is meant to catch.  The cost of the coarser hash is
+    that a comment-only change also re-derives, and that is one build:
+    the fingerprint is folded into a marker that is per-lap, so an
+    over-trigger costs a single pass, not a pass per batch.
+
+    Cached per process, because a running process does not edit its own
+    source.
+    """
+    import hashlib
+    import importlib
+
+    cached = _MODULE_FINGERPRINTS.get(dotted)
+    if cached is not None:
+        return cached
+    try:
+        path = importlib.import_module(dotted).__file__
+        raw = pathlib.Path(path).read_bytes() if path else b""
+    except Exception:          # pragma: no cover - frozen or namespace pkg
+        # No source to hash is not a reason to refuse to run; it only
+        # means a code change cannot reopen the guard on this install.
+        raw = b""
+    fp = hashlib.sha256(raw).hexdigest()[:12] if raw else "nosource"
+    _MODULE_FINGERPRINTS[dotted] = fp
+    return fp
+
+
 def _lexicon_definition(config: ChicoryConfig) -> str:
     """A fingerprint of the cuts the lexicon is built with.
 
@@ -2165,7 +2212,12 @@ def _lexicon_definition(config: ChicoryConfig) -> str:
     serving a lexicon built under the old cuts — fragments included,
     `מצרים` filed as `צרים` — for as long as it took the cursor to wrap.
 
-    Config only, so it costs no query.  New MATERIAL still waits for the
+    The cuts AND the code that applies them — `bilingual` is where the
+    fold, the gates and the tokeniser live, so a change to any of them
+    has to re-derive just as an edited threshold does.  The two halves
+    are kept separate in the marker so a reader can see which moved.
+
+    Costs one file read per process.  New MATERIAL still waits for the
     lap, which is right: that is a corpus change, not an author's.
     """
     import hashlib
@@ -2175,7 +2227,8 @@ def _lexicon_definition(config: ChicoryConfig) -> str:
         config.bilingual_min_dice, config.bilingual_ubiquity_max,
         config.bilingual_max_forms_per_term, config.bilingual_min_hebrew_share,
     ], sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    cuts = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    return f"{cuts}.{_module_fingerprint('chicory.layer4.bilingual')}"
 
 
 def _asymmetry_definition(config: ChicoryConfig) -> str:
@@ -2201,7 +2254,11 @@ def _asymmetry_definition(config: ChicoryConfig) -> str:
         [config.asymmetry_pairs, config.corpus_documents],
         sort_keys=True, default=str,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    declared = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    # And the module that decides what the declaration MEANS — the
+    # registry, the bearing-chunk rule, the profiler.  Same argument as
+    # the lexicon's: an author's edit to any of them must re-derive.
+    return f"{declared}.{_module_fingerprint('chicory.layer4.asymmetry')}"
 
 
 def _unstamped_asymmetries(db: DatabaseEngine) -> bool:
