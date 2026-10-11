@@ -680,14 +680,17 @@ class EpisodicTensor:
         return pruned
 
     def _decay_inactive(self) -> int:
-        """Transition edges to 'decaying' if not activated within the decay window."""
+        """Transition edges to 'decaying' if not activated within the decay window.
+
+        An edge that was never activated is aged from when it was created,
+        not treated as infinitely old.
+        """
         hours = self._cfg.episodic_decay_inactive_hours
         cursor = self._db.execute(
             """UPDATE memory_relational_tensor SET edge_status = 'decaying'
                WHERE edge_status IN ('candidate', 'warm')
-                 AND (last_activated_at IS NULL
-                      OR last_activated_at < strftime('%%Y-%%m-%%dT%%H:%%M:%%f',
-                          'now', ? || ' hours'))""",
+                 AND COALESCE(last_activated_at, created_at)
+                     < strftime('%Y-%m-%dT%H:%M:%f', 'now', ? || ' hours')""",
             (f"-{hours}",),
         )
         decayed = cursor.rowcount
@@ -702,9 +705,8 @@ class EpisodicTensor:
         cursor = self._db.execute(
             """UPDATE memory_relational_tensor SET edge_status = 'archived'
                WHERE edge_status = 'decaying'
-                 AND (last_activated_at IS NULL
-                      OR last_activated_at < strftime('%%Y-%%m-%%dT%%H:%%M:%%f',
-                          'now', ? || ' hours'))""",
+                 AND COALESCE(last_activated_at, created_at)
+                     < strftime('%Y-%m-%dT%H:%M:%f', 'now', ? || ' hours')""",
             (f"-{hours}",),
         )
         archived = cursor.rowcount
