@@ -454,7 +454,8 @@ class TestTensorMerge:
         """A merge makes the surviving tag a new union: anti-association rows
         on either side are stale, and the next background pass must recount."""
         from chicory.layer3.lateral_inhibition import (
-            WATERMARK_KEY,
+            EVIDENCE_VERSION,
+            inhibition_due,
             load_watermark,
             save_watermark,
         )
@@ -478,9 +479,12 @@ class TestTensorMerge:
                 "VALUES (?, ?, 0.5, 0, 10.0)",
                 (min(a, b), max(a, b)),
             )
-        save_watermark(db, {"max_rowid": 6, "units": 3, "pairs": 3})
+        counted = {"max_rowid": 6, "units": 3, "pairs": 3,
+                   "evidence": EVIDENCE_VERSION, "id": "counted"}
+        save_watermark(db, counted)
         db.connection.commit()
-        assert load_watermark(db) is not None
+        assert load_watermark(db) == counted
+        assert not inhibition_due(db, 1e9)
 
         tags.merge_tags(src.id, tgt.id)
 
@@ -490,9 +494,11 @@ class TestTensorMerge:
         assert [(r["tag_a_id"], r["tag_b_id"]) for r in left] == [
             (min(rival.id, other.id), max(rival.id, other.id)),
         ]
-        assert db.execute(
-            "SELECT 1 FROM librarian_state WHERE key = ?", (WATERMARK_KEY,),
-        ).fetchone() is None
+        # A reset watermark, not a missing one: every process is due, and a
+        # plan counted against the old watermark sees it change.
+        reset = load_watermark(db)
+        assert reset["max_rowid"] == 0 and reset != counted
+        assert inhibition_due(db, 1e9)
 
         # The existing merge contract still holds.
         rows_after = _get_tensor_rows(db)

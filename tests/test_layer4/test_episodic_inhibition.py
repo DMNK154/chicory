@@ -1,8 +1,9 @@
 """Layer-4 readers of lateral inhibition.
 
 The episodic tensor shunts its tag projection by the anti-association
-between the two memories' tags (from tag_inhibition), and the meta
-analyzer's connectivity no longer subtracts the retired tensor column.
+between the two memories' tags (from tag_inhibition) — through bootstrap
+and update_on_store alike, pooled as a noisy-OR — and the meta analyzer's
+connectivity no longer subtracts the retired tensor column.
 """
 
 from __future__ import annotations
@@ -125,6 +126,113 @@ def test_eager_fields_shunt_tag_projection(stack):
     both = {"ma": [py, js, bug], "mb": [py, js, bug]}
     assert _eager(et, both, inhibition=True)["tag_inhibition_projected"] == (
         pytest.approx(0.5, rel=1e-12)
+    )
+
+
+@pytest.mark.parametrize("weight", [-2.0, -3.0, float("nan"), float("inf")])
+def test_bad_gain_reads_as_off(stack, weight):
+    # The weight is settable from the environment; a typo must not divide
+    # by zero, flip the projection's sign, or turn it into nan.
+    db, config, tags = stack["db"], stack["config"], stack["tags"]
+    py, js, bug = (tags.get_or_create(n).id for n in ("python", "javascript", "bug"))
+    _tensor_row(db, py, bug, cooccurrence_strength=0.2, glyph_strength=0.4)
+    _tensor_row(db, bug, js, semantic_strength=0.1, glyph_strength=0.6)
+    _inhibition_row(db, py, js, 0.5)
+    db.connection.commit()
+    config.tensor_inhibition_weight = weight
+
+    edge = _eager(EpisodicTensor(db, config), {"ma": [py, bug], "mb": [js, bug]},
+                  inhibition=True)
+
+    assert edge["tag_projected_strength"] == pytest.approx(0.65, rel=1e-12)
+
+
+def _stored(db, mid: str, tag_ids: list[int], episode: int | None) -> None:
+    """A memory with tags and a chunk-0 embedding.
+
+    Every memory gets the same vector, so each pair is a candidate edge
+    with semantic = 1.
+    """
+    db.execute(
+        "INSERT INTO memories (id, content, source_model) VALUES (?, ?, 'test')",
+        (mid, f"content of {mid}"),
+    )
+    db.execute(
+        "INSERT INTO embeddings (memory_id, chunk_index, embedding, model_name, dimension) "
+        "VALUES (?, 0, ?, 'mock', 8)",
+        (mid, np.ones(8, dtype=np.float32).tobytes()),
+    )
+    for tag_id in tag_ids:
+        db.execute(
+            "INSERT INTO memory_tags (memory_id, tag_id) VALUES (?, ?)", (mid, tag_id),
+        )
+    if episode is not None:
+        db.execute(
+            "INSERT INTO memory_episode_assignments (memory_id, episode_id) "
+            "VALUES (?, ?)", (mid, episode),
+        )
+
+
+def _edge_through(path: str, stack, mem_tags: dict[str, list[int]]) -> dict:
+    """Store the memories, build their edge the way `path` does, read it back."""
+    db, config = stack["db"], stack["config"]
+    episode = None
+    if path == "update_on_store":
+        episode = db.execute(
+            "INSERT INTO temporal_episodes (centroid) VALUES (?)",
+            (np.zeros(8, dtype=np.float32).tobytes(),),
+        ).lastrowid
+    for mid, tag_ids in mem_tags.items():
+        _stored(db, mid, tag_ids, episode)
+    db.connection.commit()
+
+    et = EpisodicTensor(db, config)
+    if path == "bootstrap":
+        et.bootstrap()
+    else:
+        assert et.update_on_store("mb") == 1
+    row = db.query_one(
+        "SELECT tag_projected_strength, tag_inhibition_projected "
+        "FROM memory_relational_tensor WHERE memory_a_id = 'ma' AND memory_b_id = 'mb'",
+    )
+    assert row is not None
+    return dict(row)
+
+
+@pytest.mark.parametrize("path", ["bootstrap", "update_on_store"])
+def test_stored_edges_are_shunted(stack, path):
+    db, tags = stack["db"], stack["tags"]
+    py, js, bug = (tags.get_or_create(n).id for n in ("python", "javascript", "bug"))
+    _tensor_row(db, py, bug, cooccurrence_strength=0.2, glyph_strength=0.4)
+    _tensor_row(db, bug, js, semantic_strength=0.1, glyph_strength=0.6)
+    _inhibition_row(db, py, js, 0.5)
+
+    edge = _edge_through(path, stack, {"ma": [py, bug], "mb": [js, bug]})
+
+    assert edge["tag_inhibition_projected"] == pytest.approx(0.5, rel=1e-12)
+    assert edge["tag_projected_strength"] == pytest.approx(
+        0.65 / (1 + 2 * 0.5), rel=1e-12,
+    )
+
+
+@pytest.mark.parametrize("path", ["bootstrap", "update_on_store"])
+def test_inhibitory_pairs_pool_as_noisy_or(stack, path):
+    # Two anti-associated cross pairs: a sum would give H = 0.9 and keep
+    # growing past 1 with more pairs; the noisy-OR gives 1 − 0.5·0.6.
+    db, tags = stack["db"], stack["tags"]
+    py, go, js, bug = (
+        tags.get_or_create(n).id for n in ("python", "golang", "javascript", "bug")
+    )
+    _tensor_row(db, py, bug, glyph_strength=0.4)
+    _inhibition_row(db, py, js, 0.5)
+    _inhibition_row(db, go, js, 0.4)
+
+    edge = _edge_through(path, stack, {"ma": [py, go], "mb": [js, bug]})
+
+    pooled = 1 - (1 - 0.5) * (1 - 0.4)
+    assert edge["tag_inhibition_projected"] == pytest.approx(pooled, rel=1e-12)
+    assert edge["tag_projected_strength"] == pytest.approx(
+        0.4 / (1 + 2 * pooled), rel=1e-12,
     )
 
 

@@ -297,7 +297,7 @@ I_e =
 Where:
 
 - `abs(Rel_i - Sem_j)` raises threshold when relevance and semantics disagree.
-- `local_opposition` comes from tensor inhibition and antiparallelness.
+- `local_opposition` comes from lateral inhibition (`tag_inhibition`, data-derived anti-association).
 - `collapse_risk` raises threshold when concepts are too likely to collapse prematurely.
 
 The important rule is that `I_e` lives between the lifted layers. It is not a relevance score and not a semantic score.
@@ -482,7 +482,7 @@ The canopy reads existing Chicory signals before adding new concepts:
 | Recurrence | retrieval events, observations, sync reinforcement | `R`, relevance lift |
 | Co-occurrence | memory tags, `tag_relational_tensor.cooccurrence_strength` | `Co`, semantic substrate |
 | Similarity | embeddings, tag centroids, semantic tensor strength | `S`, semantic lift |
-| Tensor inhibition | `tag_relational_tensor.inhibition_strength`, `parallelness` | cross-layer edge seed |
+| Lateral inhibition | `tag_inhibition.inhibition_strength` (data-derived anti-association) | cross-layer edge seed |
 | Centroid subtraction | `CentroidSubgraph.update_on_retrieval` | cross-layer edge evidence |
 | Synchronicity events | `synchronicity_events` | `R`, `B`, cross-layer edge evidence |
 | Meta-patterns | `meta_patterns` | `R`, `B`, cross-layer edge evidence |

@@ -1597,15 +1597,6 @@ class SynchronicityEngine:
         _cp["directed_in_out"] = _time.perf_counter() - _s
         _cp["n_directed_discoveries"] = len(directed_discoveries)
 
-        # ── Lateral inhibition: every active context tag divides the
-        # partners it competes with, edge or no edge.  After the directed
-        # merge, so a discovery cannot rescue a suppressed partner.
-        weights = context_weights if context_weights is not None else {t: 1.0 for t in tag_ids}
-        partner_scores, inhibition = apply_lateral_inhibition(
-            partner_scores, weights, self._inhibitor_index(weights.keys()),
-            effective_gain(self._config), floor=self._config.resonance_min_tensor_score)
-        _cp["n_inhibited"] = len(inhibition)
-
         if not partner_scores:
             self._last_partner_inhibition = {}
             return {}
@@ -1617,15 +1608,25 @@ class SynchronicityEngine:
         if associated:
             partner_scores = {p: s for p, s in partner_scores.items() if p in associated}
 
+        # ── Lateral inhibition: every active context tag divides the
+        # partners it competes with, edge or no edge.  After the directed
+        # merge, so a discovery cannot rescue a suppressed partner; after
+        # the gate, so membership is decided on excitation alone and
+        # inhibiting one partner can never open the gate to others.
+        weights = context_weights if context_weights is not None else {t: 1.0 for t in tag_ids}
+        partner_scores, inhibition = apply_lateral_inhibition(
+            partner_scores, weights, self._inhibitor_index(weights.keys()),
+            effective_gain(self._config))
+        _cp["n_inhibited"] = len(inhibition)
+
         _cp["n_partners_post_gate"] = len(partner_scores)
         _cp["total"] = _time.perf_counter() - _cp0
 
         import logging
         logging.getLogger("chicory.centroid_path").info("centroid_path_timing: %s", _cp)
 
-        self._last_partner_inhibition = {
-            p: h for p, h in inhibition.items() if p in partner_scores
-        }
+        # Division drops nothing, so H names only partners returned here.
+        self._last_partner_inhibition = inhibition
         return partner_scores
 
     def _episodic_path(self, seed_memory_ids: list[str]) -> dict[str, float]:
@@ -2461,14 +2462,6 @@ class SynchronicityEngine:
                 partner_scores[partner] = max(
                     partner_scores.get(partner, 0.0), score)
 
-        # Lateral inhibition from the active context; divisive, so it
-        # never drops a partner here.
-        weights = (context_weights if context_weights is not None
-                   else {t: 1.0 for t in context_tag_ids})
-        partner_scores, _ = apply_lateral_inhibition(
-            partner_scores, weights, self._inhibitor_index(weights.keys()),
-            effective_gain(self._config), floor=None)
-
         if not partner_scores:
             return []
 
@@ -2479,8 +2472,14 @@ class SynchronicityEngine:
         if associated:
             partner_scores = {p: s for p, s in partner_scores.items() if p in associated}
 
-        if not partner_scores:
-            return []
+        # Lateral inhibition from the active context, after the gate as in
+        # the centroid path: the gate sees excitation only, and division
+        # never drops a partner.
+        weights = (context_weights if context_weights is not None
+                   else {t: 1.0 for t in context_tag_ids})
+        partner_scores, _ = apply_lateral_inhibition(
+            partner_scores, weights, self._inhibitor_index(weights.keys()),
+            effective_gain(self._config))
 
         # Resolve partner tags → memory scores using candidate set
         memory_scores: dict[str, float] = {}

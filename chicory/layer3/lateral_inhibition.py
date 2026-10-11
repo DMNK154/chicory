@@ -13,7 +13,12 @@ What counts as evidence:
   - only memories a tagger tagged.  File ingest (content_hash set) tags by
     path, and its extension / directory tags are mutually exclusive by
     construction — counting them would inhibit cross-module associations;
-  - never temporal, single-letter or digit tags.
+  - only the tags a tagger chose (memory_tags.assigned_by 'llm' or a
+    librarian's author string), never the store's own 'system' rows: the
+    split words of a compound tag, which copy its incidence exactly, and
+    the temporal and letter tags;
+  - never temporal, single-letter or digit tags, by name as well, since a
+    tagger or librarian can still apply such a name itself.
 
 Pairs are selected by Benjamini-Hochberg at ``inhibition_fdr`` over every
 testable pair, and the strength is the FCR-adjusted Poisson lower bound on
@@ -36,6 +41,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
@@ -62,6 +68,10 @@ WRITE_TOLERANCE = 0.01       # |ΔI| below this is not worth a write
 CANDIDATE_BLOCK = 2_000_000  # candidate pairs tested per vectorised block
 FULL_LOAD_THRESHOLD = 5_000  # more context ids than this: load the whole table
 WATERMARK_KEY = "inhibition_watermark"
+# Bump when what counts as evidence changes: a watermark counted under an
+# older definition describes rows this code would not write, so it reads
+# as absent and the next pass recounts.  2: system-assigned rows excluded.
+EVIDENCE_VERSION = 2
 
 _ID_CHUNK = 500              # ids per IN (...) list; well under SQLite's variable cap
 
@@ -72,12 +82,16 @@ _UNITS_SQL = (
     "ORDER BY rowid LIMIT ?"
 )
 
-# Single-letter tags are dropped in SQL so they never reach Python at all;
-# they are a large share of memory_tags on a lattice-tagged store.
+# Single-letter tags and system rows are dropped in SQL so they never reach
+# Python at all; on a lattice-tagged store they are most of memory_tags.
+# A split word ('borrow' from 'borrow-checker') is a system row with exactly
+# its compound's incidence: counted, one anti-association would be selected
+# once per word and multiplied into the noisy-OR as independent evidence.
 _INCIDENCE_SQL = (
     "SELECT mt.rowid AS rid, m.rowid AS mrow, mt.tag_id FROM memory_tags mt "
     "JOIN memories m ON m.id = mt.memory_id JOIN tags t ON t.id = mt.tag_id "
     "WHERE mt.rowid > ? AND mt.rowid <= ? AND length(t.name) >= 2 "
+    "AND mt.assigned_by != 'system' "
     "ORDER BY mt.rowid LIMIT ?"
 )
 
@@ -115,8 +129,15 @@ def is_lexical_variant(a: str, b: str) -> bool:
 
 
 def effective_gain(config: ChicoryConfig) -> float:
-    """The shunting gain β, or 0 when inhibition is switched off."""
-    return config.tensor_inhibition_weight if config.inhibition_enabled else 0.0
+    """The shunting gain β, or 0 when inhibition is switched off.
+
+    A negative or non-finite weight (a typo in the environment) reads as
+    off: dividing by 1 + β·H would otherwise divide by zero or flip a sign.
+    """
+    gain = config.tensor_inhibition_weight
+    if not config.inhibition_enabled or not math.isfinite(gain) or gain <= 0.0:
+        return 0.0
+    return gain
 
 
 def poisson_upper(observed, confidence: float) -> np.ndarray:
@@ -177,12 +198,14 @@ def build_inhibitor_index(edges: Iterable) -> dict[int, dict[int, float]]:
 # ── Retrieval ───────────────────────────────────────────────────────────
 
 
-def apply_lateral_inhibition(excitation, context_weights, index, gain, floor=None):
+def apply_lateral_inhibition(excitation, context_weights, index, gain):
     """Shunting lateral inhibition: R_p = E_p / (1 + gain * H_p),
     H_p = 1 - prod_s (1 - a_s * I(s, p)) over active context tags s.
-    No tensor edge s-p is required.  Partners with no inhibitor in the
-    context are returned unchanged; with a floor only an inhibited partner
-    can be dropped.  Returns (scores, H) with H only for inhibited partners."""
+    No tensor edge s-p is required.  Divisive and never a prune: H ≤ 1, so
+    R_p / E_p ≥ 1 / (1 + gain) and every partner comes back — membership
+    (thresholds, gates) is the excitation's business, decided before this.
+    Partners with no inhibitor in the context are returned unchanged.
+    Returns (scores, H) with H only for inhibited partners."""
     if gain <= 0.0 or not excitation or not context_weights or not index:
         return dict(excitation), {}
     survival: dict[int, float] = {}
@@ -206,9 +229,7 @@ def apply_lateral_inhibition(excitation, context_weights, index, gain, floor=Non
             continue
         h = 1.0 - s
         H[p] = h
-        r = e / (1.0 + gain * h)
-        if floor is None or r >= floor:
-            out[p] = r
+        out[p] = e / (1.0 + gain * h)
     return out, H
 
 
@@ -246,12 +267,9 @@ def compute_tag_inhibition(
     def _result(edges: list) -> InhibitionComputation:
         stats["inhibitory_pairs"] = len(edges)
         stats["seconds"] = round(time.perf_counter() - started, 3)
-        return InhibitionComputation(edges=edges, stats=stats, watermark={
-            "max_rowid": max_rowid,
-            "units": stats["units"],
-            "pairs": len(edges),
-            "computed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
+        return InhibitionComputation(edges=edges, stats=stats, watermark=_watermark(
+            max_rowid, units=stats["units"], pairs=len(edges),
+        ))
 
     col: dict[int, int] = {}
     names: list[tuple[int, str]] = []
@@ -533,8 +551,28 @@ def load_inhibitor_index(
 # ── Watermark and gating ────────────────────────────────────────────────
 
 
+def _watermark(max_rowid: int, *, units: int, pairs: int) -> dict:
+    """A publication of the table, compared by identity rather than content.
+
+    Processes and queued plans decide "did anything change?" by equality,
+    and two recounts in one second can agree on every count; the id makes
+    each publication distinct.
+    """
+    return {
+        "max_rowid": max_rowid,
+        "units": units,
+        "pairs": pairs,
+        "computed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "evidence": EVIDENCE_VERSION,
+        "id": uuid.uuid4().hex,
+    }
+
+
 def load_watermark(db: DatabaseEngine) -> dict | None:
-    """The last persisted computation's snapshot, or None if absent or unreadable."""
+    """The last persisted computation's snapshot, or None if absent or unreadable.
+
+    A watermark from an older EVIDENCE_VERSION is treated as absent.
+    """
     row = db.query_one(
         "SELECT value FROM librarian_state WHERE key = ?", (WATERMARK_KEY,),
     )
@@ -545,6 +583,8 @@ def load_watermark(db: DatabaseEngine) -> dict | None:
     except (TypeError, ValueError):
         return None
     if not isinstance(wm, dict) or not isinstance(wm.get("max_rowid"), int):
+        return None
+    if wm.get("evidence") != EVIDENCE_VERSION:
         return None
     return wm
 
@@ -573,11 +613,14 @@ def inhibition_due(db: DatabaseEngine, growth: float) -> bool:
 
 
 def forget_tag_inhibition(db: DatabaseEngine, tag_ids: Iterable[int]) -> None:
-    """Drop rows touching `tag_ids` and the watermark, so the next pass recounts.
+    """Drop rows touching `tag_ids` and reset the watermark, so the next pass recounts.
 
     For a merge: the surviving tag's statistics are a new union, so no row
-    on either side still describes it.  Does not commit — it runs inside
-    the caller's transaction.
+    on either side still describes it.  The watermark is replaced rather
+    than deleted: one at max_rowid 0 makes every process due, and as a new
+    publication it is visible to a plan counted against the old one — even
+    when there was no old one, where a deletion would leave None == None.
+    Does not commit — it runs inside the caller's transaction.
     """
     ids = tuple(tag_ids)
     if not ids:
@@ -588,4 +631,4 @@ def forget_tag_inhibition(db: DatabaseEngine, tag_ids: Iterable[int]) -> None:
         f"OR tag_b_id IN ({marks})",
         ids + ids,
     )
-    db.execute("DELETE FROM librarian_state WHERE key = ?", (WATERMARK_KEY,))
+    save_watermark(db, _watermark(0, units=0, pairs=0))

@@ -365,7 +365,7 @@ class TagSpace:
                    else load_inhibitor_index(self._db, all_seeds))
             non_seed = {t: s for t, s in all_tag_scores.items() if t not in all_seeds}
             inhibited, _ = apply_lateral_inhibition(
-                non_seed, {s: 1.0 for s in all_seeds}, idx, gain, floor=None)
+                non_seed, {s: 1.0 for s in all_seeds}, idx, gain)
             all_tag_scores = {**{t: s for t, s in all_tag_scores.items() if t in all_seeds},
                               **inhibited}
 

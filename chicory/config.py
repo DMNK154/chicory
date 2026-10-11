@@ -1000,6 +1000,11 @@ def load_config(**overrides) -> ChicoryConfig:
         # runs at all is a per-install decision like gate enforcement.
         "CHICORY_WANDER_ENABLED": "wander_enabled",
         "CHICORY_WANDER_TICK_SECONDS": "wander_tick_seconds",
+        # The inhibition kill switch and gain: an MCP server builds its
+        # config with load_config() and no overrides, so without these
+        # turning inhibition off would take a code change.
+        "CHICORY_INHIBITION_ENABLED": "inhibition_enabled",
+        "CHICORY_TENSOR_INHIBITION_WEIGHT": "tensor_inhibition_weight",
     }
     for env_key, config_key in mapping.items():
         if env_key in env and env[env_key]:
@@ -1015,6 +1020,7 @@ def load_config(**overrides) -> ChicoryConfig:
     # Coerce string booleans from env vars
     for bool_key in (
         "commons_enabled", "glyph_bridge_enabled", "librarian_gate_enforce",
+        "inhibition_enabled",
     ):
         if isinstance(kwargs.get(bool_key), str):
             kwargs[bool_key] = kwargs[bool_key].lower() in ("true", "1", "yes")

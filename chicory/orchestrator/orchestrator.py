@@ -29,6 +29,8 @@ from chicory.layer3.lateral_inhibition import (
     InhibitionPlan,
     compute_tag_inhibition,
     inhibition_due,
+    load_inhibitor_index,
+    load_watermark,
     persist_inhibition,
     plan_inhibition,
     save_watermark,
@@ -146,6 +148,14 @@ class Orchestrator:
         # Seed centroid sub-graph if empty
         self._maybe_seed_centroid_subgraph()
 
+        # The watermark this process's index matches.  Other processes on
+        # the same file (one MCP server per client, a CLI sync) recompute
+        # and save the shared watermark without touching this index, so a
+        # watermark that moves away from this one means reload.  Read
+        # before the table: a recompute landing between the two reads
+        # then costs one spare reload, never a missed one.
+        self._inhibition_seen: dict | None = load_watermark(self._db)
+
         # Warm the inhibitor index once (small, chunked) so no retrieval
         # pays the load; afterwards it changes only by a whole swap.
         self._tensor_cache.inhibitor_index()
@@ -237,6 +247,9 @@ class Orchestrator:
         # A recompute whose diff-write was pre-empted part way; the next
         # pass finishes writing it instead of counting again.
         self._inhibition_backlog: InhibitionPlan | None = None
+        # The watermark the backlog's diff was taken against.  If it has
+        # moved by the time the backlog resumes, the plan is stale.
+        self._inhibition_backlog_base: dict | None = None
         self._background_idle = False
 
         # Diagnostics — activation trace + context log
@@ -733,20 +746,52 @@ class Orchestrator:
         # it is a swap — retrieval never sees a half-written table.
         self._tensor_cache.set_inhibitor_index(plan.index)
         save_watermark(self._db, plan.watermark)
+        self._inhibition_seen = plan.watermark
         logging.getLogger(__name__).info(
             "lateral inhibition: %s written=%d deleted=%d",
             plan.stats, plan.written, plan.deleted,
         )
 
+    def _adopt_peer_inhibition(self) -> None:
+        """Reload the index if another process recounted since this one looked.
+
+        Its rows are in the table and its watermark in librarian_state, but
+        nothing replaces this process's index except this process.
+        """
+        wm = load_watermark(self._db)
+        if wm is not None and wm != self._inhibition_seen:
+            # Watermark first, then the table, as at boot.
+            self._inhibition_seen = wm
+            self._tensor_cache.set_inhibitor_index(load_inhibitor_index(self._db))
+
     def recompute_inhibition(self) -> dict[str, Any]:
-        """Synchronous full recompute (run_sync, tests).  No lock juggling."""
+        """Synchronous full recompute (run_sync, tests).
+
+        Counting is read-only, so it runs without the foreground lock, as
+        the background pass's does.  The diff, the write and the publish
+        happen under it: a background pass then either finishes before
+        this one diffs, or finds the watermark moved and drops its plan,
+        instead of writing an older count over this one.
+        """
         if not self._config.inhibition_enabled:
             return {"pairs": 0, "written": 0, "deleted": 0}
-        plan = self._plan_inhibition()
-        # A fresh count supersedes whatever a pre-empted pass left queued.
-        self._inhibition_backlog = None
-        persist_inhibition(self._db, plan)
-        self._finish_inhibition(plan)
+        comp = compute_tag_inhibition(
+            self._db, fdr=self._config.inhibition_fdr,
+            max_pairs=self._config.inhibition_max_pairs,
+        )
+        # Set first so a background write in progress yields at its next
+        # chunk.  An RLock, so a caller already holding it is fine.
+        self._foreground_waiting.set()
+        try:
+            with self._foreground_db_lock:
+                plan = plan_inhibition(self._db, comp)
+                # A fresh count supersedes whatever a pre-empted pass left queued.
+                self._inhibition_backlog = None
+                self._inhibition_backlog_base = None
+                persist_inhibition(self._db, plan)
+                self._finish_inhibition(plan)
+        finally:
+            self._foreground_waiting.clear()
         return {
             "pairs": plan.stats.get("inhibitory_pairs", 0),
             "written": plan.written, "deleted": plan.deleted, **plan.stats,
@@ -758,7 +803,8 @@ class Orchestrator:
         Counting is read-only and chunked, so it runs with the foreground
         lock released.  The diff-write yields to a waiting foreground call
         between chunks; what it leaves queued is the backlog, which the
-        next pass finishes before anything is counted again.
+        next pass finishes before anything is counted again.  When
+        another process recomputed instead, this one only reloads.
         """
         now = datetime.utcnow()
         if self._last_inhibition_check and (
@@ -771,23 +817,45 @@ class Orchestrator:
             return
 
         plan = self._inhibition_backlog
+        base = self._inhibition_backlog_base
         if plan is None:
             if not inhibition_due(self._db, self._config.inhibition_recompute_growth):
+                # Not due here may mean another process just recounted:
+                # its watermark is what made this one not due.
+                self._adopt_peer_inhibition()
                 return
+            # What the diff is about to be taken against.  Read under the
+            # lock, before it is released.
+            base = load_watermark(self._db)
             self._foreground_db_lock.release()
             try:
                 plan = self._plan_inhibition()
             finally:
                 self._foreground_db_lock.acquire()
 
+        # A run_sync recompute replaces the watermark and a tag merge
+        # deletes it.  Either one, while this plan was counted or queued,
+        # makes it stale: writing it would put older strengths over the
+        # fresh count or bring back rows the merge deleted, and saving its
+        # watermark would cancel the recount the merge asked for.
+        if load_watermark(self._db) != base:
+            self._inhibition_backlog = None
+            self._inhibition_backlog_base = None
+            # Another process's recount is taken as it stands; after a
+            # merge there is no watermark, and the next pass recounts.
+            self._adopt_peer_inhibition()
+            return
+
         persist_inhibition(
             self._db, plan, should_stop=self._foreground_waiting.is_set,
         )
         if plan.done:
             self._inhibition_backlog = None
+            self._inhibition_backlog_base = None
             self._finish_inhibition(plan)
         else:
             self._inhibition_backlog = plan
+            self._inhibition_backlog_base = base
 
     # ── Tool call handlers ──────────────────────────────────────────
 
@@ -959,6 +1027,12 @@ class Orchestrator:
         # be paired with this query in the ledgers.
         self._memory_store._last_query_vec = None
         self._memory_store._last_penumbra = []
+        # Likewise the trace's partner activations and inhibition: only the
+        # centroid path writes them, and a semantic or tag query, or a
+        # hybrid one with no context tags, never reaches it — the trace
+        # would report the previous query's.
+        self._sync_engine._last_partner_inhibition = {}
+        self._sync_engine._last_partner_tag_scores = {}
 
         if method == "semantic":
             results = self._memory_store.retrieve_semantic(query, top_k, tags)

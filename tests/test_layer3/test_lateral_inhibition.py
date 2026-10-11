@@ -18,16 +18,26 @@ from scipy.special import pdtr
 
 from chicory.db.engine import DatabaseEngine
 from chicory.db.schema import apply_schema
+from chicory.layer1.memory_store import MemoryStore
+from chicory.layer1.salience import SalienceScorer
+from chicory.layer1.tag_manager import TagManager
+from chicory.config import ChicoryConfig
 from chicory.layer3.lateral_inhibition import (
+    EVIDENCE_VERSION,
     compute_tag_inhibition,
     deficit_strength,
+    effective_gain,
+    inhibition_due,
     load_inhibitor_index,
+    load_watermark,
+    save_watermark,
     persist_inhibition,
     plan_inhibition,
     poisson_upper,
     select_anti_associations,
 )
 from chicory.layer3.tensor_cache import TensorCache
+from tests.conftest import MockEmbeddingEngine
 
 SUBSTITUTES = {
     frozenset(p) for p in (
@@ -221,6 +231,22 @@ def test_compute_finds_substitutes_only(db):
     assert comp.watermark["units"] == 102 and comp.watermark["pairs"] == 4
 
 
+def test_unit_with_only_structural_tags_still_counts(db):
+    # N is the population the expectation is taken over: a unit that
+    # carries no eligible tag is still a unit, so E = 60·40/103.
+    _scenario_a(db)
+    _mem(db, "bare", ["month-2026-10", "q"])
+
+    comp = _compute(db)
+
+    assert comp.stats["units"] == 103
+    assert set(_by_names(db, comp.edges)) == SUBSTITUTES
+    expected = 60 * 40 / 103
+    for _a, _b, strength, observed, e in comp.edges:
+        assert e == pytest.approx(expected, abs=1e-12)
+        assert strength == pytest.approx(1.0 - (-math.log(0.02)) / expected, abs=1e-12)
+
+
 def test_structural_tags_never_inhibit(make_db):
     def build(day: str, year: str):
         db = make_db()
@@ -229,12 +255,19 @@ def test_structural_tags_never_inhibit(make_db):
         for u in range(3000):
             names = [f"{day}{u % 30:02d}"] + ([year] if u % 30 < 15 else [])
             _mem(db, f"m{u}", names)
-        return _compute(db)
+        comp = _compute(db)
+        return comp, [pair for pair in _by_names(db, comp.edges) if year in pair]
 
-    assert build("day-2026-10-", "2026").edges == []
-    # The same pattern under ordinary names is strong evidence, so the
-    # empty result above is the name rule and not a lack of signal.
-    assert len(build("shift-", "y2026").edges) > 0
+    days, _ = build("day-2026-10-", "2026")
+    assert days.edges == []
+    # Ordinary exclusive names inhibit one another, yet the all-digit year
+    # is still never evidence...
+    shifts, year_edges = build("shift-", "2026")
+    assert shifts.edges and year_edges == []
+    # ...while the same year under a non-digit name is strong evidence
+    # against shifts 15-29, so the absence above is the name rule.
+    _, year_edges = build("shift-", "y2026")
+    assert len(year_edges) == 15
 
 
 def test_file_ingested_memories_are_not_evidence(make_db):
@@ -253,6 +286,39 @@ def test_file_ingested_memories_are_not_evidence(make_db):
     assert comp.stats["units"] == 0
     # Layout tags are exclusive by construction: as tagger evidence they would inhibit.
     assert len(build(hashed=False).edges) > 0
+
+
+def test_split_words_are_not_evidence(make_db, config):
+    # Through the real store: a compound's split words are 'system' rows
+    # with exactly its incidence, so counting them would select the one
+    # python / borrow-checker deficit once per word.
+    def build(rust_tags: list[str]):
+        db = make_db()
+        tags = TagManager(db)
+        store = MemoryStore(config, db, MockEmbeddingEngine(32), tags,
+                            SalienceScorer(config, db))
+        for i in range(60):
+            store.store(f"rust note {i}", rust_tags, skip_embedding=True)
+        for i in range(40):
+            store.store(f"python note {i}", ["python"], skip_embedding=True)
+        roles = {(r["name"], r["assigned_by"]) for r in db.query(
+            "SELECT DISTINCT t.name, mt.assigned_by FROM memory_tags mt "
+            "JOIN tags t ON t.id = mt.tag_id")}
+        comp = _compute(db)
+        return roles, comp, set(_by_names(db, comp.edges))
+
+    roles, comp, pairs = build(["borrow-checker"])
+    assert {("borrow-checker", "llm"), ("borrow", "system"), ("checker", "system"),
+            ("python", "llm")} <= roles
+    assert pairs == {frozenset(("python", "borrow-checker"))}
+    # One test, so q* = 0.95, and E = 60·40/100.
+    assert comp.edges[0][2] == pytest.approx(1.0 - (-math.log(0.05)) / 24.0, abs=1e-12)
+
+    # A word the tagger chose itself is its own evidence.
+    roles, _, pairs = build(["borrow-checker", "borrow"])
+    assert ("borrow", "llm") in roles and ("borrow", "system") not in roles
+    assert pairs == {frozenset(("python", "borrow-checker")),
+                     frozenset(("python", "borrow"))}
 
 
 def test_chunks_of_one_source_count_once(make_db):
@@ -424,6 +490,45 @@ def test_persist_yields_and_resumes(db):
 
 
 # ── TensorCache ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("weight, enabled, gain", [
+    (2.0, True, 2.0),
+    (2.0, False, 0.0),
+    (0.0, True, 0.0),
+    (-2.0, True, 0.0),
+    (float("nan"), True, 0.0),
+    (float("inf"), True, 0.0),
+])
+def test_effective_gain_reads_bad_weights_as_off(weight, enabled, gain):
+    cfg = ChicoryConfig(tensor_inhibition_weight=weight, inhibition_enabled=enabled)
+    assert effective_gain(cfg) == gain
+
+
+def test_watermarks_are_distinct_publications(db):
+    # Peers and queued plans compare watermarks by equality; two recounts
+    # in one second agree on every count, so each carries its own id.
+    _scenario_a(db)
+    first, second = _compute(db).watermark, _compute(db).watermark
+    assert first["evidence"] == second["evidence"] == EVIDENCE_VERSION
+    assert {k: v for k, v in first.items() if k not in ("id", "computed_at")} == (
+        {k: v for k, v in second.items() if k not in ("id", "computed_at")}
+    )
+    assert first != second
+
+
+def test_watermark_from_older_evidence_reads_as_absent(db):
+    # Counted before system rows were excluded: those rows are not what this
+    # code would write, so the next pass must recount however little grew.
+    _scenario_a(db)
+    current = _compute(db).watermark
+    save_watermark(db, current)
+    assert load_watermark(db) == current
+    assert not inhibition_due(db, 0.02)
+
+    save_watermark(db, {k: v for k, v in current.items() if k != "evidence"})
+    assert load_watermark(db) is None
+    assert inhibition_due(db, 0.02)
 
 
 def test_tensor_cache_inhibitor_lifecycle(db):

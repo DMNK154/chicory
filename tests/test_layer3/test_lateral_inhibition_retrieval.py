@@ -10,7 +10,8 @@ tensor rows at all — it only inhibits.
 The evidence is computed, planned and persisted from the memories, never
 inserted by hand: the four cross-language pairs get I = 0.8337, so with
 python active js falls to 2.80 / (1 + 2·0.8337) = 1.0497 and drops below
-asyncio.  No centroid_edges exist, so the co-retrieval gate is skipped.
+asyncio.  No centroid_edges exist unless a test adds one, so the
+co-retrieval gate is otherwise skipped.
 """
 
 from __future__ import annotations
@@ -64,20 +65,26 @@ def _glyph_row(db, a: int, b: int, glyph: float) -> None:
     )
 
 
-@pytest.fixture(params=["cache", "sql"])
-def world(request, config, db):
-    """Scenario A with glyph rows; engine with a TensorCache or the SQL fallback."""
+def _scenario_a(db) -> dict[str, int]:
+    """Scenario A's memories and the two glyph rows; returns the tag ids."""
     for i in range(60):
         _mem(db, f"py{i}", ["python", "asyncio", "bug", "month-2026-10", "p", "y"])
     for i in range(40):
         _mem(db, f"js{i}", ["javascript", "promise", "bug", "month-2026-10", "j", "a"])
     _mem(db, "rare-a", ["rare1", "rare2"])
     _mem(db, "rare-b", ["rare3"])
-    ids = {name: _tag(db, name) for name in ("python", "asyncio", "bug", "javascript")}
+    ids = {name: _tag(db, name)
+           for name in ("python", "asyncio", "bug", "javascript", "promise")}
     _glyph_row(db, ids["bug"], ids["javascript"], JS_GLYPH)
     _glyph_row(db, ids["bug"], ids["asyncio"], ASYNCIO_GLYPH)
     db.connection.commit()
+    return ids
 
+
+@pytest.fixture(params=["cache", "sql"])
+def world(request, config, db):
+    """Scenario A with glyph rows; engine with a TensorCache or the SQL fallback."""
+    ids = _scenario_a(db)
     cache = TensorCache(db) if request.param == "cache" else None
     tags = TagManager(db)
 
@@ -97,6 +104,7 @@ def world(request, config, db):
         "asyncio": ids["asyncio"],
         "bug": ids["bug"],
         "js": ids["javascript"],
+        "promise": ids["promise"],
     }
 
 
@@ -218,6 +226,81 @@ def test_directed_discovery_cannot_rescue(world, monkeypatch):
     assert after[js] == pytest.approx(3.0 / 2.6674, abs=1e-4)
 
 
+def test_inhibition_cannot_open_the_gate(world, monkeypatch):
+    w = world
+    cfg, db, engine = w["config"], w["db"], w["engine"]
+    py, bug, promise = w["py"], w["bug"], w["promise"]
+    # promise is a directed discovery from bug (2.0 × 0.3 = 0.6, over the
+    # 0.3 excitation threshold) and the only partner co-retrieved with bug;
+    # the glyph partners js and asyncio have no co-retrieval edge.
+    discovery = DiscoveredTag(tag_id=promise, max_strength=2.0, paths=[(bug, 2.0)])
+    excitation = discovery.score * cfg.semiotic_directed_weight
+    assert excitation == pytest.approx(0.6)
+    monkeypatch.setattr(engine._semiotic_graph, "expand_in_through_out",
+                        lambda tag_ids: {promise: discovery})
+    db.execute(
+        "INSERT INTO centroid_edges (tag_a_id, tag_b_id, edge_strength, co_retrieval_count) "
+        "VALUES (?, ?, 0.9, 3)", (min(bug, promise), max(bug, promise)),
+    )
+    db.connection.commit()
+
+    assert engine._centroid_path([py, bug]) == {promise: pytest.approx(excitation)}
+
+    strength = _recompute(w).index[py][promise]
+    inhibited = excitation / (1 + BETA * strength)
+    # Below the threshold once divided — and still a partner: the gate
+    # decided on excitation, and division never prunes.
+    assert inhibited < cfg.resonance_min_tensor_score
+
+    after = engine._centroid_path([py, bug])
+    assert after == {promise: pytest.approx(inhibited, abs=1e-9)}
+    assert engine._last_partner_inhibition == {promise: pytest.approx(strength)}
+
+    # The same at the memory level: no un-gated glyph partner gets a boost.
+    candidates = {"pr0": [promise], "js0": [w["js"]], "py0": [w["asyncio"]]}
+    assert engine.get_resonant_memory_ids_fast(
+        [py, bug], candidate_memory_ids=list(candidates),
+        candidate_tag_ids_map=candidates,
+    ) == [("pr0", pytest.approx(1.0))]
+
+
+def test_inhibitor_on_the_larger_id_side(world):
+    # Every stored pair has a < b, and javascript is b in all of its rows,
+    # so without a cache only the tag_b_id half of the lookup finds them.
+    w = world
+    engine, bug, js, asyncio = w["engine"], w["bug"], w["js"], w["asyncio"]
+    strength = _recompute(w).index[js][asyncio]
+    assert js > asyncio and js > w["py"]
+
+    after = engine._centroid_path([js, bug])
+    assert after == {asyncio: pytest.approx(2.20 / (1 + BETA * strength), abs=1e-9)}
+    assert engine._last_partner_inhibition == {asyncio: pytest.approx(strength)}
+
+
+def test_resonant_lookup_honours_activations(world):
+    w = world
+    engine, py, bug = w["engine"], w["py"], w["bug"]
+    candidates = {"js0": [w["js"]], "py0": [w["asyncio"]]}
+    strength = _recompute(w).index[py][w["js"]]
+
+    def rank(activation):
+        return engine.get_resonant_memory_ids_fast(
+            [py, bug], candidate_memory_ids=["js0", "py0"],
+            candidate_tag_ids_map=candidates,
+            context_weights={bug: 1.0, py: activation},
+        )
+
+    # One stray python result in five: js is divided by 1 + β·0.1·I only.
+    faint = rank(0.1)
+    js_faint = 2.80 / (1 + BETA * 0.1 * strength)
+    assert [mid for mid, _ in faint] == ["js0", "py0"]
+    assert dict(faint)["py0"] == pytest.approx(2.20 / js_faint, abs=1e-9)
+
+    full = rank(1.0)
+    assert [mid for mid, _ in full] == ["py0", "js0"]
+    assert dict(full)["js0"] == pytest.approx(1.0497 / 2.20, abs=1e-4)
+
+
 # ── Glyph association ───────────────────────────────────────────────────
 
 
@@ -246,6 +329,29 @@ def test_glyph_association_flips(world):
     assert js_partner == pytest.approx(5.2486, abs=1e-3)  # 14.0 / 2.6674
 
 
+def test_glyph_association_honours_activations(world):
+    w = world
+    engine, py, bug = w["engine"], w["py"], w["bug"]
+    candidates = {"js0": [w["js"]], "py0": [w["asyncio"]]}
+    strength = _recompute(w).index[py][w["js"]]
+
+    def rank(activation):
+        return engine.get_glyph_association_scores(
+            [py, bug], candidate_memory_ids=["js0", "py0"],
+            candidate_tag_ids_map=candidates,
+            context_weights={bug: 1.0, py: activation},
+        )
+
+    faint = rank(0.1)
+    js_faint = JS_GLYPH / (1 + BETA * 0.1 * strength)  # 12.0, still over asyncio's 11.0
+    assert [mid for mid, _ in faint] == ["js0", "py0"]
+    assert dict(faint)["py0"] == pytest.approx(ASYNCIO_GLYPH / js_faint, abs=1e-9)
+
+    full = rank(1.0)
+    assert [mid for mid, _ in full] == ["py0", "js0"]
+    assert dict(full)["js0"] * ASYNCIO_GLYPH == pytest.approx(5.2486, abs=1e-3)
+
+
 # ── TagSpace ────────────────────────────────────────────────────────────
 
 
@@ -261,7 +367,15 @@ def test_tag_space_lexical_inhibition(world):
     assert scores[asyncio] == pytest.approx(1.1)
     assert scores[js] == pytest.approx(0.525, abs=1e-3)
     assert scores[asyncio] > scores[js]
-    assert scores[py] == scores[bug] == 1.0  # seeds are never inhibited
+
+    # Seeds are what the query names, so never inhibited: here javascript
+    # is a seed and also python's competitor, and keeps its fan-out score.
+    scores, seeds = space._lexical_tag_scores("python bug javascript")
+    assert seeds == {py, bug, js}
+    off_cfg = w["config"].model_copy(update={"inhibition_enabled": False})
+    off = TagSpace(off_cfg, w["db"], w["tags"], tensor_cache=w["cache"])
+    assert scores[js] == off._lexical_tag_scores("python bug javascript")[0][js]
+    assert scores[js] == pytest.approx(2.80)
 
     scores, seeds = space._lexical_tag_scores("bug")
     assert seeds == {bug}
@@ -270,6 +384,83 @@ def test_tag_space_lexical_inhibition(world):
     memories, seeds = space.score_lexical("python bug")
     assert seeds == {py, bug} and memories
     assert space.score_lexical("a b") == ({}, set())  # no usable token
+
+
+# ── Production activations ──────────────────────────────────────────────
+
+
+def test_hybrid_retrieval_activations(orchestrator, monkeypatch):
+    # Five near-copies of the query make the FAISS top-5 (scenario A's
+    # memories have no embeddings); python is on one of them, bug on all.
+    orch = orchestrator
+    db, engine, space = orch._db, orch._sync_engine, orch._tag_space
+    ids = _scenario_a(db)
+    py, bug, js = ids["python"], ids["bug"], ids["javascript"]
+    orch._tensor_cache.invalidate()
+    orch.recompute_inhibition()
+    strength = orch._tensor_cache.inhibitor_index()[py][js]
+    assert strength == pytest.approx(I_SCENARIO_A, abs=1e-12)
+    top5 = {
+        orch.handle_store_memory(
+            f"bug event loop crash {i}",
+            tags=["bug", "crash"] + (["python"] if i == 0 else []),
+        )["memory_id"]
+        for i in range(5)
+    }
+    crash = _tag(db, "crash")
+
+    calls: dict[str, tuple] = {}
+
+    def spy(name):
+        method = getattr(engine, name)
+
+        def wrapper(*args, **kwargs):
+            calls[name] = (args, kwargs)
+            return method(*args, **kwargs)
+        monkeypatch.setattr(engine, name, wrapper)
+
+    spy("get_resonant_memory_ids_fast")
+    spy("get_glyph_association_scores")
+    # The hub filter prunes crash from the excitation seeds; it says
+    # nothing about what the context is about, so crash keeps its weight.
+    filter_context_tags = space.filter_context_tags
+    monkeypatch.setattr(space, "filter_context_tags",
+                        lambda seeds, ctx: filter_context_tags(seeds, ctx) - {crash})
+
+    orch.handle_retrieve_memories("bug event loop crash", method="hybrid")
+
+    (r_args, r_kwargs), (g_args, g_kwargs) = (
+        calls["get_resonant_memory_ids_fast"], calls["get_glyph_association_scores"])
+    assert set(r_kwargs["seed_memory_ids"]) == top5  # the premise
+    weights = r_kwargs.get("context_weights")
+    assert weights and g_kwargs.get("context_weights") == weights
+    assert weights.get(py) == pytest.approx(0.2)  # one result in five
+    assert weights.get(bug) == pytest.approx(1.0)
+    assert crash not in r_args[0] and crash not in g_args[0]
+    assert weights.get(crash) == pytest.approx(1.0)
+    # The centroid path saw the weight: js divided by 1 + β·0.2·I, not 1 + β·I.
+    assert engine._last_partner_tag_scores[js] == pytest.approx(
+        2.80 / (1 + BETA * 0.2 * strength), abs=1e-9)
+    assert engine._last_partner_inhibition[js] == pytest.approx(0.2 * strength)
+
+
+# ── Glyph lattice ───────────────────────────────────────────────────────
+
+
+def test_single_letter_tags_never_placed(world):
+    w = world
+    engine, tags, db = w["engine"], w["tags"], w["db"]
+    for name in ("x", "xq"):
+        tags.get_or_create(name)
+    db.connection.commit()
+
+    assert engine.place_tags_on_glyph_lattice(["x"]) == []
+    x = tags.get_by_name("x").id
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM glyph_positions WHERE tag_id = ?", (x,))["n"] == 0
+    # A two-letter name is placed, so the empty result is the length rule.
+    assert [p.tag_id for p in engine.place_tags_on_glyph_lattice(["xq"])] == [
+        tags.get_by_name("xq").id]
 
 
 # ── Exact identity without evidence ─────────────────────────────────────
@@ -339,18 +530,17 @@ def test_apply_helper_properties():
     assert apply_lateral_inhibition(excitation, {2: 0.0, 3: -1.0}, index, BETA) == (
         excitation, {})
 
-    # However many confident inhibitors, a partner keeps at least 1/(1 + β).
-    many = {s: {10: 0.999, 11: 0.999} for s in range(100, 140)}
-    out, _ = apply_lateral_inhibition(excitation, {s: 1.0 for s in many}, many, BETA)
-    for p in (10, 11):
-        assert out[p] / excitation[p] >= 1 / (1 + BETA)
-
-    # The floor drops only inhibited partners: 12 is below it but untouched.
-    floor_index = {2: {10: 0.9, 11: 0.1}}
-    out, _ = apply_lateral_inhibition(excitation, {2: 1.0}, floor_index, BETA, floor=1.0)
-    assert 10 not in out  # 2.0 / 2.8 < 1.0
-    assert out[11] == pytest.approx(3.0 / 1.2)
-    assert out[12] == 0.5
+    # Divisive, never a prune: however many confident inhibitors and however
+    # faint the excitation, every partner comes back with at least 1/(1 + β).
+    faint = {**excitation, 13: 0.01}
+    many = {s: {10: 0.999, 11: 0.999, 12: 1.0, 13: 1.0} for s in range(100, 140)}
+    out, h = apply_lateral_inhibition(faint, {s: 1.0 for s in many}, many, BETA)
+    assert out.keys() == h.keys() == faint.keys()
+    for p, e in faint.items():
+        assert out[p] / e >= 1 / (1 + BETA) - 1e-12
+    out, h = apply_lateral_inhibition(faint, {100: 0.3}, many, BETA)
+    assert out.keys() == faint.keys()
+    assert out[13] == pytest.approx(0.01 / (1 + BETA * 0.3))
 
     # Divisive: scale-free.
     scaled, _ = apply_lateral_inhibition(

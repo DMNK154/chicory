@@ -353,6 +353,7 @@ def squares(
 
     from chicory.config import load_config
     from chicory.db.engine import DatabaseEngine
+    from chicory.layer3.lateral_inhibition import effective_gain
     from chicory.layer3.square_finder import find_square_motifs
 
     console = Console()
@@ -367,7 +368,7 @@ def squares(
             "semantic": config.tensor_semantic_weight,
             "semiotic": config.tensor_semiotic_weight,
             "glyph": config.tensor_glyph_weight,
-            "inhibition": config.tensor_inhibition_weight,
+            "inhibition": effective_gain(config),
         }
         motifs = find_square_motifs(
             db_engine,
@@ -498,6 +499,7 @@ def cross_align(
     from chicory.layer3.cross_project_alignment import (
         analyze_cross_project_alignment,
     )
+    from chicory.layer3.lateral_inhibition import effective_gain
 
     console = Console()
     db_path = Path(db)
@@ -515,7 +517,7 @@ def cross_align(
         "semantic": config.tensor_semantic_weight,
         "semiotic": config.tensor_semiotic_weight,
         "glyph": config.tensor_glyph_weight,
-        "inhibition": config.tensor_inhibition_weight,
+        "inhibition": effective_gain(config),
     }
 
     def open_readonly(path: Path) -> sqlite3.Connection:
@@ -657,6 +659,7 @@ def cross_middle_build(
         analyze_cross_project_alignment,
     )
     from chicory.layer3.cross_project_middle import write_middle_layer
+    from chicory.layer3.lateral_inhibition import effective_gain
 
     console = Console()
     db_path = Path(db)
@@ -674,7 +677,7 @@ def cross_middle_build(
         "semantic": config.tensor_semantic_weight,
         "semiotic": config.tensor_semiotic_weight,
         "glyph": config.tensor_glyph_weight,
-        "inhibition": config.tensor_inhibition_weight,
+        "inhibition": effective_gain(config),
     }
 
     def open_readonly(path: Path) -> sqlite3.Connection:
@@ -897,6 +900,7 @@ def cross_raw_query(
         build_middle_layer_document,
         query_middle_layer,
     )
+    from chicory.layer3.lateral_inhibition import effective_gain
 
     console = Console()
     db_path = Path(db)
@@ -914,7 +918,7 @@ def cross_raw_query(
         "semantic": config.tensor_semantic_weight,
         "semiotic": config.tensor_semiotic_weight,
         "glyph": config.tensor_glyph_weight,
-        "inhibition": config.tensor_inhibition_weight,
+        "inhibition": effective_gain(config),
     }
 
     def open_readonly(path: Path) -> sqlite3.Connection:
@@ -1112,6 +1116,7 @@ def cross_hidden_bridges(
         analyze_cross_project_alignment,
     )
     from chicory.layer3.cross_project_middle import build_middle_layer_document
+    from chicory.layer3.lateral_inhibition import effective_gain
 
     console = Console()
     db_path = Path(db)
@@ -1129,7 +1134,7 @@ def cross_hidden_bridges(
         "semantic": config.tensor_semantic_weight,
         "semiotic": config.tensor_semiotic_weight,
         "glyph": config.tensor_glyph_weight,
-        "inhibition": config.tensor_inhibition_weight,
+        "inhibition": effective_gain(config),
     }
 
     def open_readonly(path: Path) -> sqlite3.Connection:
@@ -1397,6 +1402,7 @@ def cross_hidden_ask(
         analyze_cross_project_alignment,
     )
     from chicory.layer3.cross_project_middle import build_middle_layer_document
+    from chicory.layer3.lateral_inhibition import effective_gain
     from chicory.llm.factory import create_llm_client
     from chicory.orchestrator.orchestrator import Orchestrator
     from chicory.orchestrator.tool_handlers import dispatch_tool_call
@@ -1422,7 +1428,7 @@ def cross_hidden_ask(
         "semantic": config.tensor_semantic_weight,
         "semiotic": config.tensor_semiotic_weight,
         "glyph": config.tensor_glyph_weight,
-        "inhibition": config.tensor_inhibition_weight,
+        "inhibition": effective_gain(config),
     }
 
     def open_readonly(path: Path) -> sqlite3.Connection:
@@ -1641,6 +1647,7 @@ def chain_anisotropy(
     from chicory.config import load_config
     from chicory.db.engine import DatabaseEngine
     from chicory.layer3.chain_anisotropy import analyze_chain_anisotropy
+    from chicory.layer3.lateral_inhibition import effective_gain
 
     console = Console()
     config = load_config(db_path=Path(db))
@@ -1654,7 +1661,7 @@ def chain_anisotropy(
             "semantic": config.tensor_semantic_weight,
             "semiotic": config.tensor_semiotic_weight,
             "glyph": config.tensor_glyph_weight,
-            "inhibition": config.tensor_inhibition_weight,
+            "inhibition": effective_gain(config),
         }
         report = analyze_chain_anisotropy(
             db_engine,
@@ -1798,6 +1805,7 @@ def zigzag(
 
     from chicory.config import load_config
     from chicory.db.engine import DatabaseEngine
+    from chicory.layer3.lateral_inhibition import effective_gain
     from chicory.layer3.zigzag_analyzer import analyze_square_zigzags
 
     console = Console()
@@ -1812,7 +1820,7 @@ def zigzag(
             "semantic": config.tensor_semantic_weight,
             "semiotic": config.tensor_semiotic_weight,
             "glyph": config.tensor_glyph_weight,
-            "inhibition": config.tensor_inhibition_weight,
+            "inhibition": effective_gain(config),
         }
         report = analyze_square_zigzags(
             db_engine,
@@ -1963,6 +1971,7 @@ def vertical_squares(
 
     from chicory.config import load_config
     from chicory.db.engine import DatabaseEngine
+    from chicory.layer3.lateral_inhibition import effective_gain
     from chicory.layer3.vertical_square_finder import (
         find_tensor_vertical_square_motifs,
         find_vertical_square_motifs,
@@ -1980,7 +1989,7 @@ def vertical_squares(
             "semantic": config.tensor_semantic_weight,
             "semiotic": config.tensor_semiotic_weight,
             "glyph": config.tensor_glyph_weight,
-            "inhibition": config.tensor_inhibition_weight,
+            "inhibition": effective_gain(config),
         }
         if mode == "tensor":
             motifs = find_tensor_vertical_square_motifs(
