@@ -450,6 +450,59 @@ class TestTensorMerge:
                         if r["tag_a_id"] == tag_b.id and r["tag_b_id"] == tag_b.id]
         assert len(self_entries) == 0
 
+    def test_merge_drops_inhibition_rows_and_watermark(self, stack):
+        """A merge makes the surviving tag a new union: anti-association rows
+        on either side are stale, and the next background pass must recount."""
+        from chicory.layer3.lateral_inhibition import (
+            WATERMARK_KEY,
+            load_watermark,
+            save_watermark,
+        )
+
+        db, emb, tags, engine = stack["db"], stack["emb"], stack["tags"], stack["engine"]
+
+        src = tags.get_or_create("alpha")
+        tgt = tags.get_or_create("beta")
+        rival = tags.get_or_create("gamma")
+        other = tags.get_or_create("delta")
+
+        _create_memory(db, emb, "m1", "content one", [src.id, rival.id])
+        _create_memory(db, emb, "m2", "content two", [src.id, rival.id])
+        _create_memory(db, emb, "m3", "content three", [tgt.id, other.id])
+        engine.seed_tensor_from_associations()
+
+        for a, b in ((src.id, other.id), (tgt.id, rival.id), (rival.id, other.id)):
+            db.execute(
+                "INSERT INTO tag_inhibition "
+                "(tag_a_id, tag_b_id, inhibition_strength, observed, expected) "
+                "VALUES (?, ?, 0.5, 0, 10.0)",
+                (min(a, b), max(a, b)),
+            )
+        save_watermark(db, {"max_rowid": 6, "units": 3, "pairs": 3})
+        db.connection.commit()
+        assert load_watermark(db) is not None
+
+        tags.merge_tags(src.id, tgt.id)
+
+        left = db.execute(
+            "SELECT tag_a_id, tag_b_id FROM tag_inhibition"
+        ).fetchall()
+        assert [(r["tag_a_id"], r["tag_b_id"]) for r in left] == [
+            (min(rival.id, other.id), max(rival.id, other.id)),
+        ]
+        assert db.execute(
+            "SELECT 1 FROM librarian_state WHERE key = ?", (WATERMARK_KEY,),
+        ).fetchone() is None
+
+        # The existing merge contract still holds.
+        rows_after = _get_tensor_rows(db)
+        assert not [r for r in rows_after
+                    if src.id in (r["tag_a_id"], r["tag_b_id"])]
+        assert db.execute(
+            "SELECT COUNT(*) AS c FROM memory_tags WHERE tag_id = ?", (src.id,),
+        ).fetchone()["c"] == 0
+        assert tags.get_by_id(src.id).merged_into == tgt.id
+
 
 # ── Seeding tests ────────────────────────────────────────────────────
 

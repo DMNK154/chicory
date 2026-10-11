@@ -17,6 +17,11 @@ from chicory.config import ChicoryConfig
 from chicory.db.engine import DatabaseEngine
 from chicory.layer1.embedding_engine import EmbeddingEngine
 from chicory.layer1.tag_manager import TagManager
+from chicory.layer3.lateral_inhibition import (
+    apply_lateral_inhibition,
+    effective_gain,
+    load_inhibitor_index,
+)
 from chicory.layer3.poincare import PoincareProjection
 from chicory.layer3.tensor_cache import TensorCache
 from chicory.layer3.semiotic_graph import SemioticDirectedGraph
@@ -60,6 +65,8 @@ class SynchronicityEngine:
             min_strength=config.semiotic_directed_min_strength,
             tensor_cache=tensor_cache,
         )
+        # Partner → H from the last centroid path, for the activation trace.
+        self._last_partner_inhibition: dict[int, float] = {}
 
     @property
     def semiotic_graph(self) -> SemioticDirectedGraph:
@@ -1447,6 +1454,7 @@ class SynchronicityEngine:
         candidate_memory_ids: list[str] | None = None,
         candidate_tag_ids_map: dict[str, list[int]] | None = None,
         seed_memory_ids: list[str] | None = None,
+        context_weights: dict[int, float] | None = None,
     ) -> list[tuple[str, float]]:
         """Tensor-based resonance scoring for candidate memories.
 
@@ -1457,6 +1465,9 @@ class SynchronicityEngine:
            No full memory_tags scan — works on the pre-filtered candidate set.
         2. Episodic path: direct memory-to-memory edges from the episodic
            tensor, seeded by the FAISS results.
+
+        context_weights ({tag: activation in [0, 1]}) are the active tags
+        that laterally inhibit partners; default: every tag_id at 1.0.
         """
         if not tag_ids:
             return []
@@ -1464,7 +1475,7 @@ class SynchronicityEngine:
         memory_scores: dict[str, float] = {}
 
         # ── Centroid path: tensor → partner tag scores → score candidates ──
-        partner_tag_scores = self._centroid_path(tag_ids)
+        partner_tag_scores = self._centroid_path(tag_ids, context_weights)
         self._last_partner_tag_scores = dict(partner_tag_scores)
         if partner_tag_scores and candidate_memory_ids and candidate_tag_ids_map:
             max_partner = max(partner_tag_scores.values())
@@ -1494,8 +1505,16 @@ class SynchronicityEngine:
 
         return sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)
 
-    def _centroid_path(self, tag_ids: list[int]) -> dict[str, float]:
-        """Tensor partners gated by co-retrieval edges, resolved to memories."""
+    def _centroid_path(
+        self,
+        tag_ids: list[int],
+        context_weights: dict[int, float] | None = None,
+    ) -> dict[str, float]:
+        """Tensor partners gated by co-retrieval edges, resolved to memories.
+
+        Partner excitation is divided by lateral inhibition from the active
+        context (context_weights, default every tag_id at 1.0).
+        """
         import time as _time
         _cp = {}
         _cp0 = _time.perf_counter()
@@ -1509,7 +1528,7 @@ class SynchronicityEngine:
             placeholders = ",".join("?" * len(tag_ids))
             _cols = ("tag_a_id, tag_b_id, cooccurrence_strength, synchronicity_strength,"
                      " semantic_strength, semiotic_forward, semiotic_reverse,"
-                     " glyph_strength, inhibition_strength, parallelness")
+                     " glyph_strength")
             _params = tuple(tag_ids)
             rows_a = self._db.execute(
                 f"SELECT {_cols} FROM tag_relational_tensor WHERE tag_a_id IN ({placeholders})",
@@ -1525,6 +1544,7 @@ class SynchronicityEngine:
         _cp["tensor_rows"] = len(rows)
 
         if not rows:
+            self._last_partner_inhibition = {}
             return {}
 
         w_co = self._config.tensor_cooccurrence_weight
@@ -1532,7 +1552,6 @@ class SynchronicityEngine:
         w_sem = self._config.tensor_semantic_weight
         w_glyph = self._config.tensor_glyph_weight
         w_meta = self._config.tensor_meta_resonance_weight
-        w_inhib = self._config.tensor_inhibition_weight
 
         partner_scores: dict[int, float] = {}
         for row in rows:
@@ -1559,14 +1578,9 @@ class SynchronicityEngine:
             if sync_val > 0 and glyph_val > 0:
                 excitatory += w_meta * sync_val * glyph_val
 
-            inhib = row["inhibition_strength"]
-            par = row["parallelness"]
-            suppression = w_inhib * inhib * max(0.0, -par) if inhib > 0 and par < 0 else 0.0
-
-            combined = excitatory - suppression
-            if combined >= self._config.resonance_min_tensor_score:
+            if excitatory >= self._config.resonance_min_tensor_score:
                 partner_scores[partner] = max(
-                    partner_scores.get(partner, 0.0), combined,
+                    partner_scores.get(partner, 0.0), excitatory,
                 )
 
         _cp["n_partners_pre_gate"] = len(partner_scores)
@@ -1583,7 +1597,17 @@ class SynchronicityEngine:
         _cp["directed_in_out"] = _time.perf_counter() - _s
         _cp["n_directed_discoveries"] = len(directed_discoveries)
 
+        # ── Lateral inhibition: every active context tag divides the
+        # partners it competes with, edge or no edge.  After the directed
+        # merge, so a discovery cannot rescue a suppressed partner.
+        weights = context_weights if context_weights is not None else {t: 1.0 for t in tag_ids}
+        partner_scores, inhibition = apply_lateral_inhibition(
+            partner_scores, weights, self._inhibitor_index(weights.keys()),
+            effective_gain(self._config), floor=self._config.resonance_min_tensor_score)
+        _cp["n_inhibited"] = len(inhibition)
+
         if not partner_scores:
+            self._last_partner_inhibition = {}
             return {}
 
         _s = _time.perf_counter()
@@ -1599,6 +1623,9 @@ class SynchronicityEngine:
         import logging
         logging.getLogger("chicory.centroid_path").info("centroid_path_timing: %s", _cp)
 
+        self._last_partner_inhibition = {
+            p: h for p, h in inhibition.items() if p in partner_scores
+        }
         return partner_scores
 
     def _episodic_path(self, seed_memory_ids: list[str]) -> dict[str, float]:
@@ -1651,6 +1678,13 @@ class SynchronicityEngine:
         co_retrieved = {r["partner"] for r in rows_a} | {r["partner"] for r in rows_b}
         return candidate_ids & co_retrieved
 
+    def _inhibitor_index(self, context_ids) -> dict[int, dict[int, float]]:
+        """The lateral-inhibitor index: the cached whole, or just the rows
+        touching context_ids when there is no cache."""
+        if self._tensor_cache:
+            return self._tensor_cache.inhibitor_index()
+        return load_inhibitor_index(self._db, context_ids)
+
     # ── Glyph Ramsey Lattice ─────────────────────────────────────────
 
     def place_tags_on_glyph_lattice(
@@ -1669,7 +1703,7 @@ class SynchronicityEngine:
         # Phase 0: filter to tags that need placement
         to_place: list[tuple[str, object]] = []  # (name, Tag)
         for name in tag_names:
-            if not name:
+            if not name or len(name) < 2:
                 continue
             tag = self._tags.get_by_name(name)
             if tag is None:
@@ -2140,58 +2174,12 @@ class SynchronicityEngine:
         positions = self.place_tags_on_glyph_lattice(word_tags)
         return len(positions)
 
-    # ── Lateral Inhibition & Cross-Reference ─────────────────────────
-
-    def compute_all_parallelness(self) -> int:
-        """Compute parallelness for all tensor edges from glyph lattice angles.
-
-        parallelness = cos(angle_a - angle_b): +1 parallel, -1 antiparallel.
-        Vectorized with numpy; writes via temp table + single joined UPDATE.
-        """
-        import numpy as np
-
-        pos_rows = self._db.execute(
-            "SELECT tag_id, angle FROM glyph_positions"
-        ).fetchall()
-        if not pos_rows:
-            return 0
-
-        tag_angles: dict[int, float] = {r["tag_id"]: r["angle"] for r in pos_rows}
-
-        edges = self._db.execute(
-            "SELECT tag_a_id, tag_b_id FROM tag_relational_tensor"
-        ).fetchall()
-
-        a_ids = []
-        b_ids = []
-        deltas = []
-        for row in edges:
-            a, b = row["tag_a_id"], row["tag_b_id"]
-            if a in tag_angles and b in tag_angles:
-                a_ids.append(a)
-                b_ids.append(b)
-                deltas.append(tag_angles[a] - tag_angles[b])
-
-        if not deltas:
-            return 0
-
-        par_values = np.cos(np.array(deltas, dtype=np.float64))
-
-        now = "strftime('%Y-%m-%dT%H:%M:%f', 'now')"
-        self._db.executemany(
-            f"UPDATE tag_relational_tensor "
-            f"SET parallelness = ?, updated_at = {now} "
-            f"WHERE tag_a_id = ? AND tag_b_id = ?",
-            [(float(par_values[i]), int(a_ids[i]), int(b_ids[i]))
-             for i in range(len(a_ids))],
-        )
-        self._db.connection.commit()
-        return len(a_ids)
+    # ── Cross-Reference ──────────────────────────────────────────────
 
     def seed_from_cross_reference(self) -> int:
         """Import GPT-GU cross-reference data into the tag relational tensor.
 
-        Loads oppositions (→ inhibition_strength), transformations (→ semiotic),
+        Loads oppositions (→ semantic_strength), transformations (→ semiotic),
         and co-occurrences (→ cooccurrence boost) from the GlyphBridge.
         Maps glyph symbols back to Chicory tag IDs via glyph_bridge_cache.
 
@@ -2214,6 +2202,7 @@ class SynchronicityEngine:
 
         resonant_set = self._load_resonant_tag_set()
         updates: dict[tuple[int, int], dict[str, float]] = {}
+        opposition_pairs: set[tuple[int, int]] = set()
 
         def _resonant_pair(a: int, b: int) -> tuple[int, int] | None:
             if a == b:
@@ -2221,7 +2210,8 @@ class SynchronicityEngine:
             key = (min(a, b), max(a, b))
             return key if key in resonant_set else None
 
-        # 1. Oppositions → inhibition_strength + semantic_strength
+        # 1. Oppositions → semantic_strength.  Inhibition is not seeded:
+        # it comes only from anti-association evidence (tag_inhibition).
         for glyph_a, opp_set in xref_data.get("oppositions", {}).items():
             tids_a = glyph_to_tids.get(glyph_a, [])
             for glyph_b in opp_set:
@@ -2231,9 +2221,8 @@ class SynchronicityEngine:
                         pair = _resonant_pair(ta, tb)
                         if pair is None:
                             continue
+                        opposition_pairs.add(pair)
                         d = updates.setdefault(pair, {})
-                        d["inhibition_strength"] = max(
-                            d.get("inhibition_strength", 0.0), 0.5)
                         d["semantic_strength"] = max(
                             d.get("semantic_strength", 0.0), 0.6)
 
@@ -2304,9 +2293,9 @@ class SynchronicityEngine:
 
         logger.info(
             "Cross-reference seeded: %d tensor edges "
-            "(%d oppositions, %d transformations, %d co-occurrences)",
+            "(%d opposition pairs (semantic), %d transformations, %d co-occurrences)",
             len(updates),
-            sum(1 for s in updates.values() if "inhibition_strength" in s),
+            len(opposition_pairs),
             sum(1 for s in updates.values()
                 if "semiotic_forward" in s or "semiotic_reverse" in s),
             sum(1 for s in updates.values() if "cooccurrence_strength" in s),
@@ -2412,12 +2401,14 @@ class SynchronicityEngine:
         context_tag_ids: list[int],
         candidate_memory_ids: list[str] | None = None,
         candidate_tag_ids_map: dict[str, list[int]] | None = None,
+        context_weights: dict[int, float] | None = None,
     ) -> list[tuple[str, float]]:
         """Score memories by glyph network association (tensor edge traversal).
 
         Like GPT-GU's recall_by_association: given context tags, follow
         glyph tensor edges to find memories connected via glyph resonance,
-        with lateral inhibition pruning antiparallel activations.
+        divided by data-derived lateral inhibition from the active context
+        (context_weights, default every context tag at 1.0).
 
         When candidate_memory_ids and candidate_tag_ids_map are provided,
         scores only those candidates (no memory_tags query). Otherwise
@@ -2429,7 +2420,6 @@ class SynchronicityEngine:
             return []
 
         query_set = set(context_tag_ids)
-        w_inhib = self._config.tensor_inhibition_weight
 
         # Get all tensor edges touching context tags that have glyph signal
         if self._tensor_cache:
@@ -2437,7 +2427,7 @@ class SynchronicityEngine:
                     if r["glyph_strength"] > 0]
         else:
             placeholders = ",".join("?" * len(context_tag_ids))
-            _cols = "tag_a_id, tag_b_id, glyph_strength, cooccurrence_strength, inhibition_strength, parallelness"
+            _cols = "tag_a_id, tag_b_id, glyph_strength, cooccurrence_strength"
             _params = tuple(context_tag_ids)
             rows_a = self._db.execute(
                 f"SELECT {_cols} FROM tag_relational_tensor "
@@ -2455,7 +2445,7 @@ class SynchronicityEngine:
         if not rows:
             return []
 
-        # Phase 1: score partner tags by glyph composite with inhibition
+        # Phase 1: score partner tags by glyph composite
         partner_scores: dict[int, float] = {}
         for row in rows:
             a_in = row["tag_a_id"] in query_set
@@ -2467,15 +2457,17 @@ class SynchronicityEngine:
             # Excitatory: glyph resonance + co-occurrence bonus
             score = row["glyph_strength"] + 0.3 * row["cooccurrence_strength"]
 
-            # Inhibition: antiparallel suppression
-            inhib = row["inhibition_strength"]
-            par = row["parallelness"]
-            if inhib > 0 and par < 0:
-                score -= w_inhib * inhib * (-par)
-
             if score > 0:
                 partner_scores[partner] = max(
                     partner_scores.get(partner, 0.0), score)
+
+        # Lateral inhibition from the active context; divisive, so it
+        # never drops a partner here.
+        weights = (context_weights if context_weights is not None
+                   else {t: 1.0 for t in context_tag_ids})
+        partner_scores, _ = apply_lateral_inhibition(
+            partner_scores, weights, self._inhibitor_index(weights.keys()),
+            effective_gain(self._config), floor=None)
 
         if not partner_scores:
             return []
@@ -2530,58 +2522,6 @@ class SynchronicityEngine:
             return []
 
         return sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)
-
-    def get_inhibition_score(
-        self, tag_ids_a: list[int], tag_ids_b: list[int],
-    ) -> float:
-        """Compute net inhibition between two sets of tags.
-
-        Only considers glyph-resonant pairs; fetches all matching rows in
-        a single batch query instead of one SELECT per pair.
-        """
-        if not tag_ids_a or not tag_ids_b:
-            return 0.0
-
-        resonant_set = self._load_resonant_tag_set()
-        pairs: list[tuple[int, int]] = []
-        for ta in tag_ids_a:
-            for tb in tag_ids_b:
-                if ta == tb:
-                    continue
-                key = (min(ta, tb), max(ta, tb))
-                if key in resonant_set:
-                    pairs.append(key)
-
-        if not pairs:
-            return 0.0
-
-        total_suppression = 0.0
-        if self._tensor_cache:
-            pair_set = set(pairs)
-            all_a_ids = {a for a, _ in pairs}
-            for row in self._tensor_cache.rows_for_a(all_a_ids):
-                key = (row["tag_a_id"], row["tag_b_id"])
-                if key in pair_set and row["inhibition_strength"] > 0:
-                    par = row["parallelness"]
-                    total_suppression += row["inhibition_strength"] * max(0.0, -par)
-        else:
-            for chunk_start in range(0, len(pairs), 450):
-                chunk = pairs[chunk_start:chunk_start + 450]
-                conditions = " OR ".join(
-                    "(tag_a_id = ? AND tag_b_id = ?)" for _ in chunk
-                )
-                params = [v for a, b in chunk for v in (a, b)]
-                rows = self._db.execute(
-                    f"SELECT inhibition_strength, parallelness "
-                    f"FROM tag_relational_tensor "
-                    f"WHERE ({conditions}) AND inhibition_strength > 0",
-                    params,
-                ).fetchall()
-                for row in rows:
-                    par = row["parallelness"]
-                    total_suppression += row["inhibition_strength"] * max(0.0, -par)
-
-        return total_suppression
 
     # ── Internal ─────────────────────────────────────────────────────
 

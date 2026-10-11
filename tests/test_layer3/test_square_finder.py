@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,11 @@ from chicory.config import ChicoryConfig
 from chicory.db.engine import DatabaseEngine
 from chicory.db.schema import apply_schema
 from chicory.layer1.tag_manager import TagManager
-from chicory.layer3.square_finder import find_square_motifs
+from chicory.layer3.square_finder import (
+    TensorEdge,
+    find_square_motifs,
+    load_tensor_edges,
+)
 from chicory.layer3.square_visualizer import (
     render_chain_anisotropy_report_html,
     render_cross_project_alignment_html,
@@ -25,7 +30,10 @@ from chicory.layer3.cross_hidden_bridges import (
     find_hidden_bridges,
     format_hidden_bridge_context,
 )
-from chicory.layer3.cross_project_alignment import analyze_cross_project_alignment
+from chicory.layer3.cross_project_alignment import (
+    _load_gu_glyph_edges,
+    analyze_cross_project_alignment,
+)
 from chicory.layer3.cross_project_middle import (
     build_middle_layer_document,
     load_middle_layer,
@@ -593,3 +601,95 @@ def test_cross_project_alignment_visualizer_renders_matrix():
     finally:
         db_a.close()
         db_b.close()
+
+
+# ── Inhibition is suppressive, never a positive layer ────────────────
+
+SHUNT = 1.0 / (1.0 + 2.0 * 0.6)  # default inhibition weight β = 2, I = 0.6
+
+
+def _edges_by_pair(edges: list[TensorEdge]) -> dict[frozenset[str], TensorEdge]:
+    return {frozenset((edge.tag_a, edge.tag_b)): edge for edge in edges}
+
+
+def test_inhibition_is_suppressive_and_never_dominant(stack):
+    db, tags = stack["db"], stack["tags"]
+    ids = _tag_ids(tags, ["alpha", "beta", "gamma", "delta"])
+
+    # Identical excitation; the legacy column on the second edge is retired
+    # and must be ignored now that tag_inhibition exists.
+    _insert_edge(db, ids["alpha"], ids["beta"], cooccurrence=1.0, glyph=0.5)
+    _insert_edge(db, ids["gamma"], ids["delta"], cooccurrence=1.0, glyph=0.5,
+                 inhibition=0.9)
+    a, b = sorted((ids["alpha"], ids["beta"]))
+    db.execute(
+        "INSERT INTO tag_inhibition "
+        "(tag_a_id, tag_b_id, inhibition_strength, observed, expected) "
+        "VALUES (?, ?, 0.6, 0, 20.0)",
+        (a, b),
+    )
+    db.connection.commit()
+
+    edges = _edges_by_pair(load_tensor_edges(db))
+    inhibited = edges[frozenset(("alpha", "beta"))]
+    plain = edges[frozenset(("gamma", "delta"))]
+
+    assert inhibited.strengths["inhibition"] == pytest.approx(0.6)
+    assert plain.strengths["inhibition"] == 0.0
+    assert plain.score == pytest.approx(1.0 * 0.5 + 0.5 * 0.2)
+    assert inhibited.score == pytest.approx(plain.score * SHUNT)
+    # 2.0 × 0.6 outweighs every excitatory layer, yet it never dominates.
+    assert {edge.dominant_layer for edge in edges.values()} == {"cooccurrence"}
+
+
+def test_falls_back_to_tensor_column_without_table(stack):
+    db, tags = stack["db"], stack["tags"]
+    ids = _tag_ids(tags, ["alpha", "beta", "gamma", "delta"])
+
+    _insert_edge(db, ids["alpha"], ids["beta"], cooccurrence=1.0, glyph=0.5,
+                 inhibition=0.6)
+    _insert_edge(db, ids["gamma"], ids["delta"], cooccurrence=1.0, glyph=0.5)
+    # A foreign or pre-v48 database opened by the CLI.
+    db.execute("DROP TABLE tag_inhibition")
+    db.connection.commit()
+
+    edges = _edges_by_pair(load_tensor_edges(db))
+    inhibited = edges[frozenset(("alpha", "beta"))]
+    plain = edges[frozenset(("gamma", "delta"))]
+
+    assert inhibited.strengths["inhibition"] == pytest.approx(0.6)
+    assert inhibited.score == pytest.approx(plain.score * SHUNT)
+    assert inhibited.dominant_layer == "cooccurrence"
+
+
+def test_gu_inhibition_is_suppressive():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            """
+            CREATE TABLE glyph_edges (
+                glyph_a TEXT, glyph_b TEXT,
+                cooccurrence_strength REAL, synchronicity_strength REAL,
+                semantic_strength REAL, semiotic_forward REAL,
+                semiotic_reverse REAL, ramsey_strength REAL,
+                inhibition_strength REAL, parallelness REAL
+            )
+            """
+        )
+        for a, b, inhibition in (("alpha", "beta", 0.6), ("gamma", "delta", 0.0)):
+            conn.execute(
+                "INSERT INTO glyph_edges VALUES (?, ?, 1.0, 0, 0, 0, 0, 0.5, ?, 0)",
+                (a, b, inhibition),
+            )
+
+        edges, _names = _load_gu_glyph_edges(conn, layer_weights=None)
+    finally:
+        conn.close()
+
+    by_pair = _edges_by_pair(edges)
+    inhibited = by_pair[frozenset(("alpha", "beta"))]
+    plain = by_pair[frozenset(("gamma", "delta"))]
+
+    assert inhibited.score == pytest.approx(plain.score * SHUNT)
+    assert {edge.dominant_layer for edge in edges} == {"cooccurrence"}

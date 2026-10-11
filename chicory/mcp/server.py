@@ -532,9 +532,10 @@ def sync_network(ctx: Context) -> str:
     """Run full network synchronization after a large ingest.
 
     Executes all expensive network-building passes in order: centroids,
-    glyph lattice, lateral inhibition, tensor channels (co-occurrence,
-    semantic, glyph, semiotic), episodic edges, canopy growth,
-    synchronicity detection, and meta-pattern analysis.
+    glyph lattice, lateral inhibition (data-derived tag anti-association,
+    recomputed synchronously), tensor channels (co-occurrence, semantic,
+    glyph, semiotic), episodic edges, canopy growth, synchronicity
+    detection, and meta-pattern analysis.
 
     Use this after bulk ingestion (ingest_codebase / ingest_documents /
     corpus loading) to bring the network up to date. Runs against all

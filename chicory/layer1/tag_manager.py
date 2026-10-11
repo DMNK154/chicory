@@ -127,6 +127,11 @@ class TagManager:
             )
             # Consolidate tag relational tensor entries
             self._consolidate_tensor_on_merge(source_id, target_id)
+            # The surviving tag's statistics are a new union, so no
+            # anti-association row on either side still describes it.
+            # Dropping the watermark makes the next background pass recount.
+            from chicory.layer3.lateral_inhibition import forget_tag_inhibition
+            forget_tag_inhibition(self._db, (source_id, target_id))
 
     def list_active(self) -> list[Tag]:
         """List all active tags."""

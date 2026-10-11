@@ -217,7 +217,7 @@ def sync(
         console.print("[bold green]Sync complete.[/bold green]")
         console.print(f"  Centroids rebuilt:     {stats.get('centroids_rebuilt', 0):,}")
         console.print(f"  Glyph positions:       {stats.get('glyph_positions', 0):,}")
-        console.print(f"  Parallelness updated:  {stats.get('parallelness_updated', 0):,}")
+        console.print(f"  Inhibitory pairs:      {stats.get('inhibition_pairs', 0):,}")
         console.print(f"  Co-occurrence pairs:   {stats.get('cooccurrence_pairs', 0):,}")
         console.print(f"  Semantic pairs:        {stats.get('semantic_pairs', 0):,}")
         console.print(f"  Glyph pairs:           {stats.get('glyph_pairs', 0):,}")

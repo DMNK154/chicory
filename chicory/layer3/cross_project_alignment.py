@@ -12,6 +12,7 @@ from chicory.layer3.square_finder import (
     LAYER_ORDER,
     TensorEdge,
     load_tensor_edges,
+    score_strengths,
 )
 
 
@@ -353,18 +354,15 @@ def _load_gu_glyph_edges(
                 _as_float(row_dict.get("semiotic_forward")),
                 _as_float(row_dict.get("semiotic_reverse")),
             ),
+            # parallelness here is a column of the external GPT-GU
+            # glyph_edges format, not Chicory's retired tensor column.
             "glyph": max(
                 _as_float(row_dict.get("ramsey_strength")),
                 _as_float(row_dict.get("parallelness")),
             ),
             "inhibition": _as_float(row_dict.get("inhibition_strength")),
         }
-        weighted = {
-            layer: strengths[layer] * weights.get(layer, 1.0)
-            for layer in LAYER_ORDER
-        }
-        dominant_layer = max(weighted, key=weighted.get)
-        score = sum(weighted.values())
+        score, dominant_layer = score_strengths(strengths, weights)
         if score <= 0:
             continue
         left_id, right_id = sorted((tag_a_id, tag_b_id))

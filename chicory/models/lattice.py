@@ -50,24 +50,3 @@ class GlyphPosition(BaseModel):
     glyph_vector: bytes  # float32 blob — 26-dim letter freq or 1472-dim ByT5
     glyph_dimension: int = 26  # vector dimensionality
     placed_at: Optional[datetime] = None
-
-
-class TagResonanceEntry(BaseModel):
-    """A single entry in the tag relational tensor R(tag_a, tag_b).
-
-    Seven overlapping Ramsey networks on the same tag vertex set,
-    each capturing a different type of relational strength.
-    """
-
-    tag_a_id: int
-    tag_b_id: int
-    cooccurrence_strength: float = 0.0   # PMI from memory_tags
-    synchronicity_strength: float = 0.0  # Lattice resonance + sync event co-involvement
-    semantic_strength: float = 0.0       # Embedding cosine similarity between tag centroids
-    semiotic_forward: float = 0.0        # Directional glyph transformation P(B|A)
-    semiotic_reverse: float = 0.0        # Directional glyph transformation P(A|B)
-    glyph_strength: float = 0.0          # Glyph Ramsey lattice resonance
-    inhibition_strength: float = 0.0     # Opposition/contrast suppression strength
-    parallelness: float = 0.0            # cos(angular_diff): +1 parallel, -1 antiparallel
-    memory_ids: str = "[]"               # JSON array of reachable memory IDs
-    updated_at: Optional[datetime] = None

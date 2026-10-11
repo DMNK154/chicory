@@ -42,6 +42,9 @@ class ActivationTrace:
     # Top-N tag activations from tensor/centroid path: {tag_name: strength}
     tag_activations: dict[str, float] = field(default_factory=dict)
 
+    # Lateral inhibition H on the partners it divided: {tag_name: H}
+    tag_inhibition: dict[str, float] = field(default_factory=dict)
+
     # Per-memory score breakdowns
     score_breakdowns: list[ScoreBreakdown] = field(default_factory=list)
 
@@ -64,6 +67,11 @@ class ActivationTrace:
             "score_breakdowns": [s.to_dict() for s in self.score_breakdowns],
             "timing": self.timing,
         }
+        if self.tag_inhibition:
+            d["tag_inhibition"] = {
+                k: round(v, 4) for k, v in
+                sorted(self.tag_inhibition.items(), key=lambda x: x[1], reverse=True)
+            }
         if include_context and self.context_entries is not None:
             d["context"] = self.context_entries
         return d

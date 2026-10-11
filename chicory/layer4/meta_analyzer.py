@@ -180,21 +180,22 @@ class MetaAnalyzer:
         """Find connected subgraphs in the tag relational tensor.
 
         Queries all tensor edges among the given tags with meaningful
-        composite strength and clusters via union-find.
+        composite strength and clusters via union-find.  The composite is
+        excitatory only: anti-association is not evidence against
+        connectivity, and the retired inhibition_strength column is no
+        longer maintained.
         """
         ph = ",".join("?" * len(tag_ids))
         rows = self._db.execute(
             f"""
             SELECT tag_a_id, tag_b_id,
                    cooccurrence_strength + synchronicity_strength
-                   + semantic_strength + glyph_strength
-                   - inhibition_strength AS composite
+                   + semantic_strength + glyph_strength AS composite
             FROM tag_relational_tensor
             WHERE tag_a_id IN ({ph})
               AND tag_b_id IN ({ph})
               AND (cooccurrence_strength + synchronicity_strength
-                   + semantic_strength + glyph_strength
-                   - inhibition_strength) > 0.05
+                   + semantic_strength + glyph_strength) > 0.05
             """,
             (*tag_ids, *tag_ids),
         ).fetchall()

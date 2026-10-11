@@ -17,6 +17,11 @@ import numpy as np
 
 from chicory.config import ChicoryConfig
 from chicory.db.engine import DatabaseEngine
+from chicory.layer3.lateral_inhibition import (
+    apply_lateral_inhibition,
+    effective_gain,
+    load_inhibitor_index,
+)
 
 if TYPE_CHECKING:
     from chicory.layer1.tag_manager import TagManager
@@ -108,7 +113,11 @@ class TagSpace:
         seed_tag_ids: set[int],
         depth: int | None = None,
     ) -> dict[int, float]:
-        """BFS through tensor edges from seed tags, scoring partners."""
+        """BFS through tensor edges from seed tags, scoring partners.
+
+        Excitation only: the frontier is decided on excitation, and lateral
+        inhibition is applied once to the final lexical scores.
+        """
         if not seed_tag_ids:
             return {}
         depth = depth if depth is not None else self._config.tag_space_fan_depth
@@ -118,7 +127,6 @@ class TagSpace:
         w_sem = self._config.tensor_semantic_weight
         w_glyph = self._config.tensor_glyph_weight
         w_meta = self._config.tensor_meta_resonance_weight
-        w_inhib = self._config.tensor_inhibition_weight
         min_score = self._config.resonance_min_tensor_score
 
         visited = set(seed_tag_ids)
@@ -140,14 +148,14 @@ class TagSpace:
                 rows_a = self._db.execute(
                     f"SELECT tag_a_id, tag_b_id, cooccurrence_strength,"
                     f" synchronicity_strength, semantic_strength,"
-                    f" glyph_strength, inhibition_strength, parallelness"
+                    f" glyph_strength"
                     f" FROM tag_relational_tensor WHERE tag_a_id IN ({ph})",
                     params,
                 ).fetchall()
                 rows_b = self._db.execute(
                     f"SELECT tag_a_id, tag_b_id, cooccurrence_strength,"
                     f" synchronicity_strength, semantic_strength,"
-                    f" glyph_strength, inhibition_strength, parallelness"
+                    f" glyph_strength"
                     f" FROM tag_relational_tensor WHERE tag_b_id IN ({ph})",
                     params,
                 ).fetchall()
@@ -176,15 +184,7 @@ class TagSpace:
                 if sync_val > 0 and glyph_val > 0:
                     excitatory += w_meta * sync_val * glyph_val
 
-                inhib = row["inhibition_strength"]
-                par = row["parallelness"]
-                suppression = (
-                    w_inhib * inhib * max(0.0, -par)
-                    if inhib > 0 and par < 0
-                    else 0.0
-                )
-
-                combined = (excitatory - suppression) * decay
+                combined = excitatory * decay
                 if combined >= min_score:
                     all_scores[partner] = max(
                         all_scores.get(partner, 0.0), combined,
@@ -290,6 +290,13 @@ class TagSpace:
     def score_lexical(
         self, query: str,
     ) -> tuple[dict[str, float], set[int]]:
+        """Lexical tag scores (see _lexical_tag_scores) resolved to memories."""
+        tag_scores, seeds = self._lexical_tag_scores(query)
+        return (self.resolve_to_memories(tag_scores), seeds) if tag_scores else ({}, seeds)
+
+    def _lexical_tag_scores(
+        self, query: str,
+    ) -> tuple[dict[int, float], set[int]]:
         """Sequential lexical expansion: each token fans out before later tokens match.
 
         Earlier tokens expand through the tensor, and their expanded tags
@@ -297,6 +304,9 @@ class TagSpace:
         matches "embedding", fans out to discover "embedding-engine", and
         then "engine" matches that expanded tag — promoting it to a seed
         for its own fan-out.
+
+        The final seeds then laterally inhibit the discovered tags they
+        compete with — once, so the result does not depend on token order.
         """
         index = self._get_lexical_index()
         reverse = self._reverse_index or {}
@@ -347,11 +357,23 @@ class TagSpace:
                 expanded_ids.update(fan_scores.keys())
             expanded_ids.update(direct)
 
+        # Seeds are what the query names, so only discovered tags are
+        # inhibited.  No floor: like the inward ratio, it is a per-tag factor.
+        gain = effective_gain(self._config)
+        if gain > 0 and all_tag_scores:
+            idx = (self._tensor_cache.inhibitor_index() if self._tensor_cache
+                   else load_inhibitor_index(self._db, all_seeds))
+            non_seed = {t: s for t, s in all_tag_scores.items() if t not in all_seeds}
+            inhibited, _ = apply_lateral_inhibition(
+                non_seed, {s: 1.0 for s in all_seeds}, idx, gain, floor=None)
+            all_tag_scores = {**{t: s for t, s in all_tag_scores.items() if t in all_seeds},
+                              **inhibited}
+
         for sid in all_seeds:
             all_tag_scores[sid] = max(all_tag_scores.get(sid, 0.0), 1.0)
 
         all_tag_scores = self._apply_inward_ratio(all_seeds, all_tag_scores)
-        return self.resolve_to_memories(all_tag_scores), all_seeds
+        return all_tag_scores, all_seeds
 
     # ── Inward ratio ───────────────────────────────────────────────
 

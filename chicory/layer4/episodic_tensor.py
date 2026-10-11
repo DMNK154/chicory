@@ -9,7 +9,8 @@ Episodic tensor: "Why did these two specific memories become meaningfully adjace
 Candidate discovery is scoped by temporal episodes: within each episode,
 pairwise semantic similarity (matrix multiply) identifies the top-K
 neighbors per memory.  Tag tensor projection scores the edges across
-all channels (semantic, synchronicity, co-occurrence, glyph, inhibition).
+the excitatory channels (semantic, synchronicity, co-occurrence, glyph),
+divided by the lateral inhibition between the two memories' tags.
 Co-retrieval strength accumulates incrementally via activate_edge.
 """
 
@@ -19,6 +20,8 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
+
+from chicory.layer3.lateral_inhibition import effective_gain, load_inhibitor_index
 
 if TYPE_CHECKING:
     from chicory.config import ChicoryConfig
@@ -72,6 +75,7 @@ class EpisodicTensor:
         id_to_idx = {mid: i for i, mid in enumerate(mem_ids)}
         mem_tags = self._load_all_memory_tags()
         tag_tensor = self._load_tag_tensor_cache(mem_tags)
+        tag_inhibition = self._load_tag_inhibition_index(mem_tags)
         mem_times = self._load_memory_timestamps()
         mem_sources = self._load_memory_sources()
 
@@ -84,6 +88,7 @@ class EpisodicTensor:
             edges = self._process_episode(
                 ep_members, id_to_idx, vectors, mem_tags, tag_tensor,
                 mem_times, mem_sources, batch_size,
+                tag_inhibition=tag_inhibition,
             )
             total_edges += edges
 
@@ -122,6 +127,7 @@ class EpisodicTensor:
         mem_times: dict[str, str],
         mem_sources: dict[str, str],
         batch_size: int,
+        tag_inhibition: dict[int, dict[int, float]] | None = None,
     ) -> int:
         """Discover and score candidate edges within one episode."""
         indices = np.array([id_to_idx[m] for m in ep_members])
@@ -149,7 +155,7 @@ class EpisodicTensor:
         for a, b in candidates:
             edge = self._compute_eager_fields(
                 a, b, id_to_idx, vectors, mem_tags, tag_tensor,
-                mem_times, mem_sources,
+                mem_times, mem_sources, tag_inhibition=tag_inhibition,
             )
             if edge is not None:
                 rows.append(edge)
@@ -180,6 +186,7 @@ class EpisodicTensor:
         tag_tensor: dict[tuple[int, int], dict],
         mem_times: dict[str, str],
         mem_sources: dict[str, str],
+        tag_inhibition: dict[int, dict[int, float]] | None = None,
     ) -> tuple | None:
         idx_a = id_to_idx.get(a)
         idx_b = id_to_idx.get(b)
@@ -191,7 +198,7 @@ class EpisodicTensor:
         tags_a = set(mem_tags.get(a, []))
         tags_b = set(mem_tags.get(b, []))
 
-        tag_sem, tag_sync, tag_cooc, tag_inhib, tag_glyph = 0.0, 0.0, 0.0, 0.0, 0.0
+        tag_sem, tag_sync, tag_cooc, tag_glyph = 0.0, 0.0, 0.0, 0.0
         pair_count = 0
 
         for ta in tags_a:
@@ -202,7 +209,6 @@ class EpisodicTensor:
                     tag_sem += t["semantic_strength"]
                     tag_sync += t["synchronicity_strength"]
                     tag_cooc += t["cooccurrence_strength"]
-                    tag_inhib += t["inhibition_strength"]
                     tag_glyph += t["glyph_strength"]
                     pair_count += 1
 
@@ -210,10 +216,34 @@ class EpisodicTensor:
             tag_sem /= pair_count
             tag_sync /= pair_count
             tag_cooc /= pair_count
-            tag_inhib /= pair_count
             tag_glyph /= pair_count
 
-        tag_projected = tag_sem + tag_sync + tag_cooc + tag_glyph - tag_inhib
+        # Noisy-OR over the anti-associated cross pairs, each unordered pair
+        # once.  Unlike a per-pair mean it is not diluted by letter or
+        # temporal tags, which never carry inhibition, and it stays below 1.
+        survive = 1.0
+        if tag_inhibition:
+            seen: set[tuple[int, int]] = set()
+            for ta in tags_a:
+                row = tag_inhibition.get(ta)
+                if not row:
+                    continue
+                for tb in tags_b:
+                    strength = row.get(tb)
+                    if strength is None:
+                        continue
+                    key = (ta, tb) if ta < tb else (tb, ta)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    survive *= 1.0 - strength
+        tag_inhib = 1.0 - survive
+
+        # Shunting, as at retrieval: dividing suppresses at any excitation
+        # scale and never flips the sign of an edge.
+        tag_projected = (tag_sem + tag_sync + tag_cooc + tag_glyph) / (
+            1.0 + effective_gain(self._cfg) * tag_inhib
+        )
 
         time_a = mem_times.get(a, "")
         time_b = mem_times.get(b, "")
@@ -366,7 +396,7 @@ class EpisodicTensor:
         rows = self._db.execute(
             f"""SELECT tag_a_id, tag_b_id,
                        cooccurrence_strength, synchronicity_strength,
-                       semantic_strength, inhibition_strength, glyph_strength
+                       semantic_strength, glyph_strength
                 FROM tag_relational_tensor
                 WHERE tag_a_id IN ({placeholders}) AND tag_b_id IN ({placeholders})""",
             sorted_tags + sorted_tags,
@@ -376,6 +406,30 @@ class EpisodicTensor:
         for r in rows:
             cache[(r["tag_a_id"], r["tag_b_id"])] = dict(r)
         return cache
+
+    def _load_tag_inhibition_index(
+        self, mem_tags: dict[str, list[int]],
+    ) -> dict[int, dict[int, float]]:
+        """{tag: {competitor: I}} from tag_inhibition, both ends in scope.
+
+        Inhibition is its own table, not a tensor column: competing tags
+        almost never share a (glyph-resonant) tensor row.
+        """
+        all_tags: set[int] = set()
+        for tags in mem_tags.values():
+            all_tags.update(tags)
+
+        if not all_tags:
+            return {}
+
+        index: dict[int, dict[int, float]] = {}
+        for tag, row in load_inhibitor_index(self._db, sorted(all_tags)).items():
+            if tag not in all_tags:
+                continue
+            kept = {other: w for other, w in row.items() if other in all_tags}
+            if kept:
+                index[tag] = kept
+        return index
 
     def _load_memory_timestamps(self) -> dict[str, str]:
         rows = self._db.execute(
@@ -477,6 +531,7 @@ class EpisodicTensor:
             mem_tags.setdefault(r["memory_id"], []).append(r["tag_id"])
 
         tag_tensor = self._load_tag_tensor_cache(mem_tags)
+        tag_inhibition = self._load_tag_inhibition_index(mem_tags)
 
         time_rows = self._db.execute(
             f"SELECT id, created_at FROM memories WHERE id IN ({scope_ph})",
@@ -496,7 +551,7 @@ class EpisodicTensor:
             a, b = min(memory_id, other), max(memory_id, other)
             edge = self._compute_eager_fields(
                 a, b, id_to_idx, all_vecs, mem_tags, tag_tensor,
-                mem_times, mem_sources,
+                mem_times, mem_sources, tag_inhibition=tag_inhibition,
             )
             if edge is not None:
                 rows.append(edge)

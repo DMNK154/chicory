@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from chicory.db.engine import DatabaseEngine
 
-SCHEMA_VERSION = 47
+SCHEMA_VERSION = 48
 
 TABLES = [
     # -- Schema version tracking --
@@ -316,6 +316,21 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_tensor_cooccurrence ON tag_relational_tensor(cooccurrence_strength DESC)",
     "CREATE INDEX IF NOT EXISTS idx_tensor_synchronicity ON tag_relational_tensor(synchronicity_strength DESC)",
     "CREATE INDEX IF NOT EXISTS idx_tensor_semantic ON tag_relational_tensor(semantic_strength DESC)",
+
+    # -- Layer 3.5: Lateral inhibition (data-derived anti-association) --
+    """
+    CREATE TABLE IF NOT EXISTS tag_inhibition (
+        tag_a_id            INTEGER NOT NULL REFERENCES tags(id),
+        tag_b_id            INTEGER NOT NULL REFERENCES tags(id),
+        inhibition_strength REAL NOT NULL,              -- I in (0,1)
+        observed            INTEGER NOT NULL DEFAULT 0, -- O (units) at last write
+        expected            REAL NOT NULL DEFAULT 0.0,  -- E at last write
+        updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+        PRIMARY KEY (tag_a_id, tag_b_id),
+        CHECK (tag_a_id < tag_b_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tag_inhibition_b ON tag_inhibition(tag_b_id)",
 
     # -- Layer 3.5: Centroid Sub-Graph --
     """
@@ -1349,6 +1364,8 @@ def apply_schema(db: DatabaseEngine) -> None:
                 _migrate_v45_to_v46(db)
             if current_version <= 46:
                 _migrate_v46_to_v47(db)
+            if current_version <= 47:
+                _migrate_v47_to_v48(db)
 
         # Create all tables (IF NOT EXISTS handles idempotency)
         for stmt in TABLES:
@@ -1362,7 +1379,7 @@ def apply_schema(db: DatabaseEngine) -> None:
         if not row:
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                (SCHEMA_VERSION, "Is the source prose at all: the gate docJ could not be"),
+                (SCHEMA_VERSION, "Data-derived lateral inhibition (tag_inhibition)"),
             )
 
 
@@ -2194,6 +2211,19 @@ def _migrate_v44_to_v45(db: DatabaseEngine) -> None:
     if "prose" not in cols:
         db.execute("ALTER TABLE meta_shelves ADD COLUMN prose REAL")
     db.connection.commit()
+
+
+def _migrate_v47_to_v48(db: DatabaseEngine) -> None:
+    """Lateral inhibition moves to its own table; the TABLES loop makes it.
+
+    Nothing to migrate.  The retired tensor columns ``inhibition_strength``
+    and ``parallelness`` stay on tag_relational_tensor for compatibility
+    and are deliberately not rewritten: that would touch ~91k rows to
+    clear values no reader consults any more.  ``tag_inhibition`` starts
+    empty; the first background inhibition pass or ``chicory sync`` fills
+    it from the anti-association evidence.
+    """
+    return
 
 
 def _migrate_v46_to_v47(db: DatabaseEngine) -> None:

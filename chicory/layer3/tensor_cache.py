@@ -3,6 +3,9 @@
 The tensor is ~74K rows (~6MB) but scattered across a 10GB SQLite file.
 Caching it eliminates all tensor I/O during retrieval — lookups become
 dict operations (microseconds) instead of random page reads (seconds).
+
+It also holds the lateral-inhibitor index built from tag_inhibition, which
+has its own lifecycle: rebuilt in the background and swapped in whole.
 """
 
 from __future__ import annotations
@@ -10,15 +13,19 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from chicory.layer3.lateral_inhibition import load_inhibitor_index
+
 if TYPE_CHECKING:
     from chicory.db.engine import DatabaseEngine
 
 _log = logging.getLogger(__name__)
 
+# inhibition_strength and parallelness are retired tensor columns (v48):
+# still on disk, never read.  Inhibition lives in tag_inhibition.
 _COLS = (
     "tag_a_id, tag_b_id, cooccurrence_strength, synchronicity_strength,"
     " semantic_strength, semiotic_forward, semiotic_reverse,"
-    " glyph_strength, inhibition_strength, parallelness"
+    " glyph_strength"
 )
 
 
@@ -30,6 +37,7 @@ class TensorCache:
         self._by_a: dict[int, list[dict]] = {}
         self._by_b: dict[int, list[dict]] = {}
         self._loaded = False
+        self._inhib: dict[int, dict[int, float]] | None = None
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
@@ -88,7 +96,36 @@ class TensorCache:
             result[tid] = len(self._by_a.get(tid, [])) + len(self._by_b.get(tid, []))
         return result
 
+    def inhibitor_index(self) -> dict[int, dict[int, float]]:
+        """{tag: {competitor: I}} from tag_inhibition, loaded on first use.
+
+        Two threads racing the first load both read the same table; the
+        duplicate is harmless and cheaper than a lock on the hot path.
+        """
+        index = self._inhib  # one read: a concurrent invalidate cannot hand back None
+        if index is None:
+            index = load_inhibitor_index(self._db)
+            self._inhib = index
+        return index
+
+    def set_inhibitor_index(self, index: dict[int, dict[int, float]]) -> None:
+        """Publish a freshly built index.
+
+        A single attribute assignment, so readers see the old index or the
+        new one, never a mix.  Published dicts are never mutated.
+        """
+        self._inhib = index
+
+    def invalidate_inhibition(self) -> None:
+        """Drop the inhibitor index; the next inhibitor_index() reloads it."""
+        self._inhib = None
+
     def invalidate(self) -> None:
+        """Drop the tensor rows; they reload on next use.
+
+        The inhibitor index has its own lifecycle; the per-store
+        invalidate must not reload it.
+        """
         self._by_a.clear()
         self._by_b.clear()
         self._loaded = False

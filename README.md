@@ -1,6 +1,6 @@
 # Chicory
 
-A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with optional lateral inhibition and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. A directional canopy tracks retrieval causality — inflow canopy identifies convergence attractors in memory-space, outflow canopy identifies distributor neighborhoods in tag-space — and feeds back into bridge hub penalties. Temporal tag episodes track drift in tag-space and detect when conversation returns to a previous topic region — episodes form a revisitable graph, not a timeline. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps. Retrieval runs two independent paths — FAISS embedding search and tag-graph navigation (TagSpace) — with an in-memory tensor cache eliminating all tensor I/O. Warm queries complete in ~35ms.
+A self-organizing memory and associative network (MAN) for LLMs. Stores memories with semantic embeddings and tags, then discovers co-occurrence, semantic, asymmetric semiotic, and glyph-structural relationships through a Prime Ramsey Lattice projected onto a Poincaré disk. Each chicory MAN maintains a four-network tag relational tensor where each channel activates from a distinct evidence source — ingest-time co-occurrence, query-time co-retrieval, or structural resonance — with data-derived lateral inhibition (confident anti-association) and glyph-aware cross-referencing. Bootstraps from zero with no seed data. An episodic memory-to-memory tensor, forest block organizer, and canopy growth layer emerge from use. A directional canopy tracks retrieval causality — inflow canopy identifies convergence attractors in memory-space, outflow canopy identifies distributor neighborhoods in tag-space — and feeds back into bridge hub penalties. Temporal tag episodes track drift in tag-space and detect when conversation returns to a previous topic region — episodes form a revisitable graph, not a timeline. Association strengths are reweighted on every retrieval through centroid sub-graph dynamics — no passive time-decay, no arbitrary caps. Retrieval runs two independent paths — FAISS embedding search and tag-graph navigation (TagSpace) — with an in-memory tensor cache eliminating all tensor I/O. Warm queries complete in ~35ms.
 
 ## Install
 
@@ -244,7 +244,7 @@ Supports `.txt`, `.md`, `.py`, `.json`, `.csv`, `.pdf`, `.docx`, and 30+ other f
                   |    semantic       (Poincaré, queries only)|
                   |    semiotic       (P(B|A), ingest+queries)|
                   |    glyph          (resonance, structural) |
-                  |  + lateral inhibition (parallelness gate) |
+                  |  + lateral inhibition (anti-association)  |
                   |  + in-memory TensorCache (~6MB, all I/O)  |
                   +-------------------------------------------+
                                       |
@@ -363,10 +363,36 @@ All four networks are stored in a single `tag_relational_tensor` table with a `C
 | Semantic | — | co-retrieval + Poincaré | — |
 | Semiotic | P(B\|A) | P(B\|A) | — |
 | Glyph | — | — | resonance |
+| Inhibition | confident co-occurrence deficit (negative PMI) | — | — |
 
 ### Lateral Inhibition
 
-Tag pairs also carry `parallelness` and `inhibition_strength` fields. Antiparallel glyph pairs (pairs whose direction vectors in embedding space point in opposing directions) receive suppressive inhibition, preventing them from reinforcing each other. Orthogonal pairs pass through unaffected. This mirrors lateral inhibition in biological neural networks — nearby neurons suppress each other to sharpen contrast.
+Inhibition is the other half of the ingest co-occurrence evidence. The co-occurrence channel keeps the pairs that appear together *more* often than chance; inhibition is built from the pairs that are each common but appear together *less* often than chance — alternatives such as `python` and `javascript`, or `postgres` and `mongodb`. When the context is clearly about one of them, partners that belong to the other are turned down. This mirrors lateral inhibition in biological neural networks — active neurons suppress their competitors to sharpen contrast.
+
+**Evidence** is counted per *unit*, `COALESCE(source_path, id)`, so the chunks of one document count once. Only non-archived, non-quarantined memories whose tags were chosen by a tagger are evidence: file-ingested memories (`content_hash` set) are left out, because their tags are their path (extension and directory tags are mutually exclusive by construction), and temporal (`month-`, `day-`, …), single-letter and digit tags never count. Over N units, with `n_a` units carrying tag `a` and `O` units carrying both:
+
+```
+E(a,b)  = n_a · n_b / N                        # expected co-occurring units
+p(a,b)  = P(Poisson(E) ≤ O)                    # tested only where E > −ln(fdr) ≈ 3.0
+select    Benjamini-Hochberg at fdr = 0.05     # R discoveries among m testable pairs
+q*      = 1 − R · fdr / m                      # FCR-adjusted confidence
+I(a,b)  = clip(1 − Γ⁻¹(O + 1, q*) / E, 0, 1)   # confident missing fraction
+```
+
+`Γ⁻¹(O + 1, q*)` is the exact one-sided Poisson upper limit on the observed count, so `I` is the fraction of the expected co-occurrences that are confidently missing. It is exactly 0 for rare tags (with E ≤ 3 no amount of absence is significant), for any pair seen as often as chance, and — because selection controls the false-discovery rate — for a store with no real anti-association. A new store starts with no inhibition and grows it only as evidence accumulates. Lexical variants (`test`/`testing`, `postgres`/`postgresql`) are exempt. Pairs live in their own sparse `tag_inhibition` table, independent of glyph resonance: tensor rows exist only for glyph-resonant pairs, which competing tags almost never are.
+
+**At retrieval**, every active context tag inhibits every partner — no tensor edge between them is needed. Each tag carried by the FAISS top-5 results is weighted by its share of them (`a_s`, taken before hub filtering, which prunes excitation seeds, not inhibition evidence), and the inhibitors of a partner `p` are pooled as a noisy-OR, so `H` stays below 1 however large the context:
+
+```
+H_p = 1 − Π_s (1 − a_s · I(s,p))     # over active context tags s
+R_p = E_p / (1 + β · H_p)            # β = tensor_inhibition_weight = 2.0
+```
+
+The suppression is divisive (shunting): it matters at any excitation scale, never flips a sign, and never divides a partner by more than `1 + β`. With no evidence `R = E` exactly, and `β = 0` or `inhibition_enabled = false` switches it off exactly. It applies to resonant memory lookup, glyph association scoring, and TagSpace lexical scoring (the lexical seeds inhibit the tags they fan out to); the episodic tensor and Ramsey square scoring divide by `1 + β·H` the same way.
+
+**Recompute** is never on the store path. A background phase recounts once `memory_tags` has grown 2% past the watermark saved in `librarian_state` (no more than once a minute), with the foreground lock released while it counts; the result is diff-written in small transactions that yield to a waiting request and resume on the next pass, then swapped into the `TensorCache` whole. `chicory sync` (`run_sync`) recomputes synchronously. Retrieval co-occurrence is deliberately not evidence in either direction: inhibition changes what gets co-retrieved, so it would feed on its own output and lock in, and FAISS co-retrieves substitutes precisely because they are similar.
+
+There is no geometric (antiparallel) gate. Competitors are usually *neighbors* in embedding space, not opposites — antiparallel pairs are already kept apart by FAISS — and the old `parallelness` (cosine of two tags' glyph-lattice angle difference) was above 0.88 on every resonant row, so the gate never opened. The tensor columns `parallelness` and `inhibition_strength` are retired: kept in the schema for compatibility, never read or written. The centroid sub-graph's parallelness factor (below) is a different quantity and is unchanged.
 
 ## Centroid Sub-Graph Reweighting
 
@@ -408,7 +434,7 @@ Both paths contribute weighted scores to the same `scores` dict. TagSpace-discov
 
 ### In-Memory Tensor Cache
 
-The `TensorCache` loads the entire `tag_relational_tensor` (~74K rows, ~6MB) into Python dicts indexed by `tag_a_id` and `tag_b_id`. All tensor queries during retrieval become dict lookups (microseconds) instead of random page reads across a 10GB SQLite file (seconds). The cache is lazy-loaded on first access and invalidated after any tensor write.
+The `TensorCache` loads the entire `tag_relational_tensor` (~74K rows, ~6MB) into Python dicts indexed by `tag_a_id` and `tag_b_id`. All tensor queries during retrieval become dict lookups (microseconds) instead of random page reads across a 10GB SQLite file (seconds). The cache is lazy-loaded on first access and invalidated after any tensor write. It also holds the lateral inhibitor index from `tag_inhibition`, which has its own lifecycle: warmed once at boot and swapped whole after each recompute, never reloaded by a store.
 
 ### Hub Filtering
 
@@ -449,7 +475,7 @@ The system maintains five tiers of relational structure at different granulariti
 3. **Same block**: memories in the same forest block
 4. **Tag affinity**: high projected affinity from the tag tensor
 
-Each edge carries a composite strength = `semantic + tag_projected + co_retrieval + bridge`, where `tag_projected` is the mean of all four tensor channels minus inhibition. All thresholds are derived from the composite signal:
+Each edge carries a composite strength = `semantic + tag_projected + co_retrieval + bridge`, where `tag_projected` is the mean of all four tensor channels divided by `1 + β·H` (H combines the anti-association between the two memories' tags as a noisy-OR). All thresholds are derived from the composite signal:
 
 - **Gateway**: semantic neighbors above `similarity_threshold` (FAISS range search), plus co-retrieval, same-block, and tag affinity above `episodic_tag_affinity_threshold`
 - **candidate → warm**: composite >= `episodic_tag_affinity_threshold`
@@ -577,6 +603,7 @@ chicory/
     centroid_subgraph.py        Retrieval-driven active reweighting (EMA centroids + edges)
     tag_space.py                Independent tag-graph retrieval path (lexical + fan-out + inward ratio)
     tensor_cache.py             In-memory cache for tag_relational_tensor (~74K rows, ~6MB)
+    lateral_inhibition.py       Data-derived tag anti-association (tag_inhibition) + shunting helper
     directional_flow.py         Inflow (convergence attractor) + outflow (distributor) observers
     chain_anisotropy.py         Directional chain analysis in the tensor graph
     semiotic_graph.py           Semiotic convergence graph for tag-pair analysis
@@ -644,12 +671,12 @@ User sends message
         -> invalidate tensor cache + PCA cache
 
      -> retrieve_memories(query)
-        -> TagSpace lexical: tokenize query → match tag index → fan-out → score
+        -> TagSpace lexical: tokenize query → match tag index → fan-out → lateral inhibition (lexical seeds) → score
         -> FAISS similarity search (single call, reused for tag filter)
         -> hub-filtered context tags (seed edge count pruning)
         -> candidate-scoped re-ranking (all via in-memory TensorCache):
-           -> resonant memory lookup (tensor pair scores)
-           -> glyph association boost (candidate tags only)
+           -> resonant memory lookup (tensor pair scores) ÷ (1 + β·H) from the top-5 context
+           -> glyph association boost (candidate tags only) ÷ (1 + β·H) from the top-5 context
            -> semiotic convergence (batch signifies/signified_by)
         -> log retrieval
         -> query relevance filter:
@@ -684,12 +711,14 @@ User sends message
                  -> compute angle (PCA -> atan2)
                  -> compute prime slots (150 primes, up to 863)
                  -> project to Poincaré disk (if enabled)
-                 -> _update_synchronicity_tensor (O(n) against existing positions)
+                 -> _find_and_persist_resonances (O(n) against existing positions)
                     -> INSERT resonances
                     -> UPSERT tensor synchronicity_strength
-                    -> lateral inhibition pass
               -> force_sync_boundary (if effective_strength >= threshold)
                  -> snapshot current episode, start new or revisit old
+           -> _maybe_recompute_inhibition (2% growth gate, lock released while counting)
+              -> unit×tag incidence → BH-selected anti-associations → tag_inhibition (diff-write)
+              -> swap the TensorCache inhibitor index
 ```
 
 ## Configuration
@@ -710,7 +739,12 @@ Key parameters in `ChicoryConfig` (70+ total, all overridable via environment va
 | `tensor_synchronicity_weight` | `0.3` | Lattice weight in recall scoring |
 | `tensor_semantic_weight` | `0.2` | Cosine weight in recall scoring |
 | `tensor_semiotic_weight` | `0.15` | Conditional probability weight |
-| `tensor_inhibition_weight` | `0.20` | Max lateral inhibition suppression |
+| `tensor_inhibition_weight` | `2.0` | Lateral inhibition gain β: partner activation ÷ (1 + β·H) |
+| `inhibition_enabled` | `true` | Compute and apply data-derived lateral inhibition |
+| `inhibition_fdr` | `0.05` | Benjamini-Hochberg false-discovery rate; evidence floor E > −ln(fdr) |
+| `inhibition_max_pairs` | `200000` | Memory safety valve on stored pairs (strongest kept) |
+| `inhibition_recompute_growth` | `0.02` | Background recompute after this fractional `memory_tags` growth |
+| `inhibition_recompute_min_seconds` | `60` | Minimum interval between background recompute checks |
 | `sync_detection_sigma` | `2.0` | Z-score threshold for anomaly detection |
 | `centroid_ema_alpha` | `0.1` | EMA weight for tag centroid updates |
 | `centroid_edge_ema_alpha` | `0.15` | EMA weight for co-retrieval edges |

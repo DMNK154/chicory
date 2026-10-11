@@ -25,13 +25,15 @@ LAYER_ORDER = (
     "inhibition",
 )
 
+# Inhibition is suppressive: its weight is the shunting gain β in
+# score_strengths, not a share of an additive sum.
 DEFAULT_LAYER_WEIGHTS = {
     "cooccurrence": 0.5,
     "synchronicity": 0.3,
     "semantic": 0.2,
     "semiotic": 0.15,
     "glyph": 0.2,
-    "inhibition": 0.2,
+    "inhibition": 2.0,
 }
 
 _LAYER_COLUMNS = {
@@ -152,12 +154,39 @@ def edge_key(a: int, b: int) -> tuple[int, int]:
     return (a, b) if a < b else (b, a)
 
 
+def score_strengths(
+    strengths: dict[str, float],
+    weights: dict[str, float],
+) -> tuple[float, str]:
+    """Score a relation vector: (score, dominant layer).
+
+    The excitatory layers add; inhibition divides the sum, as at
+    retrieval — exc / (1 + w_inh·s_inh) — so it can lower an edge but
+    never raise one, and it is never the dominant layer.
+    """
+    weighted = {
+        layer: strengths.get(layer, 0.0) * weights.get(layer, 1.0)
+        for layer in LAYER_ORDER
+        if layer != "inhibition"
+    }
+    dominant_layer = max(weighted, key=weighted.get)
+    # Clamped so a negative foreign value cannot amplify (or zero the divisor).
+    suppression = max(
+        0.0, strengths.get("inhibition", 0.0) * weights.get("inhibition", 1.0)
+    )
+    return sum(weighted.values()) / (1.0 + suppression), dominant_layer
+
+
 def load_tensor_edges(
     db: Any,
     *,
     layer_weights: dict[str, float] | None = None,
 ) -> list[TensorEdge]:
-    """Load tensor rows as scored multiplex edges."""
+    """Load tensor rows as scored multiplex edges.
+
+    Inhibition comes from the tag_inhibition table when it exists (v48+);
+    a foreign or older database falls back to the legacy tensor column.
+    """
     weights = dict(DEFAULT_LAYER_WEIGHTS)
     if layer_weights:
         weights.update(layer_weights)
@@ -166,6 +195,7 @@ def load_tensor_edges(
         row["name"]
         for row in db.execute("PRAGMA table_info(tag_relational_tensor)").fetchall()
     }
+    has_inhibition_table = _has_table(db, "tag_inhibition")
 
     select_cols = [
         "trt.tag_a_id",
@@ -175,10 +205,21 @@ def load_tensor_edges(
     ]
     if "memory_ids" in tensor_cols:
         select_cols.append("trt.memory_ids")
-    for cols in _LAYER_COLUMNS.values():
+    for layer, cols in _LAYER_COLUMNS.items():
+        if layer == "inhibition" and has_inhibition_table:
+            continue
         for col in cols:
             if col in tensor_cols:
                 select_cols.append(f"trt.{col}")
+    inhibition_join = ""
+    if has_inhibition_table:
+        select_cols.append(
+            "COALESCE(ti.inhibition_strength, 0.0) AS inhibition_strength"
+        )
+        inhibition_join = (
+            "LEFT JOIN tag_inhibition ti "
+            "ON ti.tag_a_id = trt.tag_a_id AND ti.tag_b_id = trt.tag_b_id"
+        )
 
     rows = db.execute(
         f"""
@@ -186,6 +227,7 @@ def load_tensor_edges(
         FROM tag_relational_tensor trt
         JOIN tags ta ON ta.id = trt.tag_a_id
         JOIN tags tb ON tb.id = trt.tag_b_id
+        {inhibition_join}
         """
     ).fetchall()
 
@@ -201,12 +243,7 @@ def load_tensor_edges(
             ]
             strengths[layer] = max(values) if values else 0.0
 
-        weighted = {
-            layer: strengths[layer] * weights.get(layer, 1.0)
-            for layer in LAYER_ORDER
-        }
-        dominant_layer = max(weighted, key=weighted.get)
-        score = sum(weighted.values())
+        score, dominant_layer = score_strengths(strengths, weights)
         if score <= 0:
             continue
 
@@ -602,6 +639,14 @@ def _parse_memory_ids(raw: Any) -> tuple[str, ...]:
 def _load_tag_names(db: Any) -> dict[int, str]:
     rows = db.execute("SELECT id, name FROM tags").fetchall()
     return {row["id"]: row["name"] for row in rows}
+
+
+def _has_table(db: Any, table: str) -> bool:
+    row = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
 
 
 def _find_tag_id(name_lookup: dict[int, str], tag: str) -> int | None:

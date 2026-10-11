@@ -25,6 +25,14 @@ from chicory.layer2.trend_engine import TrendEngine
 from chicory.layer3.phase_space import PhaseSpace
 from chicory.layer3.synchronicity_detector import SynchronicityDetector
 from chicory.layer3.centroid_subgraph import CentroidSubgraph
+from chicory.layer3.lateral_inhibition import (
+    InhibitionPlan,
+    compute_tag_inhibition,
+    inhibition_due,
+    persist_inhibition,
+    plan_inhibition,
+    save_watermark,
+)
 from chicory.layer3.synchronicity_engine import SynchronicityEngine
 from chicory.layer3.tag_space import TagSpace
 from chicory.layer3.tensor_cache import TensorCache
@@ -138,6 +146,10 @@ class Orchestrator:
         # Seed centroid sub-graph if empty
         self._maybe_seed_centroid_subgraph()
 
+        # Warm the inhibitor index once (small, chunked) so no retrieval
+        # pays the load; afterwards it changes only by a whole swap.
+        self._tensor_cache.inhibitor_index()
+
         # Tag Space — independent tag-graph retrieval path
         self._tag_space = TagSpace(config, self._db, self._tag_manager,
                                    tensor_cache=self._tensor_cache)
@@ -221,6 +233,10 @@ class Orchestrator:
         # The patrol has its own per-errand intervals, so this only stops
         # every background pass from re-entering it.
         self._last_patrol_check: datetime | None = None
+        self._last_inhibition_check: datetime | None = datetime.utcnow()
+        # A recompute whose diff-write was pre-empted part way; the next
+        # pass finishes writing it instead of counting again.
+        self._inhibition_backlog: InhibitionPlan | None = None
         self._background_idle = False
 
         # Diagnostics — activation trace + context log
@@ -374,33 +390,37 @@ class Orchestrator:
                 self._sync_engine.place_tags_on_glyph_lattice(word_tags)
 
     def _maybe_seed_glyph_cross_reference(self) -> None:
-        """Seed glyph cross-reference data and parallelness on first boot.
+        """Seed glyph cross-reference data into the tensor once.
 
-        Runs when GlyphBridge is available and the tensor has no
-        inhibition data yet (first boot after upgrade to v16).
-        Auto-detects: if any tensor edge has inhibition_strength > 0,
-        assumes seeding was already done.
+        Runs when GlyphBridge is available and the librarian_state marker
+        'glyph_xref_seeded' is absent.  Seeding no longer writes
+        inhibition, so a positive inhibition_strength can't serve as the
+        "already seeded" sign; the marker is written only once seeding
+        actually touched an edge, so a store with no resonant pairs yet
+        tries again next boot.  Re-seeding is an idempotent MAX upsert.
         """
         from chicory.layer1.glyph_bridge import GlyphBridge
 
         if not isinstance(self._glyph_encoder, GlyphBridge):
             return
 
-        # Check if already seeded
         row = self._db.execute(
-            "SELECT COUNT(*) as cnt FROM tag_relational_tensor "
-            "WHERE inhibition_strength > 0"
+            "SELECT 1 FROM librarian_state WHERE key = 'glyph_xref_seeded'"
         ).fetchone()
-        if row["cnt"] > 0:
-            # Already seeded — just refresh parallelness from current angles
-            self._sync_engine.compute_all_parallelness()
+        if row is not None:
             return
 
-        # Full seed: cross-reference data + semiotic pairs + parallelness
         logging.getLogger(__name__).info("Seeding glyph cross-reference data into tensor...")
-        self._sync_engine.seed_from_cross_reference()
+        n = self._sync_engine.seed_from_cross_reference()
         self._sync_engine.seed_semiotic_from_pairs()
-        self._sync_engine.compute_all_parallelness()
+        if n > 0:
+            self._db.execute(
+                "INSERT INTO librarian_state (key, value) "
+                "VALUES ('glyph_xref_seeded', strftime('%Y-%m-%dT%H:%M:%f', 'now')) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "value = strftime('%Y-%m-%dT%H:%M:%f', 'now'), "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')"
+            )
 
     def _maybe_seed_centroid_subgraph(self) -> None:
         """Seed centroids and co-retrieval edges on first boot after upgrade."""
@@ -542,11 +562,14 @@ class Orchestrator:
         stats["glyph_positions"] = len(glyph_positions)
         stats["glyph_lattice_seconds"] = round(time.time() - t0, 1)
 
-        # 3. Compute lateral inhibition (parallelness) for all tensor edges
-        _report("parallelness", "Computing lateral inhibition across tensor")
+        # 3. Recount tag anti-association evidence (lateral inhibition)
+        _report("inhibition", "Computing lateral inhibition (anti-association evidence)")
         t0 = time.time()
-        stats["parallelness_updated"] = self._sync_engine.compute_all_parallelness()
-        stats["parallelness_seconds"] = round(time.time() - t0, 1)
+        inh = self.recompute_inhibition()
+        stats["inhibition_pairs"] = inh["pairs"]
+        stats["inhibition_written"] = inh["written"]
+        stats["inhibition_deleted"] = inh["deleted"]
+        stats["inhibition_seconds"] = round(time.time() - t0, 1)
 
         # 4. Seed tensor from tag associations
         _report("tensor_seed", "Seeding tensor from tag co-occurrence associations")
@@ -678,6 +701,9 @@ class Orchestrator:
         # Commit all changes
         self._db.connection.commit()
         self._tensor_cache.invalidate()
+        # New lattice positions and centroids are invisible to TagSpace
+        # until its lexical index and centroid cache are dropped.
+        self._tag_space.invalidate_caches()
 
         _report("done", f"Sync complete in {stats['total_seconds']:.1f}s")
         return stats
@@ -692,6 +718,76 @@ class Orchestrator:
         if hasattr(self, "_commons_conn"):
             self._commons_conn.close()
         self._db.close()
+
+    # ── Lateral inhibition ──────────────────────────────────────────
+
+    def _plan_inhibition(self) -> InhibitionPlan:
+        comp = compute_tag_inhibition(
+            self._db, fdr=self._config.inhibition_fdr,
+            max_pairs=self._config.inhibition_max_pairs,
+        )
+        return plan_inhibition(self._db, comp)
+
+    def _finish_inhibition(self, plan: InhibitionPlan) -> None:
+        # The index was built from what the table now holds, so publishing
+        # it is a swap — retrieval never sees a half-written table.
+        self._tensor_cache.set_inhibitor_index(plan.index)
+        save_watermark(self._db, plan.watermark)
+        logging.getLogger(__name__).info(
+            "lateral inhibition: %s written=%d deleted=%d",
+            plan.stats, plan.written, plan.deleted,
+        )
+
+    def recompute_inhibition(self) -> dict[str, Any]:
+        """Synchronous full recompute (run_sync, tests).  No lock juggling."""
+        if not self._config.inhibition_enabled:
+            return {"pairs": 0, "written": 0, "deleted": 0}
+        plan = self._plan_inhibition()
+        # A fresh count supersedes whatever a pre-empted pass left queued.
+        self._inhibition_backlog = None
+        persist_inhibition(self._db, plan)
+        self._finish_inhibition(plan)
+        return {
+            "pairs": plan.stats.get("inhibitory_pairs", 0),
+            "written": plan.written, "deleted": plan.deleted, **plan.stats,
+        }
+
+    def _maybe_recompute_inhibition(self) -> None:
+        """Background phase: refresh anti-association evidence when tag assignments grew.
+
+        Counting is read-only and chunked, so it runs with the foreground
+        lock released.  The diff-write yields to a waiting foreground call
+        between chunks; what it leaves queued is the backlog, which the
+        next pass finishes before anything is counted again.
+        """
+        now = datetime.utcnow()
+        if self._last_inhibition_check and (
+            (now - self._last_inhibition_check).total_seconds()
+            < self._config.inhibition_recompute_min_seconds
+        ):
+            return
+        self._last_inhibition_check = now
+        if not self._config.inhibition_enabled:
+            return
+
+        plan = self._inhibition_backlog
+        if plan is None:
+            if not inhibition_due(self._db, self._config.inhibition_recompute_growth):
+                return
+            self._foreground_db_lock.release()
+            try:
+                plan = self._plan_inhibition()
+            finally:
+                self._foreground_db_lock.acquire()
+
+        persist_inhibition(
+            self._db, plan, should_stop=self._foreground_waiting.is_set,
+        )
+        if plan.done:
+            self._inhibition_backlog = None
+            self._finish_inhibition(plan)
+        else:
+            self._inhibition_backlog = plan
 
     # ── Tool call handlers ──────────────────────────────────────────
 
@@ -988,11 +1084,22 @@ class Orchestrator:
                 if tid in id_to_name
             }
 
+        tag_inhibition: dict[str, float] = {}
+        raw_inhibition = getattr(self._sync_engine, "_last_partner_inhibition", {})
+        if raw_inhibition:
+            id_to_name = self._tag_manager.get_names_by_ids(list(raw_inhibition.keys()))
+            tag_inhibition = {
+                id_to_name[tid]: h
+                for tid, h in raw_inhibition.items()
+                if tid in id_to_name
+            }
+
         trace = ActivationTrace(
             query=query,
             method=method,
             tags_requested=tags or [],
             tag_activations=tag_activations,
+            tag_inhibition=tag_inhibition,
             score_breakdowns=breakdowns,
             timing=timing,
             context_entries=annotated if self._config.context_log_full else None,
@@ -3783,6 +3890,7 @@ class Orchestrator:
             # Update co-occurrence, semantic, and semiotic tensor networks
             self._sync_engine.seed_tensor_from_associations()
             self._tensor_cache.invalidate()
+            self._tag_space.invalidate_caches()
 
         return stats
 
@@ -4078,13 +4186,15 @@ class Orchestrator:
         for r in tag_rows:
             all_tags.add(r["name"])
         if all_tags:
-            new_positions = self._sync_engine.place_tags_on_glyph_lattice(list(all_tags))
-            if new_positions:
-                self._sync_engine.compute_all_parallelness()
+            self._sync_engine.place_tags_on_glyph_lattice(list(all_tags))
 
-        # Tensor network seeding
+        # Tensor network seeding.  Inhibition is not recounted here: the
+        # background growth gate picks up the new tag assignments.
         self._sync_engine.seed_tensor_from_associations()
         self._tensor_cache.invalidate()
+        # Single stores drop these per memory; a batch must too, or its
+        # tags and centroids stay invisible to TagSpace.
+        self._tag_space.invalidate_caches()
 
     def _generate_project_overview(
         self,
@@ -4429,7 +4539,9 @@ class Orchestrator:
         if word_tags:
             new_positions = self._sync_engine.place_tags_on_glyph_lattice(word_tags)
             if new_positions:
-                self._sync_engine.compute_all_parallelness()
+                # Placement writes glyph tensor rows; the invalidate above
+                # (centroid branch) ran before them.
+                self._tensor_cache.invalidate()
 
         # Emit commons signal and auto-process
         if self._signal_emitter:
@@ -4520,6 +4632,7 @@ class Orchestrator:
             ("linear sweep", self._maybe_run_linear_sweep),
             ("demand processing", self._maybe_run_demand_processing),
             ("ingress settle", self._maybe_settle_ingress),
+            ("lateral inhibition", self._maybe_recompute_inhibition),
             ("patrol", self._maybe_run_patrol),
         ]
         if self._signal_processor:

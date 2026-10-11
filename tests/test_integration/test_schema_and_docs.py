@@ -158,6 +158,7 @@ _EXPECTED_PHASES = {
     "linear sweep",
     "demand processing",
     "ingress settle",
+    "lateral inhibition",
 }
 
 
@@ -192,6 +193,7 @@ def test_background_phases_are_rate_limited():
         ("_maybe_run_linear_sweep", "_last_sweep_check"),
         ("_maybe_run_demand_processing", "_last_demand_check"),
         ("_maybe_settle_ingress", "_last_ingress_check"),
+        ("_maybe_recompute_inhibition", "_last_inhibition_check"),
     ):
         src = inspect.getsource(getattr(Orchestrator, method))
         assert marker in src, f"{method} does not consult {marker}"

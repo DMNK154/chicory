@@ -134,8 +134,13 @@ class ChicoryConfig(BaseModel):
     tensor_semantic_weight: float = Field(default=0.2)
     tensor_semiotic_weight: float = Field(default=0.15)
 
-    # Lateral inhibition weight — max suppression for antiparallel glyph pairs
-    tensor_inhibition_weight: float = Field(default=0.20)
+    # Lateral inhibition — data-derived anti-association (tag_inhibition table)
+    tensor_inhibition_weight: float = Field(default=2.0)        # shunting gain β: activation / (1 + β·H)
+    inhibition_enabled: bool = Field(default=True)              # compute + apply
+    inhibition_fdr: float = Field(default=0.05)                 # BH false-discovery rate; evidence floor E > −ln(fdr)
+    inhibition_max_pairs: int = Field(default=200_000)          # memory safety valve (strongest kept)
+    inhibition_recompute_growth: float = Field(default=0.02)    # background recompute on 2% memory_tags growth
+    inhibition_recompute_min_seconds: float = Field(default=60.0)
 
     # Glyph Ramsey lattice — letter-composition structural resonance
     glyph_lattice_primes: list[int] = Field(

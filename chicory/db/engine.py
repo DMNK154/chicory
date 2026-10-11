@@ -40,12 +40,16 @@ class DatabaseEngine:
         if not is_memory:
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA synchronous = NORMAL")
-        # 5s was too short for this workload. A store triggers global network
+        # 5s was too short for this workload. A store triggered global network
         # passes (parallelness over ~91k tensor rows, tensor rewrites) that
-        # hold write locks for far longer, so an ordinary concurrent
+        # held write locks for far longer, so an ordinary concurrent
         # retrieval — which writes bookkeeping of its own — was enough to
         # kill a twelve-minute ingest at its final step with "database is
         # locked", after the memory rows had already been committed.
+        # The store-time parallelness pass was removed in v48 (lateral
+        # inhibition is now recomputed in the background, in small chunked
+        # transactions). 30s stays: the remaining global passes — tensor
+        # seeding at ingest finalize, run_sync — still take long write locks.
         self._conn.execute(
             f"PRAGMA busy_timeout = {int(getattr(self._config, 'db_busy_timeout_ms', 30000))}"
         )

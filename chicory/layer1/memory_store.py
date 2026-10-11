@@ -321,11 +321,17 @@ class MemoryStore:
 
             _s = _time.perf_counter()
             candidate_tag_map = self._tags.get_tag_ids_for_memories(candidate_ids)
-            top5_set = set(top5_ids)
-            context_tag_ids: set[int] = set()
-            for mid, tids in candidate_tag_map.items():
-                if mid in top5_set:
-                    context_tag_ids.update(tids)
+            context_counts: dict[int, int] = {}
+            for mid in top5_ids:
+                for tid in set(candidate_tag_map.get(mid, ())):
+                    context_counts[tid] = context_counts.get(tid, 0) + 1
+            context_tag_ids: set[int] = set(context_counts)
+            # Lateral-inhibition activations: each context tag's share of
+            # the top-5, so a tag on one stray result inhibits less.  Taken
+            # before the hub filter, which prunes excitation seeds and says
+            # nothing about what the context is (not) about.
+            context_weights = ({t: c / len(top5_ids) for t, c in context_counts.items()}
+                               if top5_ids else {})
             # Prune hub tags by seed edge count. Hubs connect to many
             # seeds; dead ends connect to few. Uses broad centroid seeds
             # (threshold 0.2) so the count discriminates.
@@ -349,6 +355,7 @@ class MemoryStore:
                     candidate_memory_ids=candidate_ids,
                     candidate_tag_ids_map=candidate_tag_map,
                     seed_memory_ids=top5_ids,
+                    context_weights=context_weights,
                 )
                 _t["resonant_lookup"] = _time.perf_counter() - _s
                 _t["resonant_count"] = len(resonant)
@@ -367,6 +374,7 @@ class MemoryStore:
                         ctx_list,
                         candidate_memory_ids=candidate_ids,
                         candidate_tag_ids_map=candidate_tag_map,
+                        context_weights=context_weights,
                     )
                     _t["glyph_assoc"] = _time.perf_counter() - _s
                     _t["glyph_assoc_count"] = len(glyph_assoc)
