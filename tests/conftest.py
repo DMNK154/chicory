@@ -162,3 +162,54 @@ class MockEmbeddingEngine:
 def mock_embeddings():
     """Mock embedding engine with deterministic vectors."""
     return MockEmbeddingEngine(dimension=32)
+
+
+class BagOfWordsModel:
+    """Stand-in for a SentenceTransformer: sums one fixed random vector per word.
+
+    Texts that share words get similar vectors, so a real EmbeddingEngine
+    (FAISS index, caching, thresholds) behaves as it would on a real model.
+    """
+
+    def __init__(self, dimension: int = 32):
+        self.dimension = dimension
+
+    def _word_vec(self, word: str) -> np.ndarray:
+        h = hashlib.sha256(word.encode()).digest()
+        rng = np.random.RandomState(int.from_bytes(h[:4], "big"))
+        return rng.randn(self.dimension).astype(np.float32)
+
+    def encode(self, texts, normalize_embeddings: bool = True, **_kw):
+        single = isinstance(texts, str)
+        out = []
+        for text in [texts] if single else texts:
+            vec = np.zeros(self.dimension, dtype=np.float32)
+            for word in text.lower().split():
+                vec += self._word_vec(word)
+            norm = np.linalg.norm(vec)
+            out.append(vec / norm if norm > 0 else vec)
+        arr = np.stack(out)
+        return arr[0] if single else arr
+
+
+@pytest.fixture
+def orchestrator(tmp_path):
+    """A full Orchestrator on a temp database with a bag-of-words model.
+
+    The fire-and-forget background pass is disabled so tests are
+    deterministic and nothing touches the database after close().
+    """
+    from chicory.orchestrator.orchestrator import Orchestrator
+
+    cfg = ChicoryConfig(
+        db_path=tmp_path / "chicory.db",
+        anthropic_api_key="test-key",
+        llm_model="test-model",
+        embedding_model="mock",
+        embedding_dimension=32,
+    )
+    orch = Orchestrator(cfg)
+    orch._embedding_engine._model = BagOfWordsModel(dimension=32)
+    orch._sync_detection_background = lambda idle=False: None
+    yield orch
+    orch.close()

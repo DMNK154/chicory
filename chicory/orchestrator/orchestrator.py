@@ -1033,7 +1033,7 @@ class Orchestrator:
         try:
             with self._foreground_db_lock:
                 return self._handle_deep_retrieve_locked(
-                    query, tags, max_depth, per_level_k,
+                    query, tags, max_depth, per_level_k, actor,
                 )
         finally:
             self._foreground_waiting.clear()
@@ -1044,6 +1044,7 @@ class Orchestrator:
         tags: list[str] | None,
         max_depth: int | None,
         per_level_k: int | None,
+        actor: str,
     ) -> dict[str, Any]:
         from chicory.layer2.time_series import exponential_decay
 
